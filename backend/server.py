@@ -460,6 +460,10 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
 # --------------------------------------------------------------------------------------
 # Mount
 # --------------------------------------------------------------------------------------
+@api.get("/health")
+async def health():
+    return {"ok": True}
+
 app.include_router(api)
 
 app.add_middleware(
@@ -469,7 +473,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@api.get("/health")
-async def health():
-    return {"ok": True}
