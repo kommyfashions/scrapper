@@ -472,12 +472,19 @@ async def list_products(
         query["tracked"] = tracked
     sort_field = sort if sort in ("updated_at", "total_reviews", "product_id") else "updated_at"
     direction = -1 if order == "desc" else 1
-    cursor = db.products.find(query, {"reviews": 0}).sort(sort_field, direction).skip(skip).limit(limit)
+    # keep payload light: exclude review text/customer/etc, keep only media (for image fallback)
+    projection = {
+        "reviews.text": 0, "reviews.rating": 0, "reviews.customer": 0,
+        "reviews.helpful": 0, "reviews.review_id": 0, "reviews.created_at": 0,
+    }
+    cursor = db.products.find(query, projection).sort(sort_field, direction).skip(skip).limit(limit)
     items = []
     async for d in cursor:
+        image = pick_product_image(d)
         d = serialize_doc(d)
+        d.pop("reviews", None)  # don't ship media list to UI
         d["avg_rating"] = avg_rating_from_distribution(d.get("rating_distribution"))
-        d["image"] = d.get("product_image_thumb_url") or d.get("product_image_large_url")
+        d["image"] = image
         items.append(d)
     total = await db.products.count_documents(query)
     return {"items": items, "total": total}

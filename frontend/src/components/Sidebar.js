@@ -89,7 +89,7 @@ export default function Sidebar() {
         <div>
           <div className="section-label mb-2 px-2">FUTURE MODULES</div>
           <div className="space-y-1 px-2">
-            {["Label Auto-Download", "Profit/Loss"].map((m) => (
+            {["Profit/Loss"].map((m) => (
               <div
                 key={m}
                 className="flex items-center justify-between text-xs text-[#71717A] py-1"
