@@ -1,0 +1,131 @@
+{
+  "project_name": "Meesho Seller Central Dashboard",
+  "theme_and_archetype": {
+    "theme": "DARK",
+    "archetype": "Archetype 2: The Performance Pro (Command Center / Control Room)",
+    "reasoning": "A B2B seller operations dashboard prioritizing data density, operational status monitoring, and extensibility. A dark 'control room' environment maximizes contrast for statuses, eliminates visual clutter, and feels authoritative and tactile."
+  },
+  "typography": {
+    "fonts": {
+      "primary_heading": "Outfit, sans-serif",
+      "body": "IBM Plex Sans, sans-serif",
+      "data_and_mono": "JetBrains Mono, monospace"
+    },
+    "rules": {
+      "headings": "Use 'Outfit' with tracking-tight. No larger than text-4xl for page titles.",
+      "body": "Use 'IBM Plex Sans' for readability in dense UI sections.",
+      "data": "Use 'JetBrains Mono' for all numerical data, status pills, table cells, metric KPIs, and dates. This aligns columns perfectly and feels highly technical.",
+      "hierarchy": {
+        "h1": "text-3xl sm:text-4xl font-semibold tracking-tight",
+        "h2": "text-2xl sm:text-3xl font-medium tracking-tight",
+        "h3": "text-xl sm:text-2xl font-medium",
+        "body": "text-sm",
+        "data_small": "text-xs font-mono uppercase tracking-wider"
+      }
+    },
+    "forbidden_fonts": ["Inter", "Space Grotesk", "Roboto", "Open Sans", "Syne"]
+  },
+  "color_palette": {
+    "background": {
+      "app": "#0A0A0A",
+      "surface": "#141414",
+      "surface_hover": "#1F1F1F"
+    },
+    "border": {
+      "default": "#2A2A2A",
+      "focus": "#007AFF"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#A1A1AA",
+      "muted": "#71717A"
+    },
+    "accents_and_status": {
+      "primary": "#007AFF",
+      "primary_hover": "#3B82F6",
+      "success_done": "#00E676",
+      "warning_pending": "#F5A623",
+      "alert_failed": "#FF3B30",
+      "info_processing": "#007AFF"
+    }
+  },
+  "layout_and_spacing": {
+    "strategy": "The 'Control Room' Grid",
+    "sidebar": "Fixed width (w-64), full height (h-screen), 1px solid right border. Highly compact vertical navigation.",
+    "page_container": "pl-64 (to accommodate sidebar), p-6 or p-8 for main content area.",
+    "grid_system": {
+      "gap": "gap-4 or gap-6 (Tight density)",
+      "kpi_cards": "grid-cols-2 lg:grid-cols-4",
+      "main_charts": "col-span-full lg:col-span-3",
+      "side_panels": "col-span-full lg:col-span-1"
+    },
+    "surfaces": "Zero soft shadows. Use 1px solid borders (`border-border`) with sharp or extremely subtle rounding (`rounded-none` or `rounded-sm`). Avoid 'floating' cards; components should feel anchored like hardware panels."
+  },
+  "component_guidelines": {
+    "tables": {
+      "style": "Extremely dense. No rounded corners on the table wrapper. Use 'JetBrains Mono' for numbers. Left-align text, right-align numbers.",
+      "borders": "Horizontal borders only (`border-b border-[#2A2A2A]`). No vertical grid lines.",
+      "row_hover": "bg-[#141414] hover:bg-[#1F1F1F]"
+    },
+    "status_badges": {
+      "style": "Tactical outline. Transparent background with 10% opacity of the status color, 1px solid border of the status color, and text in the status color. Font: JetBrains Mono text-xs uppercase.",
+      "examples": {
+        "done": "bg-[#00E676]/10 text-[#00E676] ring-1 ring-[#00E676]/30",
+        "failed": "bg-[#FF3B30]/10 text-[#FF3B30] ring-1 ring-[#FF3B30]/30"
+      }
+    },
+    "buttons": {
+      "primary": "Solid Volt Blue (#007AFF), text white, rounded-sm, font-medium.",
+      "secondary": "Transparent, 1px border (#2A2A2A), text white, hover:bg-[#1F1F1F]."
+    },
+    "charts": {
+      "library": "Recharts (wrapped in Shadcn Chart components)",
+      "style": "Minimalist axes, solid Volt Blue and pure white lines. Remove heavy grid lines, use faint #2A2A2A dashed lines if necessary."
+    },
+    "forms_inputs": {
+      "style": "Dark background (#141414), 1px border (#2A2A2A). Focus state MUST use ring-1 ring-[#007AFF] with zero outline offset to feel precise."
+    }
+  },
+  "motion_and_interactions": {
+    "hover_states": "Instantaneous color shifts (transition-colors duration-150) to feel highly responsive and technical.",
+    "loading": "Use mono-spaced 'ASCII-style' loaders (e.g., [ ///... ] or blinking cursor) or linear determinate progress bars at the top of cards instead of generic spinners.",
+    "data_entry": "When a job is submitted, use a subtle flash animation on the new table row to indicate live ingestion."
+  },
+  "media_and_assets": {
+    "icons": "Phosphor Icons (@phosphor-icons/react). Use 'regular' or 'bold' weight for sharp legibility at small sizes.",
+    "login_background": {
+      "description": "CSS-based dark grid pattern to represent a tactical terminal.",
+      "css_class": "bg-[#0A0A0A] bg-[linear-gradient(to_right,#80808012_1px,transparent_1px),linear-gradient(to_bottom,#80808012_1px,transparent_1px)] bg-[size:24px_24px]"
+    },
+    "image_urls": [
+      {
+        "url": "https://images.unsplash.com/photo-1716625300692-8d5f0341b1c5?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwyfHxlY29tbWVyY2UlMjBwcm9kdWN0JTIwcGhvdG9ncmFwaHklMjBjbGVhbiUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzc3NTQ5MjU2fDA&ixlib=rb-4.1.0&q=85",
+        "category": "product_thumbnail",
+        "description": "Yellow towel and cleaner (placeholder for home goods product)"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1627542557169-5ed71c66ed85?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHw0fHxlY29tbWVyY2UlMjBwcm9kdWN0JTIwcGhvdG9ncmFwaHklMjBjbGVhbiUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzc3NTQ5MjU2fDA&ixlib=rb-4.1.0&q=85",
+        "category": "product_thumbnail",
+        "description": "Samsung Galaxy device (placeholder for electronics product)"
+      },
+      {
+        "url": "https://images.unsplash.com/photo-1773000129212-3546d5e083cd?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwxfHxlY29tbWVyY2UlMjBwcm9kdWN0JTIwcGhvdG9ncmFwaHklMjBjbGVhbiUyMGJhY2tncm91bmR8ZW58MHx8fHwxNzc3NTQ5MjU2fDA&ixlib=rb-4.1.0&q=85",
+        "category": "product_thumbnail",
+        "description": "Skincare products (placeholder for beauty category)"
+      }
+    ]
+  },
+  "testing_and_accessibility": {
+    "test_ids": "CRITICAL: All interactive elements MUST include a data-testid. Format: kebab-case, role-based. Examples: data-testid='submit-job-button', data-testid='sidebar-jobs-link', data-testid='job-status-badge', data-testid='products-table-row'.",
+    "contrast": "Ensure pure white text (#FFFFFF) over dark surfaces (#141414) for maximum readability. Muted text must not drop below #71717A."
+  },
+  "instructions_to_main_agent": [
+    "Use standard HTML/Tailwind for structural layout. Use customized Shadcn for complex interactives (Tables, Dialogs, Selects, Charts).",
+    "Install Phosphor Icons: yarn add @phosphor-icons/react",
+    "Implement the CSS grid background for the Login page as specified in media_and_assets.",
+    "Adhere strictly to the 'Performance Pro' Archetype. DO NOT introduce soft purples, teals, or glassmorphism. Keep it tactical, precise, and flat with 1px borders.",
+    "Ensure the sidebar navigation is built as an extensible list, anticipating future modules.",
+    "For the Animated Rating Distribution on the product detail page, use simple flex-based horizontal progress bars colored by status/accent variables, rather than a bulky chart library component.",
+    "ALL numbers, dates, and metric data MUST be wrapped in tags applying the 'JetBrains Mono' font family."
+  ]
+}
