@@ -10,6 +10,11 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Any, Dict
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # py<3.9 fallback
+
 import bcrypt
 import jwt
 from bson import ObjectId
@@ -17,6 +22,8 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Query
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # --------------------------------------------------------------------------------------
 # Config / DB
@@ -28,6 +35,7 @@ JWT_ALGO = "HS256"
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@meesho-dash.local").lower()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 STUCK_JOB_MINUTES = int(os.environ.get("STUCK_JOB_MINUTES", "30"))
+SCHED_TZ = ZoneInfo("Asia/Kolkata")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -37,6 +45,8 @@ logger = logging.getLogger("dashboard")
 
 app = FastAPI(title="Meesho Seller Dashboard API")
 api = APIRouter(prefix="/api")
+
+scheduler: Optional[AsyncIOScheduler] = None
 
 # --------------------------------------------------------------------------------------
 # Auth helpers
@@ -52,8 +62,7 @@ def verify_password(p: str, h: str) -> bool:
 
 def create_token(user_id: str, email: str) -> str:
     payload = {
-        "sub": user_id,
-        "email": email,
+        "sub": user_id, "email": email,
         "exp": datetime.now(timezone.utc) + timedelta(days=7),
         "type": "access",
     }
@@ -93,10 +102,20 @@ class JobCreate(BaseModel):
 class JobsBulkCreate(BaseModel):
     product_urls: List[str]
 
+class TrackToggle(BaseModel):
+    tracked: bool
+
+class ScheduleSettings(BaseModel):
+    scrape_enabled: bool = True
+    scrape_time: str = "11:00"   # HH:MM 24h IST
+    label_enabled: bool = False
+    label_time: str = "09:30"
+
 # --------------------------------------------------------------------------------------
 # Utilities
 # --------------------------------------------------------------------------------------
 MEESHO_PRODUCT_URL_RE = re.compile(r"https?://(www\.)?meesho\.com/.+/p/([A-Za-z0-9_-]+)/?", re.IGNORECASE)
+HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 def extract_product_id(url: str) -> Optional[str]:
     m = MEESHO_PRODUCT_URL_RE.search(url.strip())
@@ -134,26 +153,138 @@ def avg_rating_from_distribution(dist: Optional[Dict[str, int]]) -> Optional[flo
         return None
     return round(weighted / total, 2)
 
+def pick_product_image(p: dict) -> Optional[str]:
+    # prefer explicit product_image_large_url > thumb > first review media
+    for k in ("product_image_large_url", "product_image_thumb_url"):
+        v = p.get(k)
+        if v:
+            return v
+    reviews = p.get("reviews")
+    if isinstance(reviews, list):
+        for r in reviews:
+            media = r.get("media") if isinstance(r, dict) else None
+            if isinstance(media, list):
+                for m in media:
+                    if isinstance(m, dict) and m.get("url"):
+                        return m["url"]
+                    if isinstance(m, str):
+                        return m
+    return None
+
+# --------------------------------------------------------------------------------------
+# Scheduler
+# --------------------------------------------------------------------------------------
+async def get_settings_doc() -> dict:
+    doc = await db.settings.find_one({"_id": "schedule"})
+    if not doc:
+        doc = {"_id": "schedule", **ScheduleSettings().model_dump()}
+        await db.settings.insert_one(doc)
+    return doc
+
+async def enqueue_daily_scrape_jobs():
+    """Enqueue one pending product_scrape job per tracked product."""
+    try:
+        now = datetime.now(timezone.utc)
+        count = 0
+        async for p in db.products.find({"tracked": True}, {"product_id": 1, "product_url": 1}):
+            pid = p.get("product_id")
+            url = p.get("product_url")
+            if not pid or not url:
+                continue
+            # skip if there's already a pending/processing job for this product_id
+            existing = await db.jobs.find_one({
+                "product_id": pid,
+                "status": {"$in": ["pending", "processing"]},
+                "type": "product_scrape",
+            })
+            if existing:
+                continue
+            await db.jobs.insert_one({
+                "product_url": url,
+                "product_id": pid,
+                "type": "product_scrape",
+                "status": "pending",
+                "created_at": now,
+                "submitted_by": "scheduler",
+            })
+            count += 1
+        logger.info(f"[scheduler] Enqueued {count} daily scrape job(s)")
+    except Exception as e:
+        logger.exception(f"[scheduler] scrape enqueue failed: {e}")
+
+async def enqueue_daily_label_job():
+    try:
+        now = datetime.now(timezone.utc)
+        existing = await db.jobs.find_one({
+            "type": "label_download",
+            "status": {"$in": ["pending", "processing"]},
+        })
+        if existing:
+            logger.info("[scheduler] label job already queued/running, skip")
+            return
+        await db.jobs.insert_one({
+            "type": "label_download",
+            "status": "pending",
+            "created_at": now,
+            "submitted_by": "scheduler",
+        })
+        logger.info("[scheduler] Enqueued daily label_download job")
+    except Exception as e:
+        logger.exception(f"[scheduler] label enqueue failed: {e}")
+
+def _parse_hhmm(s: str) -> tuple:
+    m = HHMM_RE.match(s or "")
+    if not m:
+        return (11, 0)
+    return (int(m.group(1)), int(m.group(2)))
+
+async def reconfigure_scheduler():
+    global scheduler
+    if scheduler is None:
+        return
+    # remove existing jobs
+    for j in scheduler.get_jobs():
+        scheduler.remove_job(j.id)
+    s = await get_settings_doc()
+    if s.get("scrape_enabled", True):
+        h, m = _parse_hhmm(s.get("scrape_time", "11:00"))
+        scheduler.add_job(
+            enqueue_daily_scrape_jobs,
+            CronTrigger(hour=h, minute=m, timezone=SCHED_TZ),
+            id="daily_scrape", replace_existing=True,
+        )
+    if s.get("label_enabled", False):
+        h, m = _parse_hhmm(s.get("label_time", "09:30"))
+        scheduler.add_job(
+            enqueue_daily_label_job,
+            CronTrigger(hour=h, minute=m, timezone=SCHED_TZ),
+            id="daily_label", replace_existing=True,
+        )
+    logger.info(f"[scheduler] reconfigured: jobs={[j.id for j in scheduler.get_jobs()]}")
+
 # --------------------------------------------------------------------------------------
 # Startup
 # --------------------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup():
+    global scheduler
     try:
         await db.users.create_index("email", unique=True)
         await db.jobs.create_index("status")
         await db.jobs.create_index("created_at")
+        await db.jobs.create_index("type")
         await db.products.create_index("product_id", unique=False)
+        await db.product_history.create_index([("product_id", 1), ("snapshot_at", -1)])
     except Exception as e:
         logger.warning(f"Index creation issue: {e}")
 
+    # seed admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if not existing:
         await db.users.insert_one({
             "email": ADMIN_EMAIL,
             "password_hash": hash_password(ADMIN_PASSWORD),
-            "name": "Admin",
-            "role": "admin",
+            "name": "Admin", "role": "admin",
             "created_at": datetime.now(timezone.utc),
         })
         logger.info(f"Seeded admin user: {ADMIN_EMAIL}")
@@ -164,12 +295,28 @@ async def startup():
         )
         logger.info("Admin password updated from env.")
 
+    # seed settings
+    await get_settings_doc()
+
+    # stamp legacy jobs with default type
+    await db.jobs.update_many({"type": {"$exists": False}}, {"$set": {"type": "product_scrape"}})
+
+    # auto-track existing products that don't have a tracked flag yet
+    await db.products.update_many({"tracked": {"$exists": False}}, {"$set": {"tracked": True}})
+
+    # start scheduler
+    scheduler = AsyncIOScheduler(timezone=SCHED_TZ)
+    scheduler.start()
+    await reconfigure_scheduler()
+
 @app.on_event("shutdown")
 async def shutdown():
+    if scheduler:
+        scheduler.shutdown(wait=False)
     client.close()
 
 # --------------------------------------------------------------------------------------
-# Auth endpoints
+# Auth
 # --------------------------------------------------------------------------------------
 @api.post("/auth/login", response_model=TokenOut)
 async def login(body: LoginIn):
@@ -178,10 +325,7 @@ async def login(body: LoginIn):
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_token(str(user["_id"]), email)
-    return TokenOut(
-        access_token=token,
-        user={"id": str(user["_id"]), "email": email, "name": user.get("name", "")},
-    )
+    return TokenOut(access_token=token, user={"id": str(user["_id"]), "email": email, "name": user.get("name", "")})
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
@@ -197,9 +341,8 @@ async def create_job(body: JobCreate, user: dict = Depends(get_current_user)):
     if not pid:
         raise HTTPException(status_code=400, detail="Not a valid Meesho product URL (expected /p/<id>)")
     doc = {
-        "product_url": url,
-        "product_id": pid,
-        "status": "pending",
+        "product_url": url, "product_id": pid,
+        "type": "product_scrape", "status": "pending",
         "created_at": datetime.now(timezone.utc),
         "submitted_by": user["email"],
     }
@@ -219,9 +362,8 @@ async def create_jobs_bulk(body: JobsBulkCreate, user: dict = Depends(get_curren
             skipped.append({"url": u, "reason": "invalid"})
             continue
         doc = {
-            "product_url": u,
-            "product_id": pid,
-            "status": "pending",
+            "product_url": u, "product_id": pid,
+            "type": "product_scrape", "status": "pending",
             "created_at": datetime.now(timezone.utc),
             "submitted_by": user["email"],
         }
@@ -233,6 +375,7 @@ async def create_jobs_bulk(body: JobsBulkCreate, user: dict = Depends(get_curren
 @api.get("/jobs")
 async def list_jobs(
     status: Optional[str] = None,
+    type: Optional[str] = None,
     q: Optional[str] = None,
     limit: int = Query(50, le=200),
     skip: int = 0,
@@ -241,6 +384,8 @@ async def list_jobs(
     query: dict = {}
     if status and status != "all":
         query["status"] = status
+    if type and type != "all":
+        query["type"] = type
     if q:
         query["product_url"] = {"$regex": re.escape(q), "$options": "i"}
     cursor = db.jobs.find(query).sort("created_at", -1).skip(skip).limit(limit)
@@ -254,7 +399,6 @@ async def jobs_stats(user: dict = Depends(get_current_user)):
     out = {"pending": 0, "processing": 0, "done": 0, "failed": 0}
     async for row in db.jobs.aggregate(pipe):
         out[row["_id"]] = row["count"]
-    # Stuck = processing older than threshold, OR processing without started_at
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STUCK_JOB_MINUTES)
     stuck = await db.jobs.count_documents({
         "status": "processing",
@@ -287,7 +431,6 @@ async def reset_stuck(user: dict = Depends(get_current_user)):
         {"status": "processing", "started_at": {"$lt": cutoff}},
         {"$set": {"status": "pending"}, "$unset": {"started_at": ""}},
     )
-    # also handle processing without started_at (legacy)
     res2 = await db.jobs.update_many(
         {"status": "processing", "started_at": {"$exists": False}},
         {"$set": {"status": "pending"}},
@@ -311,6 +454,7 @@ async def delete_job(job_id: str, user: dict = Depends(get_current_user)):
 @api.get("/products")
 async def list_products(
     q: Optional[str] = None,
+    tracked: Optional[bool] = None,
     sort: str = "updated_at",
     order: str = "desc",
     limit: int = Query(50, le=200),
@@ -321,10 +465,11 @@ async def list_products(
     if q:
         regex = {"$regex": re.escape(q), "$options": "i"}
         query["$or"] = [
-            {"product_id": regex},
-            {"product_url": regex},
-            {"seller.name": regex},
+            {"product_id": regex}, {"product_url": regex},
+            {"seller.name": regex}, {"product_name": regex},
         ]
+    if tracked is not None:
+        query["tracked"] = tracked
     sort_field = sort if sort in ("updated_at", "total_reviews", "product_id") else "updated_at"
     direction = -1 if order == "desc" else 1
     cursor = db.products.find(query, {"reviews": 0}).sort(sort_field, direction).skip(skip).limit(limit)
@@ -332,6 +477,7 @@ async def list_products(
     async for d in cursor:
         d = serialize_doc(d)
         d["avg_rating"] = avg_rating_from_distribution(d.get("rating_distribution"))
+        d["image"] = d.get("product_image_thumb_url") or d.get("product_image_large_url")
         items.append(d)
     total = await db.products.count_documents(query)
     return {"items": items, "total": total}
@@ -343,7 +489,96 @@ async def product_detail(product_id: str, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=404, detail="Product not found")
     out = serialize_doc(doc)
     out["avg_rating"] = avg_rating_from_distribution(out.get("rating_distribution"))
+    out["image"] = pick_product_image(doc)
     return out
+
+@api.post("/products/{product_id}/track")
+async def toggle_track(product_id: str, body: TrackToggle, user: dict = Depends(get_current_user)):
+    res = await db.products.update_one({"product_id": product_id}, {"$set": {"tracked": body.tracked}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"ok": True, "tracked": body.tracked}
+
+@api.get("/products/{product_id}/history")
+async def product_history(product_id: str, days: int = 30, user: dict = Depends(get_current_user)):
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 365)))
+    cursor = db.product_history.find(
+        {"product_id": product_id, "snapshot_at": {"$gte": since}},
+        {"_id": 0},
+    ).sort("snapshot_at", 1)
+    items = []
+    async for d in cursor:
+        if isinstance(d.get("snapshot_at"), datetime):
+            d["snapshot_at"] = d["snapshot_at"].isoformat()
+        items.append(d)
+    return {"items": items}
+
+# --------------------------------------------------------------------------------------
+# Labels
+# --------------------------------------------------------------------------------------
+@api.post("/labels/run-now")
+async def label_run_now(user: dict = Depends(get_current_user)):
+    existing = await db.jobs.find_one({
+        "type": "label_download",
+        "status": {"$in": ["pending", "processing"]},
+    })
+    if existing:
+        return {"ok": True, "already_queued": True, "id": str(existing["_id"])}
+    doc = {
+        "type": "label_download", "status": "pending",
+        "created_at": datetime.now(timezone.utc),
+        "submitted_by": user["email"],
+    }
+    res = await db.jobs.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return serialize_doc(doc)
+
+@api.get("/labels/runs")
+async def label_runs(limit: int = Query(50, le=200), user: dict = Depends(get_current_user)):
+    cursor = db.jobs.find({"type": "label_download"}).sort("created_at", -1).limit(limit)
+    items = [serialize_doc(d) for d in await cursor.to_list(length=limit)]
+    return {"items": items}
+
+# --------------------------------------------------------------------------------------
+# Settings / Scheduler
+# --------------------------------------------------------------------------------------
+@api.get("/settings")
+async def get_settings(user: dict = Depends(get_current_user)):
+    s = await get_settings_doc()
+    s.pop("_id", None)
+    # include next run info
+    next_runs = {}
+    if scheduler:
+        for j in scheduler.get_jobs():
+            next_runs[j.id] = j.next_run_time.isoformat() if j.next_run_time else None
+    s["next_runs"] = next_runs
+    s["timezone"] = "Asia/Kolkata"
+    return s
+
+@api.put("/settings")
+async def put_settings(body: ScheduleSettings, user: dict = Depends(get_current_user)):
+    if not HHMM_RE.match(body.scrape_time):
+        raise HTTPException(status_code=400, detail="scrape_time must be HH:MM (24h)")
+    if not HHMM_RE.match(body.label_time):
+        raise HTTPException(status_code=400, detail="label_time must be HH:MM (24h)")
+    await db.settings.update_one(
+        {"_id": "schedule"},
+        {"$set": body.model_dump()},
+        upsert=True,
+    )
+    await reconfigure_scheduler()
+    return await get_settings(user)  # echo updated
+
+@api.post("/scheduler/run-now")
+async def manual_run(what: str = Query("scrape"), user: dict = Depends(get_current_user)):
+    """Manually trigger a daily run right now (scrape | label)."""
+    if what == "scrape":
+        await enqueue_daily_scrape_jobs()
+    elif what == "label":
+        await enqueue_daily_label_job()
+    else:
+        raise HTTPException(status_code=400, detail="what must be 'scrape' or 'label'")
+    return {"ok": True}
 
 # --------------------------------------------------------------------------------------
 # Analytics
@@ -351,7 +586,6 @@ async def product_detail(product_id: str, user: dict = Depends(get_current_user)
 @api.get("/analytics/overview")
 async def analytics_overview(user: dict = Depends(get_current_user)):
     total_products = await db.products.count_documents({})
-    # total reviews + global rating distribution
     pipe_global = [
         {"$group": {
             "_id": None,
@@ -372,45 +606,29 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
             "avg_rating": avg_rating_from_distribution(dist),
         }
 
-    # top sellers by total_reviews
     top_sellers_pipe = [
         {"$group": {"_id": "$seller.name", "products": {"$sum": 1}, "reviews": {"$sum": "$total_reviews"}}},
         {"$match": {"_id": {"$ne": None}}},
-        {"$sort": {"reviews": -1}},
-        {"$limit": 10},
+        {"$sort": {"reviews": -1}}, {"$limit": 10},
     ]
     top_sellers = []
     async for row in db.products.aggregate(top_sellers_pipe):
         top_sellers.append({"seller": row["_id"], "products": row["products"], "reviews": row["reviews"]})
 
-    # jobs today
     start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     jobs_today = await db.jobs.count_documents({"created_at": {"$gte": start_of_day}})
 
-    # job status breakdown
     status_breakdown = {"pending": 0, "processing": 0, "done": 0, "failed": 0}
     async for row in db.jobs.aggregate([{"$group": {"_id": "$status", "count": {"$sum": 1}}}]):
         if row["_id"] in status_breakdown:
             status_breakdown[row["_id"]] = row["count"]
 
-    # review volume by day (last 30 days) — based on reviews array created_at
     thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
     volume_pipe = [
         {"$unwind": "$reviews"},
-        {"$addFields": {
-            "review_dt": {
-                "$dateFromString": {
-                    "dateString": "$reviews.created_at",
-                    "onError": None,
-                    "onNull": None,
-                }
-            }
-        }},
+        {"$addFields": {"review_dt": {"$dateFromString": {"dateString": "$reviews.created_at", "onError": None, "onNull": None}}}},
         {"$match": {"review_dt": {"$gte": thirty_days_ago}}},
-        {"$group": {
-            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$review_dt"}},
-            "count": {"$sum": 1},
-        }},
+        {"$group": {"_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$review_dt"}}, "count": {"$sum": 1}}},
         {"$sort": {"_id": 1}},
     ]
     review_volume = []
@@ -420,18 +638,11 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
     except Exception as e:
         logger.warning(f"Review volume aggregation failed: {e}")
 
-    # most helpful reviews (top 10)
     helpful_pipe = [
         {"$unwind": "$reviews"},
         {"$match": {"reviews.helpful": {"$gt": 0}}},
-        {"$sort": {"reviews.helpful": -1}},
-        {"$limit": 10},
-        {"$project": {
-            "_id": 0,
-            "product_id": 1,
-            "seller": "$seller.name",
-            "review": "$reviews",
-        }},
+        {"$sort": {"reviews.helpful": -1}}, {"$limit": 10},
+        {"$project": {"_id": 0, "product_id": 1, "seller": "$seller.name", "review": "$reviews"}},
     ]
     helpful_reviews = []
     async for row in db.products.aggregate(helpful_pipe):
@@ -458,7 +669,7 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
     }
 
 # --------------------------------------------------------------------------------------
-# Mount
+# Health + Mount
 # --------------------------------------------------------------------------------------
 @api.get("/health")
 async def health():
@@ -470,6 +681,5 @@ app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
     allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], allow_headers=["*"],
 )

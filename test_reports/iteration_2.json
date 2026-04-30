@@ -1,0 +1,47 @@
+{
+  "summary": "Iteration-2 backend + frontend testing. 18/19 new iteration-2 backend tests pass and 23/23 iteration-1 regression tests still pass (total 41/42). All new UI data-testids are present: products filters & track toggles, product detail hero + history range buttons + detail-track-toggle + empty-history banner, /labels page Run Now queues a job (history row appears), /settings page has all inputs + toggles + run-now buttons, /jobs page shows TYPE filter pills and LABEL badge/'Label Download job' text. Login and Sign out work. Two real bugs found: (1) /api/products list returns image=null for existing products aeop5q/8sa1ay because the list handler does not fall back to review media like the detail handler does; (2) Product detail page hero <img> has empty src even though /api/products/{pid} returns a valid image URL — frontend is binding to the wrong field.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "GET /api/products", "issue": "Returns image=null for both existing products (aeop5q, 8sa1ay). Spec requires 'image derived from review media if no product_image_*'. server.py:480 uses `d.get('product_image_thumb_url') or d.get('product_image_large_url')` only — no review-media fallback — AND the query uses projection `{\"reviews\": 0}` so even adding fallback logic there wouldn't find reviews. Fix: either include a $project that yields first review media image at aggregation time, or drop `reviews: 0` when those fields are absent, or replicate the pick_product_image logic using the first review-media doc (a small $lookup or separate find).", "priority": "HIGH"}
+    ],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "ProductsPage thumbnails column", "issue": "No row images render (0 <img> tags found in table rows) because /api/products returns image=null — downstream of the backend list bug above.", "selector": "table img", "priority": "HIGH"},
+      {"component": "ProductDetailPage hero image", "issue": "<img data-testid='product-hero-image'> exists but src attribute is empty/null. Backend /api/products/aeop5q correctly returns image=<review-media URL>, so the JSX is almost certainly bound to `product.product_image_large_url` (which is null for existing products) instead of `product.image`. Fix: use `product.image || product.product_image_large_url`.", "selector": "[data-testid='product-hero-image']", "priority": "HIGH"},
+      {"component": "Sidebar FUTURE MODULES", "issue": "Still lists both 'Label Auto-Download' and 'Profit/Loss' under FUTURE MODULES. Review request explicitly says FUTURE MODULES should now only show 'Profit/Loss' (Label Download was moved to AUTOMATION section).", "selector": "aside nav >> text=Label Auto-Download", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration2.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/iter2_results.xml"
+  ],
+  "action_items": [
+    "Fix /api/products list handler to populate `image` via review-media fallback for products missing product_image_*_url (matches pick_product_image used by detail endpoint).",
+    "Fix ProductDetailPage hero <img> to use `product.image` (falls back correctly on backend) instead of `product.product_image_large_url`.",
+    "Remove 'Label Auto-Download' from FUTURE MODULES in Sidebar.js — per spec only 'Profit/Loss' should remain there (the live 'Label Download' is already in AUTOMATION)."
+  ],
+  "critical_code_review_comments": [
+    "server.py list_products uses projection {reviews: 0} AND does not call pick_product_image — this is the root cause of image=null in the list response. Consider making image derivation a first-class field computed & persisted on scrape, or do a lightweight second pass that only pulls `reviews.$[0].media` for rows missing product_image_*.",
+    "HHMM_RE is good; settings PUT correctly rejects 25:00 and 'abc' with 400.",
+    "Scheduler idempotency works: a second run-now?what=scrape did not create duplicate pending jobs for aeop5q. Good.",
+    "`/api/health` was moved above app.include_router(api) — iteration-1 bug is fixed. 200 OK verified.",
+    "label_run_now idempotency verified: second call returns already_queued:true with same id.",
+    "Minor: put_settings calls `get_settings(user)` which requires a user dependency — works but couples the helper tightly to auth. Could refactor to return a plain dict.",
+    "No auth brute-force protection on /api/auth/login (still carried over from iter-1; acceptable for single-admin preview)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration2.py (new — 19 tests)"
+  ],
+  "success_rate": {"backend": "97% (41/42 — 18/19 new + 23/23 regression)", "frontend": "95% (all critical flows + testids work; 2 image-related bugs)"},
+  "test_credentials": "admin@meesho-dash.local / admin123 (from /app/memory/test_credentials.md — verified working)",
+  "seed_data_creation": "During tests: briefly toggled aeop5q tracked off/on (restored to ON before test ended), created and deleted a few transient product_scrape and label_download jobs (all cleaned up in test teardown), briefly changed settings (11:30 / 09:45, label_enabled true/false) — restored to defaults (scrape_time=11:00, scrape_enabled=true, label_time=09:30, label_enabled=false) via restore_settings session fixture.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Run both: `pytest /app/backend/tests/backend_test.py /app/backend/tests/test_iteration2.py -v`. The restore_settings fixture at module scope restores schedule settings to defaults after the iter2 suite finishes. Worker is NOT running in preview, so any scrape/label_download jobs created remain 'pending' — that's expected. When verifying image fixes: check both GET /api/products?limit=5 (items[*].image must be non-null for aeop5q & 8sa1ay) and the UI hero <img src> on /products/aeop5q (should be a meesho review-media URL). The two-product dataset (aeop5q, 8sa1ay) must be preserved in real remote MongoDB.",
+  "rca_of_the_issue": "BUG 1 (image=null in list): server.py list_products line 480 only checks product_image_thumb_url / product_image_large_url; existing products have neither (they predate the new scraper). The detail handler uses pick_product_image() which falls back to the first review-media URL — the list handler needs the same fallback. Reproduction: `curl -H 'Authorization: Bearer <token>' BASE/api/products?limit=5` → all items have `image: null`. Mitigation: add review-media fallback OR, more efficiently, have the new scraper write a derived `image` field into each product doc so both endpoints read it directly. BUG 2 (hero src empty): /api/products/aeop5q returns image=<review-media URL> but ProductDetailPage renders <img data-testid='product-hero-image'> with src bound to product.product_image_large_url (null). Fix: bind to `product.image`. Both bugs cause the user-visible 'no product thumbnails anywhere' symptom."
+}

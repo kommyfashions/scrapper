@@ -7,6 +7,8 @@ import {
   ChartBarIcon,
   SignOutIcon,
   TerminalWindowIcon,
+  PrinterIcon,
+  GearIcon,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/auth/AuthContext";
 
@@ -24,6 +26,13 @@ const NAV_SECTIONS = [
     items: [
       { to: "/products", label: "Products", Icon: PackageIcon, testid: "nav-products" },
       { to: "/analytics", label: "Analytics", Icon: ChartBarIcon, testid: "nav-analytics" },
+    ],
+  },
+  {
+    label: "AUTOMATION",
+    items: [
+      { to: "/labels", label: "Label Download", Icon: PrinterIcon, testid: "nav-labels" },
+      { to: "/settings", label: "Settings", Icon: GearIcon, testid: "nav-settings" },
     ],
   },
 ];

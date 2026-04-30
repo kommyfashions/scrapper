@@ -10,12 +10,18 @@ import PageHeader from "@/components/PageHeader";
 import { fmtDate, fmtRelative, StatusPill } from "@/lib/format";
 
 const FILTERS = ["all", "pending", "processing", "done", "failed"];
+const TYPES = [
+  { k: "all", label: "ALL TYPES" },
+  { k: "product_scrape", label: "SCRAPE" },
+  { k: "label_download", label: "LABEL" },
+];
 
 export default function JobsPage() {
   const [items, setItems] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState("all");
+  const [jobType, setJobType] = useState("all");
   const [q, setQ] = useState("");
   const [stats, setStats] = useState(null);
   const [error, setError] = useState("");
@@ -26,7 +32,7 @@ export default function JobsPage() {
     setError("");
     try {
       const [jobs, st] = await Promise.all([
-        api.get("/jobs", { params: { status, q: q || undefined, limit: 100 } }),
+        api.get("/jobs", { params: { status, type: jobType, q: q || undefined, limit: 100 } }),
         api.get("/jobs/stats"),
       ]);
       setItems(jobs.data.items);
@@ -37,7 +43,7 @@ export default function JobsPage() {
     } finally {
       setLoading(false);
     }
-  }, [status, q]);
+  }, [status, jobType, q]);
 
   useEffect(() => {
     document.title = "Jobs · Seller Central";
@@ -144,6 +150,22 @@ export default function JobsPage() {
               </button>
             );
           })}
+          <div className="mx-3 h-6 w-px bg-[#2A2A2A]" />
+          {TYPES.map((t) => (
+            <button
+              key={t.k}
+              onClick={() => setJobType(t.k)}
+              className={
+                "px-3 py-1.5 text-xs font-mono uppercase tracking-wider rounded-sm transition-colors " +
+                (jobType === t.k
+                  ? "bg-[#F5A623] text-black"
+                  : "bg-[#141414] text-[#A1A1AA] border border-[#2A2A2A] hover:bg-[#1F1F1F]")
+              }
+              data-testid={`type-filter-${t.k}`}
+            >
+              {t.label}
+            </button>
+          ))}
           <div className="flex-1" />
           <div className="relative w-full sm:w-72">
             <MagnifyingGlassIcon
@@ -201,6 +223,9 @@ export default function JobsPage() {
                   <tr key={j.id} data-testid={`job-row-${j.id}`}>
                     <td>
                       <StatusPill status={j.status} />
+                      {j.type === "label_download" && (
+                        <span className="ml-2 code-tag text-[#F5A623] border-[#F5A623]/40">LABEL</span>
+                      )}
                       {j.error && (
                         <div
                           className="mt-1 max-w-[260px] truncate font-mono text-[10px] text-[#FF3B30]"
@@ -211,9 +236,15 @@ export default function JobsPage() {
                       )}
                     </td>
                     <td className="max-w-md">
-                      <div className="font-mono text-xs text-white truncate">{j.product_url}</div>
-                      {pid && (
-                        <span className="code-tag mt-1 inline-block">id: {pid}</span>
+                      {j.type === "label_download" ? (
+                        <div className="font-mono text-xs text-[#F5A623]">Label Download job</div>
+                      ) : (
+                        <>
+                          <div className="font-mono text-xs text-white truncate">{j.product_url}</div>
+                          {pid && (
+                            <span className="code-tag mt-1 inline-block">id: {pid}</span>
+                          )}
+                        </>
                       )}
                     </td>
                     <td className="num text-xs text-[#A1A1AA]" title={fmtDate(j.created_at)}>

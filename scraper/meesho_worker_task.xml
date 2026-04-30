@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  Meesho worker — Task Scheduler auto-start
+
+  Install:
+    1. Place run_worker.bat + worker.py + product_review.py + labels.py
+       under C:\meesho-worker\ (or edit the WorkingDirectory / Command below).
+    2. Open Task Scheduler (taskschd.msc) -> Action -> "Import Task..."
+    3. Select this XML file.
+    4. On the "General" tab: set "Run only when user is logged on"
+       (the bot opens a visible Chrome window).
+    5. Save — next time you log in to Windows, the worker auto-starts.
+
+  What it does:
+    * Triggers at user logon (the laptop boot / sign-in event)
+    * Additional daily trigger at 11:00 AM local time (fallback for long-running sessions)
+    * Runs C:\meesho-worker\run_worker.bat
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Starts the Meesho Seller Central local worker. Launches debug Chrome and polls pending jobs from MongoDB.</Description>
+    <URI>\Meesho\Worker</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+    <CalendarTrigger>
+      <StartBoundary>2026-01-01T11:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\meesho-worker\run_worker.bat</Command>
+      <WorkingDirectory>C:\meesho-worker</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
