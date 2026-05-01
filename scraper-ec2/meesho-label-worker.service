@@ -1,0 +1,20 @@
+[Unit]
+Description=Meesho Label Worker (EC2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meesho-label-worker
+Environment="MESHO_MONGO_URI=mongodb://43.205.229.129:27017/"
+Environment="MESHO_DB_NAME=meesho"
+Environment="MESHO_POLL_SECONDS=5"
+ExecStart=/usr/bin/python3 /home/ubuntu/meesho-label-worker/label_worker.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/meesho-label-worker.log
+StandardError=append:/var/log/meesho-label-worker.log
+
+[Install]
+WantedBy=multi-user.target

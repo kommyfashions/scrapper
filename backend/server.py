@@ -110,6 +110,27 @@ class ScheduleSettings(BaseModel):
     scrape_time: str = "11:00"   # HH:MM 24h IST
     label_enabled: bool = False
     label_time: str = "09:30"
+    skip_dates: List[str] = []        # ["2026-05-03", ...]
+    skip_weekdays: List[int] = []     # 0=Mon ... 6=Sun (Python weekday())
+
+class AccountIn(BaseModel):
+    name: str
+    debug_port: int
+    profile_dir: str
+    pending_url: Optional[str] = None
+    ready_url: Optional[str] = None
+    enabled: bool = True
+
+class AccountUpdate(BaseModel):
+    name: Optional[str] = None
+    debug_port: Optional[int] = None
+    profile_dir: Optional[str] = None
+    pending_url: Optional[str] = None
+    ready_url: Optional[str] = None
+    enabled: Optional[bool] = None
+
+class LabelRunIn(BaseModel):
+    account_id: str
 
 # --------------------------------------------------------------------------------------
 # Utilities
@@ -154,21 +175,12 @@ def avg_rating_from_distribution(dist: Optional[Dict[str, int]]) -> Optional[flo
     return round(weighted / total, 2)
 
 def pick_product_image(p: dict) -> Optional[str]:
-    # prefer explicit product_image_large_url > thumb > first review media
+    """Return the proper product image URL captured by the scraper.
+    No review-media fallback — UI shows a placeholder if these aren't set."""
     for k in ("product_image_large_url", "product_image_thumb_url"):
         v = p.get(k)
         if v:
             return v
-    reviews = p.get("reviews")
-    if isinstance(reviews, list):
-        for r in reviews:
-            media = r.get("media") if isinstance(r, dict) else None
-            if isinstance(media, list):
-                for m in media:
-                    if isinstance(m, dict) and m.get("url"):
-                        return m["url"]
-                    if isinstance(m, str):
-                        return m
     return None
 
 # --------------------------------------------------------------------------------------
@@ -212,23 +224,42 @@ async def enqueue_daily_scrape_jobs():
     except Exception as e:
         logger.exception(f"[scheduler] scrape enqueue failed: {e}")
 
+async def is_skipped_today() -> bool:
+    s = await get_settings_doc()
+    today_local = datetime.now(SCHED_TZ)
+    iso = today_local.strftime("%Y-%m-%d")
+    if iso in (s.get("skip_dates") or []):
+        return True
+    if today_local.weekday() in (s.get("skip_weekdays") or []):
+        return True
+    return False
+
+
 async def enqueue_daily_label_job():
     try:
-        now = datetime.now(timezone.utc)
-        existing = await db.jobs.find_one({
-            "type": "label_download",
-            "status": {"$in": ["pending", "processing"]},
-        })
-        if existing:
-            logger.info("[scheduler] label job already queued/running, skip")
+        if await is_skipped_today():
+            logger.info("[scheduler] today is in skip rules — label job not enqueued")
             return
-        await db.jobs.insert_one({
-            "type": "label_download",
-            "status": "pending",
-            "created_at": now,
-            "submitted_by": "scheduler",
-        })
-        logger.info("[scheduler] Enqueued daily label_download job")
+        now = datetime.now(timezone.utc)
+        count = 0
+        async for acc in db.accounts.find({"enabled": True}):
+            existing = await db.jobs.find_one({
+                "type": "label_download",
+                "account_id": str(acc["_id"]),
+                "status": {"$in": ["pending", "processing"]},
+            })
+            if existing:
+                continue
+            await db.jobs.insert_one({
+                "type": "label_download",
+                "status": "pending",
+                "account_id": str(acc["_id"]),
+                "account_name": acc.get("name"),
+                "created_at": now,
+                "submitted_by": "scheduler",
+            })
+            count += 1
+        logger.info(f"[scheduler] Enqueued {count} label_download job(s)")
     except Exception as e:
         logger.exception(f"[scheduler] label enqueue failed: {e}")
 
@@ -275,6 +306,8 @@ async def startup():
         await db.jobs.create_index("type")
         await db.products.create_index("product_id", unique=False)
         await db.product_history.create_index([("product_id", 1), ("snapshot_at", -1)])
+        await db.accounts.create_index("name", unique=True)
+        await db.accounts.create_index("debug_port", unique=True)
     except Exception as e:
         logger.warning(f"Index creation issue: {e}")
 
@@ -521,18 +554,116 @@ async def product_history(product_id: str, days: int = 30, user: dict = Depends(
     return {"items": items}
 
 # --------------------------------------------------------------------------------------
+# Accounts (per Meesho seller account, used for label downloads on EC2)
+# --------------------------------------------------------------------------------------
+def _slugify(s: str) -> str:
+    return "".join(c if c.isalnum() else "-" for c in s.lower()).strip("-") or "account"
+
+async def _suggest_account_defaults() -> dict:
+    """Suggest next free port + profile dir for a new account."""
+    used_ports = set()
+    async for a in db.accounts.find({}, {"debug_port": 1}):
+        if a.get("debug_port"):
+            used_ports.add(int(a["debug_port"]))
+    port = 9222
+    while port in used_ports:
+        port += 1
+    n = await db.accounts.count_documents({}) + 1
+    return {
+        "debug_port": port,
+        "profile_dir": f"/home/ubuntu/chrome-profile{n}",
+    }
+
+@api.get("/accounts/defaults")
+async def account_defaults(user: dict = Depends(get_current_user)):
+    return await _suggest_account_defaults()
+
+@api.get("/accounts")
+async def list_accounts(user: dict = Depends(get_current_user)):
+    items = []
+    async for a in db.accounts.find().sort("created_at", 1):
+        items.append(serialize_doc(a))
+    return {"items": items}
+
+@api.post("/accounts")
+async def create_account(body: AccountIn, user: dict = Depends(get_current_user)):
+    # uniqueness: name and port
+    if await db.accounts.find_one({"name": body.name}):
+        raise HTTPException(status_code=400, detail=f"Account name '{body.name}' already exists")
+    if await db.accounts.find_one({"debug_port": body.debug_port}):
+        raise HTTPException(status_code=400, detail=f"Port {body.debug_port} already used by another account")
+    doc = {
+        **body.model_dump(),
+        "slug": _slugify(body.name),
+        "created_at": datetime.now(timezone.utc),
+        "last_used_at": None,
+        "last_status": None,
+    }
+    res = await db.accounts.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    return serialize_doc(doc)
+
+@api.put("/accounts/{account_id}")
+async def update_account(account_id: str, body: AccountUpdate, user: dict = Depends(get_current_user)):
+    try:
+        oid = ObjectId(account_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid account_id")
+    update = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not update:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    if "name" in update:
+        clash = await db.accounts.find_one({"name": update["name"], "_id": {"$ne": oid}})
+        if clash:
+            raise HTTPException(status_code=400, detail=f"Account name '{update['name']}' already exists")
+        update["slug"] = _slugify(update["name"])
+    if "debug_port" in update:
+        clash = await db.accounts.find_one({"debug_port": update["debug_port"], "_id": {"$ne": oid}})
+        if clash:
+            raise HTTPException(status_code=400, detail=f"Port {update['debug_port']} already used")
+    res = await db.accounts.update_one({"_id": oid}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Account not found")
+    doc = await db.accounts.find_one({"_id": oid})
+    return serialize_doc(doc)
+
+@api.delete("/accounts/{account_id}")
+async def delete_account(account_id: str, user: dict = Depends(get_current_user)):
+    try:
+        oid = ObjectId(account_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid account_id")
+    res = await db.accounts.delete_one({"_id": oid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {"ok": True}
+
+# --------------------------------------------------------------------------------------
 # Labels
 # --------------------------------------------------------------------------------------
 @api.post("/labels/run-now")
-async def label_run_now(user: dict = Depends(get_current_user)):
+async def label_run_now(body: LabelRunIn, user: dict = Depends(get_current_user)):
+    try:
+        oid = ObjectId(body.account_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid account_id")
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if not acc.get("enabled", True):
+        raise HTTPException(status_code=400, detail=f"Account '{acc.get('name')}' is disabled")
     existing = await db.jobs.find_one({
         "type": "label_download",
+        "account_id": body.account_id,
         "status": {"$in": ["pending", "processing"]},
     })
     if existing:
         return {"ok": True, "already_queued": True, "id": str(existing["_id"])}
     doc = {
-        "type": "label_download", "status": "pending",
+        "type": "label_download",
+        "status": "pending",
+        "account_id": body.account_id,
+        "account_name": acc.get("name"),
         "created_at": datetime.now(timezone.utc),
         "submitted_by": user["email"],
     }

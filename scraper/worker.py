@@ -1,27 +1,16 @@
 """
-Meesho Seller Central — local worker (v2).
+Meesho product worker — Windows.
 
-What's new vs v1:
-  * Handles two job types:
-      - type == "product_scrape"  -> runs product_review.scrape_product(url)
-      - type == "label_download"  -> runs labels.main()  (Meesho supplier portal bot)
-    Older jobs without a "type" field are treated as "product_scrape" for
-    backwards compatibility.
-  * On a successful product scrape, writes a snapshot to `product_history`
-    so the dashboard can draw trend charts.
-  * Reads MongoDB connection from environment variable MESHO_MONGO_URI if set,
-    otherwise defaults to the value you used before.
-  * Cleaner error reporting — full exception text is stored on the job.
+Polls the EC2 MongoDB `jobs` collection for jobs of type "product_scrape",
+runs the v2.1 scraper for each, writes a snapshot to `product_history`.
 
-Prerequisites on the local machine:
-  * Chrome running with remote-debugging-port=9222 (the CDP port used by both
-    scripts). Recommended: shortcut
-      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=9222 --user-data-dir=C:\\meesho_profile
-  * Python deps: pip install pymongo playwright && playwright install chromium
-  * For `label_download` jobs, be already signed in to supplier.meesho.com in that Chrome session.
+This worker only handles product scrapes. Label downloads run on a
+separate worker on the EC2 Ubuntu machine.
 
-Run:
-  python worker.py
+Env overrides:
+  MESHO_MONGO_URI   default: mongodb://43.205.229.129:27017/
+  MESHO_DB_NAME     default: meesho
+  MESHO_POLL_SECONDS default: 5
 """
 import os
 import time
@@ -30,16 +19,11 @@ from datetime import datetime, timezone
 
 from pymongo import MongoClient
 
-# Local modules (must be in the same folder as this file)
 from product_review import scrape_product
-import labels
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 MONGO_URI = os.environ.get("MESHO_MONGO_URI", "mongodb://43.205.229.129:27017/")
 DB_NAME = os.environ.get("MESHO_DB_NAME", "meesho")
-POLL_SLEEP_SECONDS = int(os.environ.get("MESHO_POLL_SECONDS", "5"))
+POLL = int(os.environ.get("MESHO_POLL_SECONDS", "5"))
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
@@ -48,24 +32,17 @@ jobs = db["jobs"]
 product_history = db["product_history"]
 
 
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
 def _avg_rating(distribution):
     if not isinstance(distribution, dict):
         return None
     total, weighted = 0, 0
     for k, v in distribution.items():
         try:
-            star = int(k)
-            count = int(v)
+            total += int(v)
+            weighted += int(k) * int(v)
         except Exception:
             continue
-        total += count
-        weighted += star * count
-    if total == 0:
-        return None
-    return round(weighted / total, 2)
+    return round(weighted / total, 2) if total else None
 
 
 def handle_product_scrape(job):
@@ -76,10 +53,11 @@ def handle_product_scrape(job):
     print(f"[product_scrape] {url}")
     result = scrape_product(url)
 
-    # sort reviews newest-first
-    def _created(r):
-        return r.get("created_at") or ""
-    reviews_sorted = sorted(result.get("reviews", []), key=_created, reverse=True)
+    reviews_sorted = sorted(
+        result.get("reviews", []),
+        key=lambda r: r.get("created_at") or "",
+        reverse=True,
+    )
 
     now = datetime.now(timezone.utc)
     doc = {
@@ -95,17 +73,13 @@ def handle_product_scrape(job):
         "reviews": reviews_sorted,
         "updated_at": now,
     }
+
     products.update_one(
         {"product_id": result["product_id"]},
-        {
-            "$set": doc,
-            # auto-track any product we scrape, but don't override an explicit False
-            "$setOnInsert": {"tracked": True},
-        },
+        {"$set": doc, "$setOnInsert": {"tracked": True}},
         upsert=True,
     )
 
-    # history snapshot (always insert; one per scrape)
     product_history.insert_one({
         "product_id": result["product_id"],
         "snapshot_at": now,
@@ -114,72 +88,44 @@ def handle_product_scrape(job):
         "rating_distribution": doc["rating_distribution"],
     })
 
-    print(f"[product_scrape] saved {doc['total_reviews']} reviews for {result['product_id']}")
+    print(f"[product_scrape] saved {doc['total_reviews']} reviews | "
+          f"image={'Y' if doc['product_image_large_url'] else 'N'}")
 
 
-def handle_label_download(job):
-    print("[label_download] running labels.main()")
-    labels.main()
-    print("[label_download] finished")
-
-
-HANDLERS = {
-    "product_scrape": handle_product_scrape,
-    "label_download": handle_label_download,
-}
-
-
-# ---------------------------------------------------------------------------
-# Worker loop
-# ---------------------------------------------------------------------------
-def worker_loop():
-    print(f"🚀 Worker started (EC2 Mongo: {MONGO_URI}, db={DB_NAME})")
-    print(f"   handlers: {list(HANDLERS.keys())}")
+def loop():
+    print(f"🚀 Product worker (Windows) — Mongo: {MONGO_URI} db={DB_NAME}")
     while True:
+        # claim only product_scrape jobs (label jobs are handled by EC2 worker)
         job = jobs.find_one_and_update(
-            {"status": "pending"},
+            {"status": "pending", "$or": [{"type": "product_scrape"}, {"type": {"$exists": False}}]},
             {"$set": {"status": "processing", "started_at": datetime.now(timezone.utc)}},
             sort=[("created_at", 1)],
         )
         if not job:
-            time.sleep(POLL_SLEEP_SECONDS)
+            time.sleep(POLL)
             continue
 
-        job_type = job.get("type") or "product_scrape"  # legacy default
-        print(f"\n=== Picked job {job.get('_id')} type={job_type} ===")
-
-        handler = HANDLERS.get(job_type)
-        if handler is None:
-            msg = f"Unknown job type: {job_type}"
-            print(f"❌ {msg}")
-            jobs.update_one(
-                {"_id": job["_id"]},
-                {"$set": {"status": "failed", "finished_at": datetime.now(timezone.utc), "error": msg}},
-            )
-            continue
-
+        print(f"\n=== job {job.get('_id')} ===")
         try:
-            handler(job)
+            handle_product_scrape(job)
             jobs.update_one(
                 {"_id": job["_id"]},
                 {"$set": {"status": "done", "finished_at": datetime.now(timezone.utc)}},
             )
-            print("✅ Done")
+            print("✅ done")
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
-            print(f"❌ Failed: {err}")
+            print(f"❌ {err}")
             traceback.print_exc()
             jobs.update_one(
                 {"_id": job["_id"]},
-                {
-                    "$set": {
-                        "status": "failed",
-                        "finished_at": datetime.now(timezone.utc),
-                        "error": err[:1000],
-                    }
-                },
+                {"$set": {
+                    "status": "failed",
+                    "finished_at": datetime.now(timezone.utc),
+                    "error": err[:1000],
+                }},
             )
 
 
 if __name__ == "__main__":
-    worker_loop()
+    loop()
