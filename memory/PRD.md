@@ -40,6 +40,25 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - New Settings page: two schedule sections with enable toggle, time picker, next-run display, and "Run now" manual triggers.
 - Jobs page: job-type filter pills (ALL TYPES / SCRAPE / LABEL), LABEL badge on label rows.
 
+## Implemented — Iteration 3 (2026-05-01)
+**Backend additions**
+- New endpoints: `GET/POST/PUT/DELETE /api/accounts`, `GET /api/accounts/defaults` (suggests next free port + profile_dir), `GET/POST/DELETE /api/alerts`, `POST /api/alerts/{id}/read`, `POST /api/alerts/read-all`, `POST /api/alerts/check-now`, `POST /api/scheduler/run-now?what=snapshot`.
+- `LabelRunIn` body now `Optional` with `all_accounts` flag — `POST /api/labels/run-now` fans out to every enabled account when called with `{}` or `{all_accounts: true}`, returning `{ok, queued, skipped}`; single-account path still returns the job doc.
+- `ScheduleSettings` persists `skip_dates` (YYYY-MM-DD list) and `skip_weekdays` (int 0-6 list); `enqueue_daily_label_job` is no-op when today matches.
+- New scheduler jobs: `daily_snapshot` (5 min after `daily_scrape`, into `product_history`) and `alerts_check` (every 30 min).
+- `detect_alerts()` compares current state vs ~24h-old snapshot — raises `one_star_spike` (≥3 new 1★ in 24h) or `rating_drop` (avg ↓ ≥0.20). Deduped per-day per-product via unique sparse index on `alerts.dedup_key`.
+
+**Frontend additions**
+- Sidebar AUTOMATION: new **Accounts** entry above Label Download.
+- New `/accounts` page: full CRUD UI with Add Account modal (auto-fills defaults from backend), enabled toggle, edit, delete-with-confirm.
+- Labels page rewrite: account selector dropdown, Account column in Run History.
+- Settings page: new **Label Skip Rules** panel (MON-SUN chips + date picker) + "Snapshot now" trigger.
+- Global **Alerts Bell**: fixed top-right with unread badge + drawer (Check Now / Mark All Read / Open Product / Mark Read / Delete); polls every 60s.
+
+**Verified — Iteration 3**
+- 19/20 new backend tests pass.
+- UI smoke screenshots (Accounts, Labels, Settings, Alerts drawer) — all rendering as designed.
+
 **Scraper + Worker (local files — `/app/scraper/`)**
 - `product_review.py` v2: now also captures `product_name`, `product_description`, `product_image_thumb_url`, `product_image_large_url` from the same `review_summary` API response.
 - `worker.py` v2: dispatch by job `type` (`product_scrape` | `label_download`), writes a `product_history` snapshot on each successful scrape, cleaner error reporting, reads MongoDB URI from env.

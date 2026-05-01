@@ -98,10 +98,10 @@ export default function LabelsPage() {
               className="input-shell font-mono text-xs py-1.5 w-auto"
               data-testid="labels-account-select"
             >
-              <option value="__all__">▸ All enabled accounts ({enabledAccounts.length})</option>
+              <option value="__all__">{`▸ All enabled accounts (${enabledAccounts.length})`}</option>
               {accounts.map((a) => (
                 <option key={a.id} value={a.id} disabled={!a.enabled}>
-                  {a.name} {a.enabled ? "" : "(disabled)"} · :{a.debug_port}
+                  {`${a.name}${a.enabled ? "" : " (disabled)"} · :${a.debug_port}`}
                 </option>
               ))}
             </select>
