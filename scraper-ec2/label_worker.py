@@ -81,14 +81,38 @@ def run_label_for_account(acc: dict):
             f"or run ./start_chromes.sh"
         )
 
+    # ── derive per-account supplier URLs ────────────────────────────────────
+    # Account `name` IS the Meesho URL suffix (e.g. 'hrbib', 'uobfs').
+    # We always derive the URLs from the name so adding a new account just
+    # works.  An explicit pending_url / ready_url on the account doc still
+    # wins (escape hatch).
+    suffix = (acc.get("name") or "").strip()
+    derived_pending = (
+        f"https://supplier.meesho.com/panel/v3/new/fulfillment/{suffix}/orders/pending"
+        if suffix else None
+    )
+    derived_ready = (
+        f"https://supplier.meesho.com/panel/v3/new/fulfillment/{suffix}/orders/ready-to-ship"
+        if suffix else None
+    )
+    pending_url = acc.get("pending_url") or derived_pending
+    ready_url = acc.get("ready_url") or derived_ready
+
+    if not pending_url or not ready_url:
+        raise RuntimeError(
+            f"account '{acc.get('name')}' has no name suffix and no "
+            f"pending_url/ready_url — cannot derive Meesho URLs."
+        )
+
     # Override the labels module globals for this run
     labels.DEBUG_PORT = f"http://127.0.0.1:{port}"
-    if acc.get("pending_url"):
-        labels.PENDING_URL = acc["pending_url"]
-    if acc.get("ready_url"):
-        labels.READY_URL = acc["ready_url"]
+    labels.PENDING_URL = pending_url
+    labels.READY_URL = ready_url
 
-    print(f"[label_worker] account='{acc.get('name')}' port={port}  → labels.main()")
+    print(
+        f"[label_worker] account='{acc.get('name')}' port={port} "
+        f"→ pending={pending_url}"
+    )
     labels.main()
 
 
