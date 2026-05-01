@@ -13,6 +13,7 @@ import ProductsPage from "@/pages/ProductsPage";
 import ProductDetailPage from "@/pages/ProductDetailPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import LabelsPage from "@/pages/LabelsPage";
+import AccountsPage from "@/pages/AccountsPage";
 import SettingsPage from "@/pages/SettingsPage";
 
 function App() {
@@ -36,6 +37,7 @@ function App() {
               <Route path="/products/:productId" element={<ProductDetailPage />} />
               <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="/labels" element={<LabelsPage />} />
+              <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

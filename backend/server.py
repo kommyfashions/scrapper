@@ -130,7 +130,8 @@ class AccountUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 class LabelRunIn(BaseModel):
-    account_id: str
+    account_id: Optional[str] = None
+    all_accounts: bool = False
 
 # --------------------------------------------------------------------------------------
 # Utilities
@@ -235,6 +236,114 @@ async def is_skipped_today() -> bool:
     return False
 
 
+async def detect_alerts():
+    """Run every 30min: detect review-velocity & rating-drop anomalies vs ~24h ago.
+    Dedup with key = (product_id, type, YYYY-MM-DD)."""
+    try:
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+        cutoff_lo = now - timedelta(hours=30)
+        cutoff_hi = now - timedelta(hours=20)
+        new_count = 0
+        async for p in db.products.find({"tracked": True}, {
+            "_id": 0, "product_id": 1, "product_name": 1,
+            "rating_distribution": 1, "total_reviews": 1,
+        }):
+            pid = p.get("product_id")
+            if not pid:
+                continue
+            cur_dist = p.get("rating_distribution") or {}
+            cur_avg = avg_rating_from_distribution(cur_dist)
+
+            # find a snapshot from ~24h ago
+            prev = await db.product_history.find_one(
+                {"product_id": pid, "snapshot_at": {"$gte": cutoff_lo, "$lte": cutoff_hi}},
+                sort=[("snapshot_at", -1)],
+            )
+            if not prev:
+                # also accept "earliest snapshot older than 20h" if present
+                prev = await db.product_history.find_one(
+                    {"product_id": pid, "snapshot_at": {"$lte": cutoff_hi}},
+                    sort=[("snapshot_at", -1)],
+                )
+            if not prev:
+                continue
+
+            prev_dist = prev.get("rating_distribution") or {}
+            prev_avg = prev.get("avg_rating")
+
+            # 1-star spike
+            cur_1 = int(cur_dist.get("1") or cur_dist.get(1) or 0)
+            prev_1 = int(prev_dist.get("1") or prev_dist.get(1) or 0)
+            delta_1 = cur_1 - prev_1
+            if delta_1 >= 3:
+                key = f"{pid}:one_star_spike:{today}"
+                exists = await db.alerts.find_one({"dedup_key": key})
+                if not exists:
+                    await db.alerts.insert_one({
+                        "type": "one_star_spike",
+                        "severity": "high",
+                        "product_id": pid,
+                        "product_name": p.get("product_name"),
+                        "message": f"+{delta_1} new 1★ reviews in last 24h",
+                        "details": {"prev_1star": prev_1, "cur_1star": cur_1},
+                        "created_at": now,
+                        "read": False,
+                        "dedup_key": key,
+                    })
+                    new_count += 1
+
+            # rating drop
+            if cur_avg is not None and prev_avg is not None:
+                drop = round(prev_avg - cur_avg, 2)
+                if drop >= 0.2:
+                    key = f"{pid}:rating_drop:{today}"
+                    exists = await db.alerts.find_one({"dedup_key": key})
+                    if not exists:
+                        await db.alerts.insert_one({
+                            "type": "rating_drop",
+                            "severity": "medium",
+                            "product_id": pid,
+                            "product_name": p.get("product_name"),
+                            "message": f"avg rating dropped {prev_avg} → {cur_avg} ({drop:.2f}) in 24h",
+                            "details": {"prev_avg": prev_avg, "cur_avg": cur_avg, "drop": drop},
+                            "created_at": now,
+                            "read": False,
+                            "dedup_key": key,
+                        })
+                        new_count += 1
+
+        if new_count:
+            logger.info(f"[scheduler] alerts: {new_count} new alert(s) raised")
+    except Exception as e:
+        logger.exception(f"[scheduler] detect_alerts failed: {e}")
+
+
+async def snapshot_all_products():
+    """Capture a daily snapshot of every tracked product into product_history."""
+    try:
+        now = datetime.now(timezone.utc)
+        count = 0
+        async for p in db.products.find({"tracked": True}, {
+            "_id": 0, "product_id": 1, "total_reviews": 1, "rating_distribution": 1,
+        }):
+            pid = p.get("product_id")
+            if not pid:
+                continue
+            dist = p.get("rating_distribution") or {}
+            await db.product_history.insert_one({
+                "product_id": pid,
+                "snapshot_at": now,
+                "total_reviews": p.get("total_reviews") or 0,
+                "rating_distribution": dist,
+                "avg_rating": avg_rating_from_distribution(dist),
+            })
+            count += 1
+        logger.info(f"[scheduler] snapshot wrote {count} product_history rows")
+    except Exception as e:
+        logger.exception(f"[scheduler] snapshot failed: {e}")
+
+
 async def enqueue_daily_label_job():
     try:
         if await is_skipped_today():
@@ -284,6 +393,14 @@ async def reconfigure_scheduler():
             CronTrigger(hour=h, minute=m, timezone=SCHED_TZ),
             id="daily_scrape", replace_existing=True,
         )
+        # snapshot 5 minutes after the scrape to give workers time to refresh data
+        sm = (m + 5) % 60
+        sh = (h + (1 if m + 5 >= 60 else 0)) % 24
+        scheduler.add_job(
+            snapshot_all_products,
+            CronTrigger(hour=sh, minute=sm, timezone=SCHED_TZ),
+            id="daily_snapshot", replace_existing=True,
+        )
     if s.get("label_enabled", False):
         h, m = _parse_hhmm(s.get("label_time", "09:30"))
         scheduler.add_job(
@@ -291,6 +408,12 @@ async def reconfigure_scheduler():
             CronTrigger(hour=h, minute=m, timezone=SCHED_TZ),
             id="daily_label", replace_existing=True,
         )
+    # alerts run every 30 minutes regardless of toggles
+    scheduler.add_job(
+        detect_alerts,
+        CronTrigger(minute="*/30", timezone=SCHED_TZ),
+        id="alerts_check", replace_existing=True,
+    )
     logger.info(f"[scheduler] reconfigured: jobs={[j.id for j in scheduler.get_jobs()]}")
 
 # --------------------------------------------------------------------------------------
@@ -308,6 +431,8 @@ async def startup():
         await db.product_history.create_index([("product_id", 1), ("snapshot_at", -1)])
         await db.accounts.create_index("name", unique=True)
         await db.accounts.create_index("debug_port", unique=True)
+        await db.alerts.create_index([("created_at", -1)])
+        await db.alerts.create_index("dedup_key", unique=True, sparse=True)
     except Exception as e:
         logger.warning(f"Index creation issue: {e}")
 
@@ -642,7 +767,36 @@ async def delete_account(account_id: str, user: dict = Depends(get_current_user)
 # Labels
 # --------------------------------------------------------------------------------------
 @api.post("/labels/run-now")
-async def label_run_now(body: LabelRunIn, user: dict = Depends(get_current_user)):
+async def label_run_now(body: Optional[LabelRunIn] = None, user: dict = Depends(get_current_user)):
+    body = body or LabelRunIn()
+    # ── multi-account / fan-out path ─────────────────────────────────────────
+    if body.all_accounts or not body.account_id:
+        now = datetime.now(timezone.utc)
+        queued, skipped = [], []
+        async for acc in db.accounts.find({"enabled": True}):
+            existing = await db.jobs.find_one({
+                "type": "label_download",
+                "account_id": str(acc["_id"]),
+                "status": {"$in": ["pending", "processing"]},
+            })
+            if existing:
+                skipped.append({"account_id": str(acc["_id"]), "name": acc.get("name"), "reason": "already_queued"})
+                continue
+            doc = {
+                "type": "label_download",
+                "status": "pending",
+                "account_id": str(acc["_id"]),
+                "account_name": acc.get("name"),
+                "created_at": now,
+                "submitted_by": user["email"],
+            }
+            r = await db.jobs.insert_one(doc)
+            queued.append({"id": str(r.inserted_id), "account_id": str(acc["_id"]), "name": acc.get("name")})
+        if not queued and not skipped:
+            raise HTTPException(status_code=400, detail="No enabled accounts. Add an account first.")
+        return {"ok": True, "queued": queued, "skipped": skipped}
+
+    # ── single-account path ──────────────────────────────────────────────────
     try:
         oid = ObjectId(body.account_id)
     except Exception:
@@ -712,10 +866,12 @@ async def manual_run(what: str = Query("scrape"), user: dict = Depends(get_curre
     """Manually trigger a daily run right now (scrape | label)."""
     if what == "scrape":
         await enqueue_daily_scrape_jobs()
+    elif what == "snapshot":
+        await snapshot_all_products()
     elif what == "label":
         await enqueue_daily_label_job()
     else:
-        raise HTTPException(status_code=400, detail="what must be 'scrape' or 'label'")
+        raise HTTPException(status_code=400, detail="what must be 'scrape' | 'label' | 'snapshot'")
     return {"ok": True}
 
 # --------------------------------------------------------------------------------------
@@ -805,6 +961,57 @@ async def analytics_overview(user: dict = Depends(get_current_user)):
         "review_volume": review_volume,
         "helpful_reviews": helpful_reviews,
     }
+
+# --------------------------------------------------------------------------------------
+# Alerts
+# --------------------------------------------------------------------------------------
+@api.get("/alerts")
+async def list_alerts(
+    unread_only: bool = False,
+    limit: int = Query(50, le=200),
+    user: dict = Depends(get_current_user),
+):
+    q: dict = {}
+    if unread_only:
+        q["read"] = False
+    cursor = db.alerts.find(q).sort("created_at", -1).limit(limit)
+    items = [serialize_doc(d) for d in await cursor.to_list(length=limit)]
+    unread = await db.alerts.count_documents({"read": False})
+    total = await db.alerts.count_documents({})
+    return {"items": items, "unread": unread, "total": total}
+
+@api.post("/alerts/{alert_id}/read")
+async def mark_alert_read(alert_id: str, user: dict = Depends(get_current_user)):
+    try:
+        oid = ObjectId(alert_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid alert_id")
+    res = await db.alerts.update_one({"_id": oid}, {"$set": {"read": True}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"ok": True}
+
+@api.post("/alerts/read-all")
+async def mark_all_read(user: dict = Depends(get_current_user)):
+    res = await db.alerts.update_many({"read": False}, {"$set": {"read": True}})
+    return {"ok": True, "updated": res.modified_count}
+
+@api.delete("/alerts/{alert_id}")
+async def delete_alert(alert_id: str, user: dict = Depends(get_current_user)):
+    try:
+        oid = ObjectId(alert_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid alert_id")
+    res = await db.alerts.delete_one({"_id": oid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return {"ok": True}
+
+@api.post("/alerts/check-now")
+async def alerts_check_now(user: dict = Depends(get_current_user)):
+    """Manually run the alerts detector right now."""
+    await detect_alerts()
+    return {"ok": True}
 
 # --------------------------------------------------------------------------------------
 # Health + Mount

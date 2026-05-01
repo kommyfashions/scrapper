@@ -9,6 +9,7 @@ import {
   TerminalWindowIcon,
   PrinterIcon,
   GearIcon,
+  UserCircleIcon,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/auth/AuthContext";
 
@@ -31,6 +32,7 @@ const NAV_SECTIONS = [
   {
     label: "AUTOMATION",
     items: [
+      { to: "/accounts", label: "Accounts", Icon: UserCircleIcon, testid: "nav-accounts" },
       { to: "/labels", label: "Label Download", Icon: PrinterIcon, testid: "nav-labels" },
       { to: "/settings", label: "Settings", Icon: GearIcon, testid: "nav-settings" },
     ],
