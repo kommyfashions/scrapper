@@ -1,12 +1,20 @@
 """
-Meesho product review scraper — v2.1
+Meesho product review scraper — v2.2
 
-Runs on user's Windows laptop. Connects to a pre-existing Chrome over CDP (port 9222)
-and scrapes the Meesho product page. Captures reviews + product metadata
-(name, description, large image, thumbnail) from the same `review_summary`
-API response that already powers the rating distribution.
+Fixes vs v2.1:
+  * Product meta (product_name, product_image_*) is now captured via a
+    FULL recursive scan of every review/review_summary response — not just
+    the block that holds the `reviews` array.  This handles any nesting
+    shape Meesho uses.
+  * Handler callbacks are hardened against late responses that fire while
+    the browser is closing (swallows CancelledError / TargetClosedError).
+  * Optional --debug flag dumps the first matching response to
+    debug_response.json so you can inspect the exact structure.
 """
 import time
+import json
+import os
+import sys
 from playwright.sync_api import sync_playwright
 
 DEBUG_PORT = "http://127.0.0.1:9222"
@@ -19,57 +27,69 @@ META_KEYS = (
 )
 
 
-def _find_review_block(payload):
-    """Locate the dict in the API response that contains the `reviews` array.
-    Product metadata fields (image, name, description) sit at the same level."""
-    if isinstance(payload, dict):
-        if isinstance(payload.get("reviews"), list):
-            return payload
-        for v in payload.values():
-            found = _find_review_block(v)
-            if found is not None:
+def _scan_meta_anywhere(obj, meta):
+    """Walk the full tree and copy any META_KEYS found at ANY depth."""
+    if isinstance(obj, dict):
+        for k in META_KEYS:
+            if not meta.get(k):
+                v = obj.get(k)
+                if isinstance(v, str) and v:
+                    meta[k] = v
+        for v in obj.values():
+            _scan_meta_anywhere(v, meta)
+    elif isinstance(obj, list):
+        for it in obj:
+            _scan_meta_anywhere(it, meta)
+
+
+def _find_reviews_list(obj):
+    """Return the first non-empty list of review dicts found in `obj`."""
+    if isinstance(obj, list):
+        if obj and isinstance(obj[0], dict) and (
+            "review_id" in obj[0] or "rating" in obj[0] or "comments" in obj[0]
+        ):
+            return obj
+        for it in obj:
+            found = _find_reviews_list(it)
+            if found:
                 return found
-    elif isinstance(payload, list):
-        for item in payload:
-            found = _find_review_block(item)
-            if found is not None:
+    elif isinstance(obj, dict):
+        # fast path: explicit "reviews" key
+        r = obj.get("reviews")
+        if isinstance(r, list) and r and isinstance(r[0], dict):
+            return r
+        for v in obj.values():
+            found = _find_reviews_list(v)
+            if found:
                 return found
     return None
 
 
-def _capture_meta_from_block(block, meta):
-    """Copy product_name / image fields from the review block into `meta`."""
-    if not isinstance(block, dict):
-        return
-    for k in META_KEYS:
-        if not meta.get(k) and block.get(k):
-            meta[k] = block[k]
+def _find_rating_distribution(obj):
+    """Pull `rating_count_map` or `rating_distribution` from anywhere in the tree."""
+    if isinstance(obj, dict):
+        for key in ("rating_count_map", "rating_distribution"):
+            v = obj.get(key)
+            if isinstance(v, dict) and any(v.values()):
+                return v
+        for v in obj.values():
+            found = _find_rating_distribution(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for it in obj:
+            found = _find_rating_distribution(it)
+            if found:
+                return found
+    return None
 
 
 def _extract_rating_from_next_data(page):
-    """Pull rating_count_map from window.__NEXT_DATA__ as a fallback."""
     try:
         data = page.evaluate("() => window.__NEXT_DATA__")
     except Exception:
         return {}
-
-    def walk(obj):
-        if isinstance(obj, dict):
-            if "review_summary" in obj:
-                return obj.get("review_summary", {}).get("data", {}) or {}
-            for v in obj.values():
-                f = walk(v)
-                if f:
-                    return f
-        elif isinstance(obj, list):
-            for it in obj:
-                f = walk(it)
-                if f:
-                    return f
-        return None
-
-    summary = walk(data) or {}
-    return summary.get("rating_count_map") or {}
+    return _find_rating_distribution(data) or {}
 
 
 def extract_seller(page):
@@ -86,10 +106,11 @@ def extract_seller(page):
         return None
 
 
-def scrape_product(product_url: str) -> dict:
+def scrape_product(product_url: str, debug: bool = False) -> dict:
     all_reviews = {}
     meta = {k: None for k in META_KEYS}
     rating_distribution = {}
+    debug_dumped = [False]  # mutable so nested fn can flip it
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(DEBUG_PORT)
@@ -103,49 +124,63 @@ def scrape_product(product_url: str) -> dict:
         time.sleep(5)
 
         seller_name = extract_seller(page)
-        # 1) initial rating distribution from __NEXT_DATA__
-        rating_distribution = _extract_rating_from_next_data(page) or {}
+        d0 = _extract_rating_from_next_data(page)
+        if d0:
+            rating_distribution.update(d0)
 
         def handle_response(response):
             try:
-                if "review" not in response.url:
-                    return
-                data = response.json()
+                url = response.url
             except Exception:
                 return
-
-            block = _find_review_block(data)
-            if block is None:
+            if "review" not in url:
+                return
+            try:
+                data = response.json()
+            except Exception:
+                # Browser closing / request aborted / non-JSON — ignore.
                 return
 
-            # capture product meta (anchored to where reviews live)
-            _capture_meta_from_block(block, meta)
+            if debug and not debug_dumped[0]:
+                try:
+                    with open("debug_response.json", "w", encoding="utf-8") as fh:
+                        json.dump({"url": url, "data": data}, fh, indent=2, default=str)
+                    print(f"[debug] dumped first review response to debug_response.json ({url})")
+                    debug_dumped[0] = True
+                except Exception:
+                    pass
 
-            # update rating_distribution if API returns it
-            rcm = block.get("rating_count_map") or block.get("rating_distribution")
-            if isinstance(rcm, dict):
-                # only overwrite if non-empty
-                if any(rcm.values()):
-                    rating_distribution.clear()
-                    rating_distribution.update(rcm)
+            # --- product meta (full-tree scan) ---
+            _scan_meta_anywhere(data, meta)
 
-            # collect reviews
-            for r in block.get("reviews") or []:
-                rid = r.get("review_id")
-                if rid is None:
-                    continue
-                all_reviews[rid] = {
-                    "review_id": rid,
-                    "text": r.get("comments"),
-                    "rating": r.get("rating"),
-                    "customer": (r.get("author") or {}).get("name"),
-                    "helpful": r.get("helpful_count", 0),
-                    "media": r.get("media", []),
-                    "created_at": r.get("created"),
-                }
-            print(f"[reviews] total so far: {len(all_reviews)} | meta: "
-                  f"name={'Y' if meta.get('product_name') else 'N'} "
-                  f"img={'Y' if meta.get('product_image_large_url') else 'N'}")
+            # --- rating distribution ---
+            rd = _find_rating_distribution(data)
+            if rd:
+                rating_distribution.clear()
+                rating_distribution.update(rd)
+
+            # --- reviews ---
+            reviews = _find_reviews_list(data)
+            if reviews:
+                for r in reviews:
+                    rid = r.get("review_id")
+                    if rid is None:
+                        continue
+                    all_reviews[rid] = {
+                        "review_id": rid,
+                        "text": r.get("comments"),
+                        "rating": r.get("rating"),
+                        "customer": (r.get("author") or {}).get("name"),
+                        "helpful": r.get("helpful_count", 0),
+                        "media": r.get("media", []),
+                        "created_at": r.get("created"),
+                    }
+                print(
+                    f"[reviews] total: {len(all_reviews):>3} | "
+                    f"name={'Y' if meta.get('product_name') else 'N'} "
+                    f"img={'Y' if meta.get('product_image_large_url') else 'N'} "
+                    f"thumb={'Y' if meta.get('product_image_thumb_url') else 'N'}"
+                )
 
         page.on("response", handle_response)
 
@@ -180,7 +215,12 @@ def scrape_product(product_url: str) -> dict:
                 break
             last = len(all_reviews)
 
-        page.remove_listener("response", handle_response)
+        # drain: give in-flight responses a moment to arrive
+        time.sleep(2)
+        try:
+            page.remove_listener("response", handle_response)
+        except Exception:
+            pass
 
         product_id = product_url.rstrip("/").split("/p/")[-1].split("?")[0]
 
@@ -199,10 +239,12 @@ def scrape_product(product_url: str) -> dict:
 
 
 if __name__ == "__main__":
-    import sys, json
     if len(sys.argv) < 2:
-        print("Usage: python product_review.py <product_url>")
+        print("Usage: python product_review.py <product_url> [--debug]")
         sys.exit(1)
-    out = scrape_product(sys.argv[1])
-    out["reviews"] = f"[{len(out['reviews'])} reviews]"
-    print(json.dumps(out, indent=2, default=str))
+    url = sys.argv[1]
+    debug = "--debug" in sys.argv[2:]
+    out = scrape_product(url, debug=debug)
+    preview = dict(out)
+    preview["reviews"] = f"[{len(out['reviews'])} reviews]"
+    print(json.dumps(preview, indent=2, default=str))
