@@ -33,6 +33,8 @@ export default function ProductDetailPage() {
   const [history, setHistory] = useState([]);
   const [historyRange, setHistoryRange] = useState(30);
   const [trackBusy, setTrackBusy] = useState(false);
+  const [compareA, setCompareA] = useState("");
+  const [compareB, setCompareB] = useState("");
 
   const loadProduct = () => {
     setLoading(true);
@@ -49,7 +51,18 @@ export default function ProductDetailPage() {
 
   useEffect(() => {
     api.get(`/products/${productId}/history`, { params: { days: historyRange } })
-      .then((r) => setHistory(r.data.items || []))
+      .then((r) => {
+        const items = r.data.items || [];
+        setHistory(items);
+        // default compare: oldest ↔ latest inside the visible range
+        if (items.length >= 2) {
+          setCompareA(items[0].snapshot_at);
+          setCompareB(items[items.length - 1].snapshot_at);
+        } else {
+          setCompareA("");
+          setCompareB("");
+        }
+      })
       .catch(() => setHistory([]));
   }, [productId, historyRange]);
 
@@ -85,6 +98,30 @@ export default function ProductDetailPage() {
       rating: (last.avg_rating ?? 0) - (first.avg_rating ?? 0),
     };
   }, [history]);
+
+  const compareRows = useMemo(() => {
+    const a = history.find((h) => h.snapshot_at === compareA);
+    const b = history.find((h) => h.snapshot_at === compareB);
+    if (!a || !b) return null;
+    const aDist = a.rating_distribution || {};
+    const bDist = b.rating_distribution || {};
+    const star = (s) => ({
+      label: `${s}★`,
+      a: Number(aDist[s] ?? aDist[String(s)] ?? 0),
+      b: Number(bDist[s] ?? bDist[String(s)] ?? 0),
+      // for stars: going DOWN on 1★/2★ is "good"; going UP on 4★/5★ is "good"
+      goodWhenUp: s >= 4,
+    });
+    return {
+      dateA: (a.snapshot_at || "").slice(0, 10),
+      dateB: (b.snapshot_at || "").slice(0, 10),
+      rows: [
+        { label: "Total reviews", a: a.total_reviews ?? 0, b: b.total_reviews ?? 0, goodWhenUp: true, kind: "int" },
+        { label: "Avg rating",    a: a.avg_rating ?? 0,    b: b.avg_rating ?? 0,    goodWhenUp: true, kind: "rating" },
+        star(5), star(4), star(3), star(2), star(1),
+      ],
+    };
+  }, [history, compareA, compareB]);
 
   const toggleTrack = async () => {
     if (!product) return;
@@ -247,7 +284,111 @@ export default function ProductDetailPage() {
                 Run daily scrapes for a few days to see trends.
               </div>
             ) : (
-              <div style={{ width: "100%", height: 260 }}>
+              <>
+                {/* COMPARE SUBSECTION */}
+                <div className="mb-6 pb-6 border-b border-[#2A2A2A]" data-testid="compare-section">
+                  <div className="flex flex-wrap items-center gap-3 mb-3">
+                    <div className="section-label">/ compare</div>
+                    <select
+                      value={compareA}
+                      onChange={(e) => setCompareA(e.target.value)}
+                      className="input-shell font-mono text-xs py-1 w-auto"
+                      data-testid="compare-date-a"
+                    >
+                      {history.map((h) => (
+                        <option key={`a-${h.snapshot_at}`} value={h.snapshot_at}>
+                          {(h.snapshot_at || "").slice(0, 16).replace("T", " ")}
+                        </option>
+                      ))}
+                    </select>
+                    <span className="font-mono text-xs text-[#71717A]">→</span>
+                    <select
+                      value={compareB}
+                      onChange={(e) => setCompareB(e.target.value)}
+                      className="input-shell font-mono text-xs py-1 w-auto"
+                      data-testid="compare-date-b"
+                    >
+                      {history.map((h) => (
+                        <option key={`b-${h.snapshot_at}`} value={h.snapshot_at}>
+                          {(h.snapshot_at || "").slice(0, 16).replace("T", " ")}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="flex items-center gap-1 ml-auto">
+                      {[
+                        { key: "oldest_latest", label: "oldest ↔ latest" },
+                        { key: "last_two", label: "last vs prev" },
+                      ].map((p) => (
+                        <button
+                          key={p.key}
+                          onClick={() => {
+                            if (history.length < 2) return;
+                            if (p.key === "oldest_latest") {
+                              setCompareA(history[0].snapshot_at);
+                              setCompareB(history[history.length - 1].snapshot_at);
+                            } else {
+                              setCompareA(history[history.length - 2].snapshot_at);
+                              setCompareB(history[history.length - 1].snapshot_at);
+                            }
+                          }}
+                          className="btn-secondary text-[10px] px-2 py-1"
+                          data-testid={`compare-preset-${p.key}`}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {compareRows ? (
+                    <div className="overflow-x-auto">
+                      <table className="dense w-full" data-testid="compare-table">
+                        <thead>
+                          <tr>
+                            <th className="w-40">Metric</th>
+                            <th className="num w-28">{compareRows.dateA}</th>
+                            <th className="num w-28">{compareRows.dateB}</th>
+                            <th className="num">Δ</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {compareRows.rows.map((row) => {
+                            const delta = (row.b - row.a);
+                            const isStar = row.label.endsWith("★");
+                            const isRating = row.kind === "rating";
+                            const isZero = Math.abs(delta) < (isRating ? 0.005 : 0.5);
+                            const good = isZero
+                              ? null
+                              : (row.goodWhenUp ? delta > 0 : delta < 0);
+                            const color = isZero ? "#71717A" : (good ? "#00E676" : "#FF3B30");
+                            const fmt = (v) =>
+                              isRating ? (Number(v) || 0).toFixed(2) : Math.round(Number(v) || 0);
+                            const sign = delta > 0 ? "+" : "";
+                            return (
+                              <tr key={row.label} data-testid={`compare-row-${row.label}`}>
+                                <td className={"font-mono text-xs " + (isStar ? "text-[#A1A1AA]" : "text-white")}>
+                                  {row.label}
+                                </td>
+                                <td className="num font-mono text-xs text-[#E5E5E5]">{fmt(row.a)}</td>
+                                <td className="num font-mono text-xs text-[#E5E5E5]">{fmt(row.b)}</td>
+                                <td className="num font-mono text-xs" style={{ color }}>
+                                  {isZero ? "—" : `${sign}${fmt(delta)}`}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-[#71717A] font-mono py-3">
+                      Pick two snapshots to compare.
+                    </div>
+                  )}
+                </div>
+
+                {/* TIMELINE CHART */}
+                <div style={{ width: "100%", height: 260 }}>
                 <ResponsiveContainer>
                   <LineChart data={historyChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
                     <CartesianGrid stroke="#2A2A2A" strokeDasharray="2 4" />
@@ -262,7 +403,8 @@ export default function ProductDetailPage() {
                       strokeWidth={2} dot={{ r: 3, fill: "#F5A623" }} activeDot={{ r: 5 }} name="Avg Rating" />
                   </LineChart>
                 </ResponsiveContainer>
-              </div>
+                </div>
+              </>
             )}
           </div>
         </div>

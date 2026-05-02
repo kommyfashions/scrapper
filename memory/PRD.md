@@ -59,6 +59,17 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - 19/20 new backend tests pass.
 - UI smoke screenshots (Accounts, Labels, Settings, Alerts drawer) — all rendering as designed.
 
+## Implemented — Iteration 4 (2026-05-02)
+**Label worker fixes** (`/app/scraper-ec2/label_worker.py`, `install.sh`)
+- Per-account Meesho URL derivation now uses **account `name` as the URL suffix** (e.g. `hrbib`, `uobfs`) and **always wins over stored `pending_url`/`ready_url`**. Stored URLs are a fallback escape-hatch when no name is set. Fixes the bug where multi-account runs kept navigating to one account's fulfillment page inside another account's Chrome (bouncing back to /growth/{x}/home).
+- `install.sh` `pip3 install` now uses `--break-system-packages` for Ubuntu 24+ compatibility and the seed-example doc no longer hardcodes pending_url/ready_url.
+
+**Product Detail — Compare section** (`/app/frontend/src/pages/ProductDetailPage.js`)
+- Inside the Trend panel, above the timeline chart, new "/ compare" block:
+  - Two dropdowns (Date A → Date B) populated from this product's `product_history` snapshots within the active 7D/30D/90D window.
+  - Defaults to oldest ↔ latest; presets "oldest ↔ latest" and "last vs prev".
+  - Comparison table: Total reviews, Avg rating, and each star bucket (5★…1★), with Δ column. Δ is green when direction is favourable (more reviews / higher rating / fewer 1★-2★ / more 4★-5★), red otherwise, "—" when unchanged.
+
 **Scraper + Worker (local files — `/app/scraper/`)**
 - `product_review.py` v2: now also captures `product_name`, `product_description`, `product_image_thumb_url`, `product_image_large_url` from the same `review_summary` API response.
 - `worker.py` v2: dispatch by job `type` (`product_scrape` | `label_download`), writes a `product_history` snapshot on each successful scrape, cleaner error reporting, reads MongoDB URI from env.
