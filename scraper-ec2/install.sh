@@ -19,7 +19,7 @@ fi
 ${SUDO} apt-get install -y python3-pip curl
 
 echo "==> Installing Python deps (pymongo, playwright)…"
-pip3 install --user pymongo playwright
+pip3 install --user pymongo playwright --break-system-packages
 
 # Playwright browsers — only needed if your labels.py launches its own browser.
 # Since we connect_over_cdp to an already-running Chrome, we don't strictly need
@@ -47,13 +47,14 @@ Next steps:
      from pymongo import MongoClient
      from datetime import datetime, timezone
      c = MongoClient("mongodb://43.205.229.129:27017/")
+     # The account 'name' is the Meesho URL suffix
+     #   (seen in supplier.meesho.com/panel/v3/new/fulfillment/<NAME>/orders/...)
+     # e.g. 'hrbib', 'uobfs'.  URLs are derived automatically by label_worker.
      c.meesho.accounts.insert_one({
-         "name": "Main",
-         "slug": "main",
+         "name": "hrbib",
+         "slug": "hrbib",
          "debug_port": 9222,
          "profile_dir": "/home/ubuntu/chrome-profile1",
-         "pending_url": "https://supplier.meesho.com/panel/v3/new/fulfillment/hrbib/orders/pending",
-         "ready_url":   "https://supplier.meesho.com/panel/v3/new/fulfillment/hrbib/orders/ready-to-ship",
          "enabled": True,
          "created_at": datetime.now(timezone.utc),
      })

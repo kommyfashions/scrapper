@@ -83,20 +83,17 @@ def run_label_for_account(acc: dict):
 
     # ── derive per-account supplier URLs ────────────────────────────────────
     # Account `name` IS the Meesho URL suffix (e.g. 'hrbib', 'uobfs').
-    # We always derive the URLs from the name so adding a new account just
-    # works.  An explicit pending_url / ready_url on the account doc still
-    # wins (escape hatch).
+    # We ALWAYS derive from the name so adding a new account just works,
+    # even if an older stored pending_url/ready_url points at a different
+    # account.  pending_url / ready_url on the doc are only used as a
+    # fallback when no name is set (rare escape-hatch).
     suffix = (acc.get("name") or "").strip()
-    derived_pending = (
-        f"https://supplier.meesho.com/panel/v3/new/fulfillment/{suffix}/orders/pending"
-        if suffix else None
-    )
-    derived_ready = (
-        f"https://supplier.meesho.com/panel/v3/new/fulfillment/{suffix}/orders/ready-to-ship"
-        if suffix else None
-    )
-    pending_url = acc.get("pending_url") or derived_pending
-    ready_url = acc.get("ready_url") or derived_ready
+    if suffix:
+        pending_url = f"https://supplier.meesho.com/panel/v3/new/fulfillment/{suffix}/orders/pending"
+        ready_url   = f"https://supplier.meesho.com/panel/v3/new/fulfillment/{suffix}/orders/ready-to-ship"
+    else:
+        pending_url = acc.get("pending_url")
+        ready_url   = acc.get("ready_url")
 
     if not pending_url or not ready_url:
         raise RuntimeError(
