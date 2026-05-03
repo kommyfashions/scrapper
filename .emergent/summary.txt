@@ -2,27 +2,27 @@
 
 **User's preferred language**: English (INSTRUCT next agent to respond in English only)
 
-**what currently exists?**: A React + FastAPI dashboard connected to an external EC2 MongoDB. It features JWT auth, job scheduling via APScheduler, and a redesigned products grid view. Two worker scripts are built:  (Windows worker) for scraping product data/hero images, and  (EC2 Ubuntu worker) for multi-account label downloading via persistent Chrome instances. Backend supports  CRUD and  for label scheduling. 
+**what currently exists?**: A React + FastAPI dashboard connected to an external EC2 MongoDB with JWT auth and APScheduler. The UI features Accounts CRUD, Settings (skip rules), Labels (multi-account selector), Review velocity Alerts (bell icon), and Product Details (Trend & Compare features). Two workers exist:  (Windows worker) for scraping product data/hero images, and  (EC2 Ubuntu worker) for multi-account label downloading which dynamically derives URLs based on the account name.
 
 **Last working item**:
-    - Last item agent was working: Assisting the user in running the updated  (v2.2) script locally and troubleshooting the user's inability to save the workspace to their GitHub repository. 
-    - Status: IN PROGRESS
-    - Agent Testing Done: Y (for the scraper script via user's local execution output)
-    - Which testing method agent to use?: Both (Frontend/backend testing agent for pending UI tasks, manual bash execution for script zipping).
-    - User Testing Done: Y
+    - Last item agent was working: Diagnosing and proposing fixes for Windows scraper () hangs. The issues were: 1) A  timeout (180000ms exceeded), and 2) The scraper getting stuck mid-pagination at a specific review count (e.g., 48) because of a stale locator blocking the infinite scroll. The agent proposed adding a 15s timeout to CDP connect and a 90s wall-clock/15s stagnation break condition to the pagination loop.
+    - Status: USER VERIFICATION PENDING
+    - Agent Testing Done: N (Waiting for user approval to modify the local file)
+    - Which testing method agent to use?: manual testing by python -c (Syntax check once code is modified, user tests the rest locally)
+    - User Testing Done: N
 
 **All Pending/In progress Issue list**:
-  Issue 1: User unable to save project to GitHub repo (scrapper) P0
-     - Attempted fixes: Agent provided text instructions for the Save to GitHub feature. User responded with I am unable to use git hub I am using scrapper repo and screenshots.
-     - Next debug checklist: Provide a workaround immediately. Create a  file of  and  and place it in the frontend  folder or provide a download script so the user can bypass GitHub and get their files. Ask for clarification on the GitHub error if they still want to use it.
-     - Why fix this issue and what will be achieved with the fix?: User is physically blocked from getting the EC2 label scripts and updating their Windows worker.
-     - Status: IN PROGRESS
-     - Is recurring issue?: N
-     - Should Test frontend/backend/both after fix?: NA
+  Issue 1: Windows scraper () hangs on CDP connect and pagination P0
+     - Attempted fixes: Agent analyzed logs and proposed code to add explicit timeouts to  and bounded limits to the infinite scroll loop (90s max wall-clock, 15s no-progress abort).
+     - Next debug checklist: Check user's response to the proposed solution (Options a, b, c). If approved, implement the changes to  and strictly preserve the JSON extraction logic. 
+     - Why fix this issue and what will be achieved with the fix?: Prevents the worker from hanging indefinitely, saving the job status accurately and moving on to the next queue item.
+     - Status: USER VERIFICATION PENDING
+     - Is recurring issue?: Y
+     - Should Test frontend/backend/both after fix?: NA (Local script file)
      - Blocked on other issue: None
 
   Issue 2:  and  traces at the end of  execution P1
-     - Attempted fixes: Agent added  to drain responses, but Playwright still throws async exceptions upon browser cleanup.
+     - Attempted fixes: Previously added  to drain responses, but Playwright still throws async exceptions upon browser cleanup.
      - Next debug checklist: Add an asyncio exception filter or  block to suppress  and  in  (around the connection cleanup).
      - Why fix this issue and what will be achieved with the fix?: Reduces noisy console output for the user running the script locally.
      - Status: NOT STARTED
@@ -31,55 +31,31 @@
      - Blocked on other issue: None
 
 **In progress Task List**:
-  Task 1: Build Accounts UI and Label Run UI (AUTOMATION section) P0
-     - Where to resume: Create Dashboard Accounts page (sidebar AUTOMATION → Accounts) with CRUD for accounts (name, debug_port, profile_dir). Update Labels page to include account selector for Run Now and account column in run history.
-     - What will be achieved with this?: User can manage multiple Meesho seller accounts for label downloading visually instead of via cURL.
-     - Status: NOT STARTED
-     - Should Test frontend/backend/both after fix?: Both
-     - Blocked on something: None
-
-  Task 2: Settings → Skip rules UI P1
-     - Where to resume: Add UI in Settings page to manage  (calendar picker) and  (weekday chips). Backend is already implemented.
-     - What will be achieved with this?: User can configure days when the automated label downloader should skip running.
-     - Status: NOT STARTED
-     - Should Test frontend/backend/both after fix?: Frontend
-     - Blocked on something: None
-
-  Task 3: Trend Latest / Compare / Timeline tabs on Product Detail P1
-     - Where to resume: Update  to show tabs for Latest (current snapshot), Compare (Date A vs Date B delta), and Timeline (7/30/90 days historical chart).
-     - What will be achieved with this?: Advanced historical comparison for product ratings and reviews.
-     - Status: NOT STARTED
-     - Should Test frontend/backend/both after fix?: Frontend
-     - Blocked on something: None
-
-  Task 4: Review velocity alerts with bell icon P1
-     - Where to resume: Implement alerts collection, 30-min APScheduler check for anomalies (e.g., >= 3 new 1-star reviews in 24h), and a bell icon with a drawer in the frontend layout.
-     - What will be achieved with this?: Proactive notification for negative review spikes.
-     - Status: NOT STARTED
-     - Should Test frontend/backend/both after fix?: Both
-     - Blocked on something: None
+  (No tasks currently in progress, UI batch was completed)
 
 **Upcoming and Future Tasks**:
     Upcoming Tasks:
     - Worker heartbeat (laptop online indicator). P2
     - Pagination for Jobs and Products. P2
     Future Tasks:
+    - Dashboard enhancement: Compare vs 7 days ago card flagging products whose avg rating moved by ≥0.20 overnight. P2 (Agent suggested, pending user feedback)
     - Label PDF filename list reported back from worker. P2
     - Profit/Loss calculator module (Requires future multi-account data scraping logic). P2
 
 **Completed work in this session**:
-- Base React + FastAPI dashboard connected to remote EC2 MongoDB (, ).
-- Redesigned Products page grid view with large thumbnails ().
-- APScheduler integration for automated  and .
-- Backend endpoints for  CRUD, , and multi-account label download execution.
-- Hardened  (v2.2) to accurately extract  from nested JSON.
-- Created EC2 worker scripts for Ubuntu systemd deployment ().
+- Accounts UI and backend CRUD (, ) (DONE)
+- Labels Page Multi-Account Selector () (DONE)
+- Settings Page Skip Rules UI () (DONE)
+- Review velocity alerts API, scheduler check, and AlertsBell UI () (DONE)
+- Product Detail Compare feature allowing A/B date snapshot comparisons () (DONE)
+- Dynamic URL derivation for multi-account  based on  suffix (DONE)
+- Daily Snapshot APScheduler job implementation (DONE)
 
 **Earlier issues found/mentioned but not fixed**:
    - None distinct from the pending issue list.
 
 **Known issue recurrence from previous fork**:
-  - Issue recurrence in previous fork: Testing agent reported a false positive regarding hero image binding ( vs ).
+  - Issue recurrence in previous fork: Testing agent reported a false positive regarding hero image binding. (RESOLVED)
   - Recurrence count: 1
   - Status: RESOLVED
 
@@ -87,61 +63,66 @@
 
 
 **Key Technical Concepts**:
-React, Tailwind CSS, Recharts, Phosphor Icons, FastAPI, Motor (Async MongoDB), APScheduler (Asia/Kolkata timezone), PyJWT, Playwright, Chrome DevTools Protocol (CDP), systemd.
+React, Tailwind CSS, Recharts, Phosphor Icons, FastAPI, Motor (Async MongoDB), APScheduler, PyJWT, Playwright, Chrome DevTools Protocol (CDP), systemd.
 
 **key DB schema**:
-  - products: {product_id, product_url, seller, rating_distribution, total_reviews, reviews, image, product_name}
+  - products: {product_id, product_url, seller, rating_distribution, total_reviews, reviews, image, product_name, tracked}
+  - product_history: {product_id, snapshot_at, total_reviews, avg_rating, rating_distribution}
   - jobs: {product_url, status, type, account_id, created_at, started_at, finished_at, error}
-  - settings: {scrape_enabled, scrape_time, label_enabled, label_time, timezone, next_runs, label_skip_rules}
-  - accounts: {name, debug_port, profile_dir, pending_url, ready_url, enabled}
+  - settings: {scrape_enabled, scrape_time, label_enabled, label_time, timezone, next_runs, skip_dates, skip_weekdays}
+  - accounts: {name, debug_port, profile_dir, enabled}
+  - alerts: {type, severity, title, message, product_id, read, created_at}
 
 **changes in tech stack**:
-  - Utilizing an external, remote MongoDB database running on the user's EC2 instance (Not local to the container). 
-  - APScheduler integrated into FastAPI for cron-like job queueing.
+  - Maintained external EC2 MongoDB architecture.
+  - Added APScheduler tasks for  and .
 
 **All files of reference**:
-1. : The crucial local web scraper. Carefully updated to deeply scan for .
-2. : The EC2 worker script that orchestrates dynamic port selection for multiple Chrome profiles.
-3. : Updated to handle large image cards and tracking toggles.
-4. : Central backend handling auth, scheduler, and CRUD for accounts/jobs.
+1. : The Windows worker script needing explicit timeout constraints.
+2. : Updated to derive pending/ready URLs dynamically based on the account name.
+3. : Contains the newly implemented Compare component.
+4. : Central backend handling endpoints for alerts, accounts, products, and scheduling.
+5. : New component handling the UI for real-time review velocity warnings.
 
 **Areas that need refactoring**:
--  will need structural updates to accommodate the upcoming Latest/Compare/Timeline tabs efficiently.
+- None identified at the moment.
 
 **key api endpoints**:
 - 
--  | 
--  (accepts )
+- , , 
+-  (accepts optional )
 - 
 
 **Critical Info for New Agent**:
-- **Environment & DB:** The backend connects to an external EC2 MongoDB. DO NOT overwrite  files with generic values, or the application will break.
-- **Architecture:** The scraper infrastructure is explicitly split:  jobs are polled by a Windows laptop,  jobs are polled by an Ubuntu EC2 instance. 
-- **Current Blocker:** The user is struggling to export the worker scripts using GitHub. Your first priority should be to provide an alternative download method (e.g., zip the  and  folders and place them in the frontend  directory so the user can click a link to download them). 
-- **Code warning:** DO NOT modify the recursive JSON scanning logic in  (v2.2), as it accurately extracts the product image from Meesho's complex payloads.
-- **Tasks:** You have a backlog of 4 frontend UI features (Accounts, Skip Rules, Trend Tabs, Alerts) frozen in the spec that were paused to handle the user's GitHub blocker.
+- **Environment:** Backend strictly uses the remote EC2 DB via . DO NOT modify the credentials/connection string.
+- **Worker Logic:**  derives the Meesho fulfillment URL dynamically using the  suffix (e.g., , ). Avoid using static  overrides unless explicitly configured.
+- **Current State:** The backend and frontend are stable and were fully tested in Iteration 3. The current blocking issue is entirely local to the user's Windows worker execution (), where Playwright's CDP connection and pagination loops are hanging. You are waiting for the user to confirm the proposed bounding/timeout fix.
 
 **documents and test reports created in this job**:
   - /app/memory/PRD.md
   - /app/memory/test_credentials.md
-  - /app/test_reports/iteration_1.json
-  - /app/test_reports/iteration_2.json
+  - /app/test_reports/iteration_3.json
 
 **Last 10 User Messages and any pending HUMAN messages**:
-- *User:* I run scrapper locally... [output logs showing success ] ... Exception in callback SyncBase... TargetClosedError ... and I am unable to use git hub I am using scrapper repo (Provided screenshots of GitHub failure).
-- *Agent:* Explained that the v2.2 scraper works perfectly. Explained that the user needs to run  to push the data to DB. Asked for clarification on the GitHub error, and noted that the harmless async tracebacks can be silenced.
-- *Pending Human Message:* User needs assistance getting their files because the GitHub integration is failing for them. 
+- *User:* Stated the label downloader worked only for one account. Agent identified hardcoded URLs and fixed  to derive URL dynamically.
+- *User:* Still faced navigation bounce. Agent diagnosed that the stale  in MongoDB was overriding the new fix. Applied fix to ignore stale URLs.
+- *User:* Confirmed it worked. Showed screenshot with 6 hours ago timestamp. Agent explained EC2 clock vs UTC logic, concluded clock is actually fine (jobs were just old ones picking up).
+- *User:* Verified they want the Compare feature shipped.
+- *Agent:* Built the Compare feature, tested it, updated PRD, and finished the iteration.
+- *User:* Asked if comparison works for old products. Reported that the Windows scraper is throwing  and hanging mid-scrape (e.g. at 48 reviews) causing the worker to freeze indefinitely.
+- *Agent:* Answered about historical snapshots. Analyzed the scraper hang, identifying lack of CDP connect timeout and an unbound infinite scroll loop. Proposed a code block with explicit time limits and asked for user approval.
+- *Pending Human Message:* User needs to approve or modify the proposed timeout fix for .
 
 **Project Health Check**:
-- Broken: GitHub Sync for the user. (Provide zip download workaround).
+- Broken:  hanging due to unconstrained Playwright execution.
 - Mocked: None.
 
 **3rd Party Integrations**:
-- Playwright (Web Scraping) - requires local browser.
-- External remote MongoDB.
+- Playwright (Web Scraping)
+- External remote MongoDB
 
 **Testing status**:
-  - Testing agent used after significant changes: YES
+  - Testing agent used after significant changes: YES (iteration 3)
   - Troubleshoot agent used after agent stuck in loop: NO
   - Test files created: []
   - Known regressions: None
@@ -150,4 +131,4 @@ React, Tailwind CSS, Recharts, Phosphor Icons, FastAPI, Motor (Async MongoDB), A
  /  (Listed in )
 
 **What agent forgot to execute**:
-The agent successfully mapped out 4 major frontend tasks (Accounts Page, Skip rules UI, Labels page Account Selector, Trend Latest/Compare Tabs, Review velocity alerts) in Iteration 3 but paused to fix a scraping image bug and address the user's GitHub sync issue. These UI tasks are entirely un-started. Ensure they are completed.</analysis>
+The agent comprehensively handled all current backlog items. The only pending action is waiting for the user's prompt response regarding the timeout implementation in the local scraper.</analysis>
