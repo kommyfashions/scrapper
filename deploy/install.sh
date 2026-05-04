@@ -67,6 +67,7 @@ yarn build
 
 # -------- systemd service --------
 echo "==> Installing systemd unit for the backend"
+cd "${APP_DIR}/deploy"
 ${SUDO} cp -v meesho-dashboard-backend.service /etc/systemd/system/meesho-dashboard-backend.service
 ${SUDO} systemctl daemon-reload
 ${SUDO} systemctl enable meesho-dashboard-backend.service
