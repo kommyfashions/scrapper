@@ -23,6 +23,37 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 4 (2026-05-04) — Profit & Loss module
+**Backend additions** (in `server.py` under `/api/pl/*`)
+- New collections: `pl_orders` (compound unique key `{account_id, sub_order_no}`), `pl_sku_costs`, `pl_uploads`, `pl_ads_cost`.
+- `POST /api/pl/upload?account_id=…` — parses Meesho monthly xlsx (sheets `Order Payments` + `Ads Cost`); dedupes by Sub Order No; idempotent bulk upserts; tracks `upload_ids[]` per order so uploads can be rolled back.
+- `GET /api/pl/uploads`, `DELETE /api/pl/uploads/{id}` — upload audit trail with safe rollback (deletes only orders not also covered by other uploads).
+- `GET /api/pl/dashboard` — KPIs: net realized profit, return loss (`|settlement|+return_charges−compensation`), net contribution, profit/order, total ads cost, net after ads, exposure, pending settlement. Filters by `account_id` and `start_date/end_date`.
+- `GET /api/pl/orders` (paginated, search, status filter), `GET /api/pl/orders/export` (xlsx).
+- `GET /api/pl/sku-analysis` — per-SKU rollup with Winner/Risky/Loser classification.
+- `GET /api/pl/exchange-analysis`, `GET /api/pl/ad-orders-analysis` — separate cohorts.
+- `GET/POST/DELETE /api/pl/sku-costs`, `POST /api/pl/sku-costs/upload-excel`, `GET /api/pl/missing-sku-costs` — per-account or "global" cost prices (account_id null = fallback).
+
+**Frontend additions** (`/app/frontend/src/pages/pl/`)
+- `PLLayout.js` — shared shell: account selector (persisted), sub-nav, date-range filter, `usePL()` context.
+- `PLDashboard.js` — 8 KPI cards + status summary + quick links.
+- `PLOrders.js` — paginated ledger with status/search filters + xlsx export.
+- `PLSKUAnalysis.js` — Winner/Risky/Loser table with sortable metrics.
+- `PLSKUCosts.js` — inline-edit cost prices, bulk Excel import, missing-SKU chips.
+- `PLExchangeAnalysis.js` — separate exchange cohort metrics.
+- `PLAdOrdersAnalysis.js` — Ad vs Normal side-by-side table.
+- `PLUploads.js` — drag-and-drop upload + history + rollback.
+- Sidebar: new "PROFIT & LOSS" section (5 sub-links). "Future Modules" replaced with Auto Payment Scraper, Inventory Loss.
+- Routing: `/pl/*` nested under `PLLayout`, default redirects to `/pl/dashboard`.
+
+**Multi-account**: every endpoint accepts `account_id` query (omit / "all" = consolidated). Compound unique key prevents cross-account collisions.
+
+**Verified end-to-end** with a real Meesho payment file (1543 rows / 1515 unique orders inserted in ~5s using bulk_write):
+- Dashboard: ₹1,06,083 net contribution, ₹1,92,547 profit, ₹86,464 return loss, ₹6,993 ads cost.
+- SKU Analysis: 94 SKUs classified.
+- Exchange: 37 orders, P&L −₹671.
+- Ad vs Normal: 17.55% ad share, ad RR 23.17% vs normal 31.55% (Δ −8.38pp).
+
 ## Implemented — Iteration 2 (2026-04-30)
 **Backend additions**
 - APScheduler on startup; configurable via `/api/settings` PUT (reconfigures live).

@@ -433,6 +433,16 @@ async def startup():
         await db.accounts.create_index("debug_port", unique=True)
         await db.alerts.create_index([("created_at", -1)])
         await db.alerts.create_index("dedup_key", unique=True, sparse=True)
+        # Profit & Loss
+        await db.pl_orders.create_index([("account_id", 1), ("sub_order_no", 1)], unique=True)
+        await db.pl_orders.create_index("order_status")
+        await db.pl_orders.create_index("sku")
+        await db.pl_orders.create_index("order_date")
+        await db.pl_sku_costs.create_index([("account_id", 1), ("sku", 1)], unique=True)
+        await db.pl_uploads.create_index([("uploaded_at", -1)])
+        await db.pl_ads_cost.create_index(
+            [("account_id", 1), ("campaign_id", 1), ("deduction_date", 1)], unique=True
+        )
     except Exception as e:
         logger.warning(f"Index creation issue: {e}")
 
@@ -1012,6 +1022,756 @@ async def alerts_check_now(user: dict = Depends(get_current_user)):
     """Manually run the alerts detector right now."""
     await detect_alerts()
     return {"ok": True}
+
+# --------------------------------------------------------------------------------------
+# Profit & Loss (Meesho payment file analyzer)
+# --------------------------------------------------------------------------------------
+import io
+import pandas as pd
+from fastapi import UploadFile, File
+from fastapi.responses import StreamingResponse
+from pymongo import UpdateOne
+
+PL_VALID_TRANSITIONS = {
+    "CREATED": {"SHIPPED", "CANCELLED"},
+    "SHIPPED": {"DELIVERED", "RTO", "CANCELLED"},
+    "DELIVERED": {"RETURNED", "EXCHANGE"},
+    "RTO": set(),
+    "RETURNED": set(),
+    "CANCELLED": set(),
+    "EXCHANGE": set(),
+}
+
+PL_STATUS_MAP = {
+    "delivered": "DELIVERED",
+    "return": "RETURNED",
+    "returned": "RETURNED",
+    "rto": "RTO",
+    "shipped": "SHIPPED",
+    "cancelled": "CANCELLED",
+    "canceled": "CANCELLED",
+    "exchange": "EXCHANGE",
+    "created": "CREATED",
+}
+
+def pl_safe_float(v) -> float:
+    if v is None:
+        return 0.0
+    try:
+        if isinstance(v, float) and pd.isna(v):
+            return 0.0
+    except Exception:
+        pass
+    s = str(v).strip()
+    if s == "" or s.lower() == "nan":
+        return 0.0
+    try:
+        return float(s.replace(",", ""))
+    except Exception:
+        return 0.0
+
+def pl_normalize_status(v) -> Optional[str]:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return PL_STATUS_MAP.get(str(v).strip().lower())
+
+def pl_payment_status(settlement: float, payment_date) -> str:
+    if settlement > 0 and payment_date and str(payment_date).strip() not in ("", "nan", "NaT"):
+        return "PAID"
+    if settlement > 0:
+        return "PENDING"
+    return "ADJUSTED"
+
+def pl_oid_or_400(s: str) -> ObjectId:
+    try:
+        return ObjectId(s)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid id")
+
+async def pl_resolve_account_filter(account_id: Optional[str]) -> dict:
+    """Return mongo filter for an account_id query param.
+    None / 'all' / '' -> no filter (all accounts). Otherwise validate account exists."""
+    if not account_id or account_id == "all":
+        return {}
+    oid = pl_oid_or_400(account_id)
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {"account_id": account_id}
+
+class PLSkuCostIn(BaseModel):
+    sku: str
+    cost_price: float
+    account_id: Optional[str] = None
+
+# ---------- Excel upload ----------
+@api.post("/pl/upload")
+async def pl_upload(
+    account_id: str = Query(..., description="Account this file belongs to"),
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    # validate account
+    oid = pl_oid_or_400(account_id)
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    contents = await file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(contents), sheet_name="Order Payments", header=1)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read 'Order Payments' sheet: {e}")
+    df = df[df["Sub Order No"].notna()]
+    df = df[df["Sub Order No"].astype(str).str.strip() != ""]
+    df = df[df["Sub Order No"].astype(str).str.lower() != "nan"]
+    # dedupe within the file: keep last occurrence per sub_order_no (latest snapshot)
+    df = df.drop_duplicates(subset=["Sub Order No"], keep="last")
+
+    required = ["Sub Order No", "Supplier SKU", "Order Date", "Live Order Status"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required columns: {missing}")
+
+    # create upload record (so we can roll back later)
+    upload_doc = {
+        "account_id": account_id,
+        "account_name": acc.get("name"),
+        "filename": file.filename,
+        "uploaded_at": datetime.now(timezone.utc),
+        "uploaded_by": user["email"],
+        "row_count": int(len(df)),
+        "status": "processing",
+    }
+    up_res = await db.pl_uploads.insert_one(upload_doc)
+    upload_id = str(up_res.inserted_id)
+
+    inserted, updated, skipped = 0, 0, 0
+    min_date, max_date = None, None
+    settlement_total = 0.0
+
+    # pre-fetch existing sub_order_no set to compute insert vs update counts
+    existing_keys = set()
+    async for d in db.pl_orders.find({"account_id": account_id}, {"_id": 0, "sub_order_no": 1}):
+        existing_keys.add(d["sub_order_no"])
+
+    ops = []
+    for _, row in df.iterrows():
+        try:
+            sub_order_no = str(row["Sub Order No"]).strip()
+            if not sub_order_no or sub_order_no.lower() == "nan":
+                skipped += 1
+                continue
+            status = pl_normalize_status(row.get("Live Order Status"))
+            if not status:
+                skipped += 1
+                continue
+            settlement = pl_safe_float(row.get("Final Settlement Amount", 0))
+            commission = abs(pl_safe_float(row.get("Meesho Commission (Incl. GST)", 0)))
+            shipping = abs(pl_safe_float(row.get("Shipping Charge (Incl. GST)", 0)))
+            tds = abs(pl_safe_float(row.get("TDS", 0)))
+            tcs = abs(pl_safe_float(row.get("TCS", 0)))
+            recovery = abs(pl_safe_float(row.get("Recovery", 0)))
+            return_shipping = abs(pl_safe_float(row.get("Return Shipping Charge (Incl. GST)", 0)))
+            compensation = abs(pl_safe_float(row.get("Compensation", 0)))
+            order_date_str = str(row.get("Order Date", "")).strip()
+            payment_date_v = row.get("Payment Date")
+            payment_date_str = (
+                str(payment_date_v) if payment_date_v is not None and not (isinstance(payment_date_v, float) and pd.isna(payment_date_v))
+                else None
+            )
+            order_source = (
+                str(row.get("Order source", "")).strip()
+                if row.get("Order source") is not None and not (isinstance(row.get("Order source"), float) and pd.isna(row.get("Order source")))
+                else ""
+            )
+            payment_status = pl_payment_status(settlement, payment_date_str)
+
+            data = {
+                "account_id": account_id,
+                "account_name": acc.get("name"),
+                "sub_order_no": sub_order_no,
+                "sku": str(row.get("Supplier SKU", "")).strip(),
+                "product_name": str(row.get("Product Name", "")).strip() if row.get("Product Name") is not None else "",
+                "catalog_id": str(row.get("Catalog ID", "")).strip() if row.get("Catalog ID") is not None else "",
+                "order_date": order_date_str,
+                "order_status": status,
+                "net_settlement_amount": settlement,
+                "payment_status": payment_status,
+                "payment_date": payment_date_str,
+                "total_deductions": round(commission + shipping + tds + tcs + recovery, 2),
+                "return_charges": round(return_shipping, 2),
+                "compensation_amount": round(compensation, 2),
+                "order_source": order_source,
+                "quantity": int(pl_safe_float(row.get("Quantity", 1))) or 1,
+                "last_updated": datetime.now(timezone.utc),
+            }
+            ops.append(UpdateOne(
+                {"account_id": account_id, "sub_order_no": sub_order_no},
+                {"$set": data, "$addToSet": {"upload_ids": upload_id}},
+                upsert=True,
+            ))
+            if sub_order_no in existing_keys:
+                updated += 1
+            else:
+                inserted += 1
+                existing_keys.add(sub_order_no)
+
+            settlement_total += settlement
+            if order_date_str and order_date_str.lower() != "nan":
+                if min_date is None or order_date_str < min_date:
+                    min_date = order_date_str
+                if max_date is None or order_date_str > max_date:
+                    max_date = order_date_str
+        except Exception as e:
+            skipped += 1
+            logger.warning(f"[pl/upload] row error: {e}")
+
+    if ops:
+        for i in range(0, len(ops), 500):
+            await db.pl_orders.bulk_write(ops[i:i+500], ordered=False)
+
+    # ingest Ads Cost sheet (optional)
+    ads_inserted = 0
+    try:
+        ads = pd.read_excel(io.BytesIO(contents), sheet_name="Ads Cost", header=1)
+        ads = ads[ads["Campaign ID"].notna()]
+        ads_ops = []
+        for _, row in ads.iterrows():
+            try:
+                campaign_id = str(row.get("Campaign ID", "")).strip()
+                ded_date = str(row.get("Deduction Date", "")).strip()
+                if not campaign_id or campaign_id.lower() == "nan":
+                    continue
+                doc = {
+                    "account_id": account_id,
+                    "account_name": acc.get("name"),
+                    "campaign_id": campaign_id,
+                    "deduction_date": ded_date,
+                    "deduction_duration": str(row.get("Deduction Duration", "")).strip(),
+                    "ad_cost": pl_safe_float(row.get("Ad Cost", 0)),
+                    "credits": pl_safe_float(row.get("Credits / Waivers / Discounts", 0)),
+                    "ad_cost_incl_credits": pl_safe_float(row.get("Ad Cost incl. Credits/Waivers/Discounts", 0)),
+                    "gst": pl_safe_float(row.get("GST", 0)),
+                    "total_ads_cost": pl_safe_float(row.get("Total Ads Cost", 0)),
+                    "upload_id": upload_id,
+                }
+                ads_ops.append(UpdateOne(
+                    {"account_id": account_id, "campaign_id": campaign_id, "deduction_date": ded_date},
+                    {"$set": doc},
+                    upsert=True,
+                ))
+                ads_inserted += 1
+            except Exception as e:
+                logger.warning(f"[pl/upload] ads row error: {e}")
+        if ads_ops:
+            for i in range(0, len(ads_ops), 500):
+                await db.pl_ads_cost.bulk_write(ads_ops[i:i+500], ordered=False)
+    except Exception as e:
+        logger.info(f"[pl/upload] no ads cost sheet or unreadable: {e}")
+
+    await db.pl_uploads.update_one(
+        {"_id": up_res.inserted_id},
+        {"$set": {
+            "status": "done",
+            "inserted": inserted, "updated": updated, "skipped": skipped,
+            "ads_rows": ads_inserted,
+            "settlement_total": round(settlement_total, 2),
+            "min_order_date": min_date, "max_order_date": max_date,
+            "finished_at": datetime.now(timezone.utc),
+        }},
+    )
+
+    return {
+        "ok": True, "upload_id": upload_id,
+        "inserted": inserted, "updated": updated, "skipped": skipped,
+        "ads_rows": ads_inserted,
+        "total_processed": int(len(df)),
+    }
+
+@api.get("/pl/uploads")
+async def pl_list_uploads(
+    account_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    q = await pl_resolve_account_filter(account_id)
+    cursor = db.pl_uploads.find(q).sort("uploaded_at", -1).limit(200)
+    items = []
+    async for d in cursor:
+        items.append(serialize_doc(d))
+    return {"items": items}
+
+@api.delete("/pl/uploads/{upload_id}")
+async def pl_delete_upload(upload_id: str, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(upload_id)
+    up = await db.pl_uploads.find_one({"_id": oid})
+    if not up:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    # pull this upload_id from every order; delete orders whose upload_ids list becomes empty
+    await db.pl_orders.update_many(
+        {"upload_ids": upload_id},
+        {"$pull": {"upload_ids": upload_id}},
+    )
+    res_del_orders = await db.pl_orders.delete_many({"upload_ids": {"$size": 0}})
+    res_del_ads = await db.pl_ads_cost.delete_many({"upload_id": upload_id})
+    await db.pl_uploads.delete_one({"_id": oid})
+    return {
+        "ok": True,
+        "orders_deleted": res_del_orders.deleted_count,
+        "ads_deleted": res_del_ads.deleted_count,
+    }
+
+# ---------- Date range ----------
+@api.get("/pl/date-range")
+async def pl_date_range(account_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q = await pl_resolve_account_filter(account_id)
+    q.update({"order_date": {"$ne": "", "$exists": True}})
+    pipeline = [
+        {"$match": q},
+        {"$group": {"_id": None,
+                    "min_date": {"$min": "$order_date"},
+                    "max_date": {"$max": "$order_date"}}},
+    ]
+    out = await db.pl_orders.aggregate(pipeline).to_list(None)
+    if out:
+        return {"min_date": out[0].get("min_date") or "", "max_date": out[0].get("max_date") or ""}
+    return {"min_date": "", "max_date": ""}
+
+# ---------- Common date filter helper ----------
+def _pl_date_query(account_id, start_date, end_date, status_filter=None):
+    q = {}
+    if status_filter is not None:
+        q.update(status_filter)
+    if account_id and account_id != "all":
+        q["account_id"] = account_id
+    if start_date or end_date:
+        df = {}
+        if start_date:
+            df["$gte"] = start_date
+        if end_date:
+            df["$lte"] = end_date + " 23:59:59"
+        if df:
+            q["order_date"] = df
+    return q
+
+# ---------- Dashboard ----------
+@api.get("/pl/dashboard")
+async def pl_dashboard(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    q = _pl_date_query(account_id, start_date, end_date, {"order_status": {"$ne": "CANCELLED"}})
+    orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+    sku_costs_q = await pl_resolve_account_filter(account_id)
+    costs = {}
+    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
+        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
+        # also store account-agnostic fallback
+        costs.setdefault((None, c["sku"]), c["cost_price"])
+
+    net_profit = 0.0
+    return_loss = 0.0
+    open_exposure = 0.0
+    pending = 0.0
+    delivered = shipped = returned = rto = total = 0
+    ads_cost_in_period = 0.0
+
+    for o in orders:
+        if o["order_status"] == "EXCHANGE":
+            continue
+        total += 1
+        cost = costs.get((o.get("account_id"), o["sku"])) or costs.get((None, o["sku"]), 0) or 0
+        if o["order_status"] == "DELIVERED" and o["payment_status"] == "PAID":
+            net_profit += o["net_settlement_amount"] - cost
+            delivered += 1
+        elif o["order_status"] == "SHIPPED":
+            open_exposure += o["net_settlement_amount"]
+            shipped += 1
+        if o["order_status"] in ("RTO", "RETURNED"):
+            # full formula: |settlement| + return_charges − compensation
+            return_loss += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
+            if o["order_status"] == "RETURNED":
+                returned += 1
+            else:
+                rto += 1
+        if o["payment_status"] == "PENDING":
+            pending += o["net_settlement_amount"]
+
+    # Ads cost for the same window (best-effort using deduction_date YYYY-MM-DD)
+    ads_q = {}
+    if account_id and account_id != "all":
+        ads_q["account_id"] = account_id
+    if start_date or end_date:
+        df = {}
+        if start_date:
+            df["$gte"] = start_date
+        if end_date:
+            df["$lte"] = end_date
+        if df:
+            ads_q["deduction_date"] = df
+    async for a in db.pl_ads_cost.find(ads_q, {"_id": 0, "total_ads_cost": 1}):
+        ads_cost_in_period += abs(a.get("total_ads_cost") or 0)
+
+    net_contribution = net_profit - return_loss
+    return {
+        "net_realized_profit": round(net_profit, 2),
+        "total_return_loss": round(return_loss, 2),
+        "net_contribution": round(net_contribution, 2),
+        "profit_per_delivered_order": round(net_profit / delivered, 2) if delivered else 0,
+        "open_exposure": round(open_exposure, 2),
+        "pending_settlement_amount": round(pending, 2),
+        "total_ads_cost": round(ads_cost_in_period, 2),
+        "net_contribution_after_ads": round(net_contribution - ads_cost_in_period, 2),
+        "total_orders": total,
+        "delivered_orders": delivered,
+        "shipped_orders": shipped,
+        "returned_orders": returned,
+        "rto_orders": rto,
+    }
+
+# ---------- Orders ----------
+@api.get("/pl/orders")
+async def pl_orders(
+    account_id: Optional[str] = None,
+    status: Optional[str] = None,
+    sku: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = Query(100, le=500),
+    skip: int = 0,
+    user: dict = Depends(get_current_user),
+):
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    query = {}
+    if account_id and account_id != "all":
+        query["account_id"] = account_id
+    if status and status != "all":
+        query["order_status"] = status.upper()
+    if sku:
+        query["sku"] = sku
+    if q:
+        regex = {"$regex": re.escape(q), "$options": "i"}
+        query["$or"] = [{"sub_order_no": regex}, {"sku": regex}, {"product_name": regex}]
+    cursor = db.pl_orders.find(query, {"_id": 0}).sort("last_updated", -1).skip(skip).limit(limit)
+    items = []
+    async for d in cursor:
+        if isinstance(d.get("last_updated"), datetime):
+            d["last_updated"] = d["last_updated"].isoformat()
+        items.append(d)
+    total = await db.pl_orders.count_documents(query)
+    return {"items": items, "total": total}
+
+@api.get("/pl/orders/export")
+async def pl_orders_export(
+    account_id: Optional[str] = None,
+    status: Optional[str] = None,
+    sku: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    query = {}
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+        query["account_id"] = account_id
+    if status and status != "all":
+        query["order_status"] = status.upper()
+    if sku:
+        query["sku"] = sku
+    rows = []
+    async for d in db.pl_orders.find(query, {"_id": 0, "upload_ids": 0}):
+        if isinstance(d.get("last_updated"), datetime):
+            d["last_updated"] = d["last_updated"].isoformat()
+        rows.append(d)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No orders to export")
+    df = pd.DataFrame(rows)
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Orders")
+    out.seek(0)
+    fn = f"pl_orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={fn}"},
+    )
+
+# ---------- SKU Analysis ----------
+@api.get("/pl/sku-analysis")
+async def pl_sku_analysis(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    q = _pl_date_query(account_id, start_date, end_date, {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
+    orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+    sku_costs_q = await pl_resolve_account_filter(account_id)
+    costs = {}
+    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
+        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
+        costs.setdefault((None, c["sku"]), c["cost_price"])
+
+    sku_data = {}
+    for o in orders:
+        s = o["sku"]
+        if s not in sku_data:
+            sku_data[s] = {"units_ordered": 0, "units_delivered": 0, "units_returned": 0,
+                           "exposure_units": 0, "profit": 0.0, "loss": 0.0,
+                           "product_name": o.get("product_name", "")}
+        sku_data[s]["units_ordered"] += 1
+        if o["order_status"] == "DELIVERED":
+            sku_data[s]["units_delivered"] += 1
+            if o["payment_status"] == "PAID":
+                cost = costs.get((o.get("account_id"), s)) or costs.get((None, s), 0) or 0
+                sku_data[s]["profit"] += o["net_settlement_amount"] - cost
+        if o["order_status"] in ("RTO", "RETURNED"):
+            sku_data[s]["units_returned"] += 1
+            sku_data[s]["loss"] += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
+        if o["order_status"] == "SHIPPED":
+            sku_data[s]["exposure_units"] += 1
+
+    out = []
+    for sku, d in sku_data.items():
+        ordered = d["units_ordered"]
+        rr = (d["units_returned"] / ordered * 100) if ordered else 0
+        ppu = d["profit"] / d["units_delivered"] if d["units_delivered"] else 0
+        lpu = d["loss"] / d["units_returned"] if d["units_returned"] else 0
+        contrib = d["profit"] - d["loss"]
+        if contrib > 0 and rr < 20:
+            cls = "Winner"
+        elif rr > 40 or contrib < 0:
+            cls = "Loser"
+        else:
+            cls = "Risky"
+        out.append({
+            "sku": sku, "product_name": d["product_name"],
+            "units_ordered": ordered, "units_delivered": d["units_delivered"],
+            "units_returned": d["units_returned"], "return_rate": round(rr, 2),
+            "net_realized_profit": round(d["profit"], 2),
+            "total_return_loss": round(d["loss"], 2),
+            "net_sku_contribution": round(contrib, 2),
+            "exposure_units": d["exposure_units"],
+            "profit_per_delivered_unit": round(ppu, 2),
+            "loss_per_returned_unit": round(lpu, 2),
+            "classification": cls,
+        })
+    out.sort(key=lambda x: x["net_sku_contribution"], reverse=True)
+    return {"items": out}
+
+# ---------- Exchange Analysis ----------
+@api.get("/pl/exchange-analysis")
+async def pl_exchange_analysis(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    q = _pl_date_query(account_id, start_date, end_date, {"order_status": "EXCHANGE"})
+    orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+    sku_costs_q = await pl_resolve_account_filter(account_id)
+    costs = {}
+    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
+        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
+        costs.setdefault((None, c["sku"]), c["cost_price"])
+
+    total_settlement = 0.0
+    total_pl = 0.0
+    pos_n = neg_n = 0
+    pos_t = neg_t = 0.0
+    by_sku = {}
+    for o in orders:
+        cost = costs.get((o.get("account_id"), o["sku"])) or costs.get((None, o["sku"]), 0) or 0
+        s = o["net_settlement_amount"]
+        pl = s - cost
+        total_settlement += s
+        total_pl += pl
+        if s >= 0:
+            pos_n += 1; pos_t += s
+        else:
+            neg_n += 1; neg_t += s
+        d = by_sku.setdefault(o["sku"], {"sku": o["sku"], "count": 0, "total_settlement": 0,
+                                         "total_profit_loss": 0, "sku_cost": cost,
+                                         "product_name": o.get("product_name", "")})
+        d["count"] += 1; d["total_settlement"] += s; d["total_profit_loss"] += pl
+    sku_breakdown = sorted(by_sku.values(), key=lambda x: x["total_profit_loss"])
+    for o in orders:
+        if isinstance(o.get("last_updated"), datetime):
+            o["last_updated"] = o["last_updated"].isoformat()
+    return {
+        "total_exchange_orders": len(orders),
+        "total_settlement": round(total_settlement, 2),
+        "total_profit_loss": round(total_pl, 2),
+        "positive_settlement_count": pos_n,
+        "negative_settlement_count": neg_n,
+        "positive_settlement_total": round(pos_t, 2),
+        "negative_settlement_total": round(neg_t, 2),
+        "avg_profit_loss_per_exchange": round(total_pl / len(orders), 2) if orders else 0,
+        "sku_breakdown": sku_breakdown,
+        "orders": orders,
+    }
+
+# ---------- Ad Orders Analysis ----------
+@api.get("/pl/ad-orders-analysis")
+async def pl_ad_orders_analysis(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    q = _pl_date_query(account_id, start_date, end_date, {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
+    orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+    sku_costs_q = await pl_resolve_account_filter(account_id)
+    costs = {}
+    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
+        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
+        costs.setdefault((None, c["sku"]), c["cost_price"])
+
+    def fresh():
+        return {"orders": 0, "delivered": 0, "returned": 0, "rto": 0, "shipped": 0,
+                "profit": 0.0, "loss": 0.0, "settlement": 0.0}
+    ad = fresh(); norm = fresh()
+    for o in orders:
+        is_ad = (o.get("order_source") or "").strip().lower() == "ad order"
+        bucket = ad if is_ad else norm
+        bucket["orders"] += 1
+        cost = costs.get((o.get("account_id"), o["sku"])) or costs.get((None, o["sku"]), 0) or 0
+        if o["order_status"] == "DELIVERED":
+            bucket["delivered"] += 1
+            if o["payment_status"] == "PAID":
+                bucket["profit"] += o["net_settlement_amount"] - cost
+                bucket["settlement"] += o["net_settlement_amount"]
+        elif o["order_status"] == "SHIPPED":
+            bucket["shipped"] += 1
+        elif o["order_status"] == "RETURNED":
+            bucket["returned"] += 1
+            bucket["loss"] += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
+        elif o["order_status"] == "RTO":
+            bucket["rto"] += 1
+            bucket["loss"] += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
+
+    def metrics(b):
+        t = b["orders"]
+        rr = ((b["returned"] + b["rto"]) / t * 100) if t else 0
+        ppo = b["profit"] / b["delivered"] if b["delivered"] else 0
+        return {
+            "total_orders": t, "delivered": b["delivered"], "returned": b["returned"],
+            "rto": b["rto"], "shipped": b["shipped"], "return_rate": round(rr, 2),
+            "total_profit": round(b["profit"], 2), "total_loss": round(b["loss"], 2),
+            "net_contribution": round(b["profit"] - b["loss"], 2),
+            "profit_per_delivered_order": round(ppo, 2),
+            "total_settlement": round(b["settlement"], 2),
+        }
+    total = len(orders) or 1
+    return {
+        "ad_orders": metrics(ad),
+        "normal_orders": metrics(norm),
+        "comparison": {
+            "ad_order_percentage": round(ad["orders"] / total * 100, 2),
+            "normal_order_percentage": round(norm["orders"] / total * 100, 2),
+            "ad_return_rate_vs_normal": round(metrics(ad)["return_rate"] - metrics(norm)["return_rate"], 2),
+        },
+    }
+
+# ---------- SKU Costs ----------
+@api.get("/pl/sku-costs")
+async def pl_list_sku_costs(account_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    q = await pl_resolve_account_filter(account_id)
+    items = []
+    async for d in db.pl_sku_costs.find(q, {"_id": 0}).sort("sku", 1):
+        items.append(d)
+    return {"items": items}
+
+@api.post("/pl/sku-costs")
+async def pl_upsert_sku_cost(body: PLSkuCostIn, user: dict = Depends(get_current_user)):
+    if body.account_id:
+        await pl_resolve_account_filter(body.account_id)
+    sku = body.sku.strip()
+    if not sku:
+        raise HTTPException(status_code=400, detail="sku required")
+    if body.cost_price < 0:
+        raise HTTPException(status_code=400, detail="cost_price must be >= 0")
+    key = {"account_id": body.account_id, "sku": sku}
+    await db.pl_sku_costs.update_one(
+        key, {"$set": {**key, "cost_price": float(body.cost_price), "updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+    return {"ok": True, "sku": sku, "cost_price": body.cost_price, "account_id": body.account_id}
+
+@api.delete("/pl/sku-costs")
+async def pl_delete_sku_cost(
+    sku: str = Query(...),
+    account_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    res = await db.pl_sku_costs.delete_one({"account_id": account_id, "sku": sku})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="SKU not found")
+    return {"ok": True}
+
+@api.post("/pl/sku-costs/upload-excel")
+async def pl_sku_costs_upload(
+    account_id: Optional[str] = None,
+    file: UploadFile = File(...),
+    user: dict = Depends(get_current_user),
+):
+    if account_id:
+        await pl_resolve_account_filter(account_id)
+    contents = await file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read excel: {e}")
+    cols = {c.lower().strip(): c for c in df.columns}
+    sku_col = cols.get("sku") or cols.get("supplier sku")
+    cost_col = cols.get("cost price") or cols.get("cost_price") or cols.get("cost")
+    if not sku_col or not cost_col:
+        raise HTTPException(status_code=400, detail="Excel must have columns: SKU, Cost Price")
+    inserted = updated = 0
+    errors = []
+    for idx, row in df.iterrows():
+        try:
+            sku = str(row[sku_col]).strip()
+            cost = pl_safe_float(row[cost_col])
+            if not sku or sku.lower() == "nan" or cost <= 0:
+                errors.append(f"Row {idx+2}: invalid")
+                continue
+            existing = await db.pl_sku_costs.find_one({"account_id": account_id, "sku": sku})
+            await db.pl_sku_costs.update_one(
+                {"account_id": account_id, "sku": sku},
+                {"$set": {"account_id": account_id, "sku": sku, "cost_price": cost,
+                          "updated_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+            if existing:
+                updated += 1
+            else:
+                inserted += 1
+        except Exception as e:
+            errors.append(f"Row {idx+2}: {e}")
+    return {"ok": True, "inserted": inserted, "updated": updated, "errors": errors[:20]}
+
+@api.get("/pl/missing-sku-costs")
+async def pl_missing_sku_costs(account_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    order_q = {} if not account_id or account_id == "all" else {"account_id": account_id}
+    order_skus = await db.pl_orders.distinct("sku", order_q)
+    cost_q = {} if not account_id or account_id == "all" else {"$or": [{"account_id": account_id}, {"account_id": None}]}
+    cost_skus = set()
+    async for c in db.pl_sku_costs.find(cost_q, {"_id": 0, "sku": 1}):
+        cost_skus.add(c["sku"])
+    missing = sorted([s for s in order_skus if s and s not in cost_skus])
+    return {"missing_skus": missing, "total_missing": len(missing),
+            "total_order_skus": len(order_skus), "total_with_costs": len(cost_skus)}
 
 # --------------------------------------------------------------------------------------
 # Health + Mount

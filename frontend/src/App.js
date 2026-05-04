@@ -15,6 +15,14 @@ import AnalyticsPage from "@/pages/AnalyticsPage";
 import LabelsPage from "@/pages/LabelsPage";
 import AccountsPage from "@/pages/AccountsPage";
 import SettingsPage from "@/pages/SettingsPage";
+import PLLayout from "@/pages/pl/PLLayout";
+import PLDashboard from "@/pages/pl/PLDashboard";
+import PLOrders from "@/pages/pl/PLOrders";
+import PLSKUAnalysis from "@/pages/pl/PLSKUAnalysis";
+import PLSKUCosts from "@/pages/pl/PLSKUCosts";
+import PLExchangeAnalysis from "@/pages/pl/PLExchangeAnalysis";
+import PLAdOrdersAnalysis from "@/pages/pl/PLAdOrdersAnalysis";
+import PLUploads from "@/pages/pl/PLUploads";
 
 function App() {
   return (
@@ -39,6 +47,16 @@ function App() {
               <Route path="/labels" element={<LabelsPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/pl" element={<PLLayout />}>
+                <Route index element={<Navigate to="/pl/dashboard" replace />} />
+                <Route path="dashboard" element={<PLDashboard />} />
+                <Route path="orders" element={<PLOrders />} />
+                <Route path="sku-analysis" element={<PLSKUAnalysis />} />
+                <Route path="sku-costs" element={<PLSKUCosts />} />
+                <Route path="exchange" element={<PLExchangeAnalysis />} />
+                <Route path="ad-orders" element={<PLAdOrdersAnalysis />} />
+                <Route path="uploads" element={<PLUploads />} />
+              </Route>
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

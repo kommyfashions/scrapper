@@ -10,6 +10,7 @@ import {
   PrinterIcon,
   GearIcon,
   UserCircleIcon,
+  CurrencyInrIcon,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/auth/AuthContext";
 
@@ -35,6 +36,16 @@ const NAV_SECTIONS = [
       { to: "/accounts", label: "Accounts", Icon: UserCircleIcon, testid: "nav-accounts" },
       { to: "/labels", label: "Label Download", Icon: PrinterIcon, testid: "nav-labels" },
       { to: "/settings", label: "Settings", Icon: GearIcon, testid: "nav-settings" },
+    ],
+  },
+  {
+    label: "PROFIT & LOSS",
+    items: [
+      { to: "/pl/dashboard", label: "P&L Dashboard", Icon: CurrencyInrIcon, testid: "nav-pl-dashboard" },
+      { to: "/pl/orders", label: "P&L Orders", Icon: ListChecksIcon, testid: "nav-pl-orders" },
+      { to: "/pl/sku-analysis", label: "SKU Analysis", Icon: ChartBarIcon, testid: "nav-pl-sku-analysis" },
+      { to: "/pl/sku-costs", label: "SKU Costs", Icon: PackageIcon, testid: "nav-pl-sku-costs" },
+      { to: "/pl/uploads", label: "Uploads", Icon: PlusCircleIcon, testid: "nav-pl-uploads" },
     ],
   },
 ];
@@ -91,7 +102,7 @@ export default function Sidebar() {
         <div>
           <div className="section-label mb-2 px-2">FUTURE MODULES</div>
           <div className="space-y-1 px-2">
-            {["Profit/Loss"].map((m) => (
+            {["Auto Payment Scraper", "Inventory Loss"].map((m) => (
               <div
                 key={m}
                 className="flex items-center justify-between text-xs text-[#71717A] py-1"
