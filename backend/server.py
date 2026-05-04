@@ -153,7 +153,9 @@ def serialize_doc(d: Optional[dict]) -> Optional[dict]:
         elif isinstance(v, ObjectId):
             out[k] = str(v)
         elif isinstance(v, datetime):
-            out[k] = v.isoformat()
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=timezone.utc)
+            out[k] = v.isoformat().replace("+00:00", "Z")
         else:
             out[k] = v
     return out
@@ -445,6 +447,12 @@ async def startup():
         )
     except Exception as e:
         logger.warning(f"Index creation issue: {e}")
+
+    # one-time SKU-cost dedupe / account_id normalization
+    try:
+        await _pl_dedupe_sku_costs()
+    except Exception as e:
+        logger.warning(f"[pl-migration] sku-cost dedupe failed: {e}")
 
     # seed admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
@@ -1088,6 +1096,65 @@ def pl_oid_or_400(s: str) -> ObjectId:
     except Exception:
         raise HTTPException(status_code=400, detail="invalid id")
 
+def _pl_norm_acc(v) -> Optional[str]:
+    """Normalise account_id to either a real id-string or None.
+    Empty string, 'all', 'global', 'none', 'null' -> None."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "" or s.lower() in ("all", "global", "none", "null"):
+        return None
+    return s
+
+def _pl_lookup_cost(costs: dict, account_id, sku) -> float:
+    """Account-specific cost takes priority over global (None) fallback."""
+    if (account_id, sku) in costs:
+        return costs[(account_id, sku)] or 0
+    return costs.get((None, sku), 0) or 0
+
+async def _pl_load_costs(sku_costs_q: dict) -> dict:
+    """Load costs sorted by updated_at ASC so the most recent write wins
+    (handles the rare residual duplicate after migration)."""
+    costs = {}
+    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}).sort("updated_at", 1):
+        costs[(c.get("account_id"), c["sku"])] = c.get("cost_price") or 0
+    return costs
+
+async def _pl_dedupe_sku_costs():
+    """Normalise legacy account_id values and merge duplicate (account_id, sku)
+    rows by keeping the row with the latest updated_at."""
+    rows = []
+    async for d in db.pl_sku_costs.find({}):
+        rows.append(d)
+    if not rows:
+        return
+    groups: Dict[tuple, list] = {}
+    for r in rows:
+        key = (_pl_norm_acc(r.get("account_id")), r.get("sku"))
+        groups.setdefault(key, []).append(r)
+    deletes, updates = [], []
+    for (norm_acc, _sku), docs in groups.items():
+        if len(docs) > 1:
+            docs.sort(
+                key=lambda d: (
+                    d.get("updated_at") or datetime.min.replace(tzinfo=timezone.utc),
+                    d["_id"].generation_time,
+                ),
+                reverse=True,
+            )
+            for d in docs[1:]:
+                deletes.append(d["_id"])
+        survivor = docs[0]
+        if survivor.get("account_id") != norm_acc:
+            updates.append((survivor["_id"], norm_acc))
+    if deletes:
+        await db.pl_sku_costs.delete_many({"_id": {"$in": deletes}})
+        logger.info(f"[pl-migration] removed {len(deletes)} duplicate SKU cost rows")
+    for _id, new_acc in updates:
+        await db.pl_sku_costs.update_one({"_id": _id}, {"$set": {"account_id": new_acc}})
+    if updates:
+        logger.info(f"[pl-migration] normalised account_id on {len(updates)} SKU cost rows")
+
 async def pl_resolve_account_filter(account_id: Optional[str]) -> dict:
     """Return mongo filter for an account_id query param.
     None / 'all' / '' -> no filter (all accounts). Otherwise validate account exists."""
@@ -1367,11 +1434,7 @@ async def pl_dashboard(
     q = _pl_date_query(account_id, start_date, end_date, {"order_status": {"$ne": "CANCELLED"}})
     orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
     sku_costs_q = await pl_resolve_account_filter(account_id)
-    costs = {}
-    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
-        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
-        # also store account-agnostic fallback
-        costs.setdefault((None, c["sku"]), c["cost_price"])
+    costs = await _pl_load_costs(sku_costs_q)
 
     net_profit = 0.0
     return_loss = 0.0
@@ -1384,7 +1447,7 @@ async def pl_dashboard(
         if o["order_status"] == "EXCHANGE":
             continue
         total += 1
-        cost = costs.get((o.get("account_id"), o["sku"])) or costs.get((None, o["sku"]), 0) or 0
+        cost = _pl_lookup_cost(costs, o.get("account_id"), o["sku"])
         if o["order_status"] == "DELIVERED" and o["payment_status"] == "PAID":
             net_profit += o["net_settlement_amount"] - cost
             delivered += 1
@@ -1511,10 +1574,7 @@ async def pl_sku_analysis(
     q = _pl_date_query(account_id, start_date, end_date, {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
     orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
     sku_costs_q = await pl_resolve_account_filter(account_id)
-    costs = {}
-    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
-        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
-        costs.setdefault((None, c["sku"]), c["cost_price"])
+    costs = await _pl_load_costs(sku_costs_q)
 
     sku_data = {}
     for o in orders:
@@ -1527,7 +1587,7 @@ async def pl_sku_analysis(
         if o["order_status"] == "DELIVERED":
             sku_data[s]["units_delivered"] += 1
             if o["payment_status"] == "PAID":
-                cost = costs.get((o.get("account_id"), s)) or costs.get((None, s), 0) or 0
+                cost = _pl_lookup_cost(costs, o.get("account_id"), s)
                 sku_data[s]["profit"] += o["net_settlement_amount"] - cost
         if o["order_status"] in ("RTO", "RETURNED"):
             sku_data[s]["units_returned"] += 1
@@ -1576,10 +1636,7 @@ async def pl_exchange_analysis(
     q = _pl_date_query(account_id, start_date, end_date, {"order_status": "EXCHANGE"})
     orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
     sku_costs_q = await pl_resolve_account_filter(account_id)
-    costs = {}
-    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
-        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
-        costs.setdefault((None, c["sku"]), c["cost_price"])
+    costs = await _pl_load_costs(sku_costs_q)
 
     total_settlement = 0.0
     total_pl = 0.0
@@ -1587,7 +1644,7 @@ async def pl_exchange_analysis(
     pos_t = neg_t = 0.0
     by_sku = {}
     for o in orders:
-        cost = costs.get((o.get("account_id"), o["sku"])) or costs.get((None, o["sku"]), 0) or 0
+        cost = _pl_lookup_cost(costs, o.get("account_id"), o["sku"])
         s = o["net_settlement_amount"]
         pl = s - cost
         total_settlement += s
@@ -1630,10 +1687,7 @@ async def pl_ad_orders_analysis(
     q = _pl_date_query(account_id, start_date, end_date, {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
     orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
     sku_costs_q = await pl_resolve_account_filter(account_id)
-    costs = {}
-    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}):
-        costs[(c.get("account_id"), c["sku"])] = c["cost_price"]
-        costs.setdefault((None, c["sku"]), c["cost_price"])
+    costs = await _pl_load_costs(sku_costs_q)
 
     def fresh():
         return {"orders": 0, "delivered": 0, "returned": 0, "rto": 0, "shipped": 0,
@@ -1643,7 +1697,7 @@ async def pl_ad_orders_analysis(
         is_ad = (o.get("order_source") or "").strip().lower() == "ad order"
         bucket = ad if is_ad else norm
         bucket["orders"] += 1
-        cost = costs.get((o.get("account_id"), o["sku"])) or costs.get((None, o["sku"]), 0) or 0
+        cost = _pl_lookup_cost(costs, o.get("account_id"), o["sku"])
         if o["order_status"] == "DELIVERED":
             bucket["delivered"] += 1
             if o["payment_status"] == "PAID":
@@ -1685,8 +1739,23 @@ async def pl_ad_orders_analysis(
 @api.get("/pl/sku-costs")
 async def pl_list_sku_costs(account_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     q = await pl_resolve_account_filter(account_id)
+    # cache account_id -> name lookup so we can label rows nicely
+    name_cache: Dict[str, str] = {}
     items = []
     async for d in db.pl_sku_costs.find(q, {"_id": 0}).sort("sku", 1):
+        aid = d.get("account_id")
+        if aid and aid not in name_cache:
+            try:
+                acc = await db.accounts.find_one({"_id": ObjectId(aid)}, {"_id": 0, "name": 1})
+                name_cache[aid] = acc["name"] if acc else aid
+            except Exception:
+                name_cache[aid] = aid
+        d["account_name"] = name_cache.get(aid)  # None -> rendered as "Global" by FE
+        if isinstance(d.get("updated_at"), datetime):
+            ua = d["updated_at"]
+            if ua.tzinfo is None:
+                ua = ua.replace(tzinfo=timezone.utc)
+            d["updated_at"] = ua.isoformat().replace("+00:00", "Z")
         items.append(d)
     return {"items": items}
 
@@ -1699,12 +1768,13 @@ async def pl_upsert_sku_cost(body: PLSkuCostIn, user: dict = Depends(get_current
         raise HTTPException(status_code=400, detail="sku required")
     if body.cost_price < 0:
         raise HTTPException(status_code=400, detail="cost_price must be >= 0")
-    key = {"account_id": body.account_id, "sku": sku}
+    norm_acc = _pl_norm_acc(body.account_id)
+    key = {"account_id": norm_acc, "sku": sku}
     await db.pl_sku_costs.update_one(
         key, {"$set": {**key, "cost_price": float(body.cost_price), "updated_at": datetime.now(timezone.utc)}},
         upsert=True,
     )
-    return {"ok": True, "sku": sku, "cost_price": body.cost_price, "account_id": body.account_id}
+    return {"ok": True, "sku": sku, "cost_price": body.cost_price, "account_id": norm_acc}
 
 @api.delete("/pl/sku-costs")
 async def pl_delete_sku_cost(
@@ -1712,7 +1782,7 @@ async def pl_delete_sku_cost(
     account_id: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
-    res = await db.pl_sku_costs.delete_one({"account_id": account_id, "sku": sku})
+    res = await db.pl_sku_costs.delete_one({"account_id": _pl_norm_acc(account_id), "sku": sku})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="SKU not found")
     return {"ok": True}
@@ -1725,6 +1795,7 @@ async def pl_sku_costs_upload(
 ):
     if account_id:
         await pl_resolve_account_filter(account_id)
+    norm_acc = _pl_norm_acc(account_id)
     contents = await file.read()
     try:
         df = pd.read_excel(io.BytesIO(contents))
@@ -1744,10 +1815,10 @@ async def pl_sku_costs_upload(
             if not sku or sku.lower() == "nan" or cost <= 0:
                 errors.append(f"Row {idx+2}: invalid")
                 continue
-            existing = await db.pl_sku_costs.find_one({"account_id": account_id, "sku": sku})
+            existing = await db.pl_sku_costs.find_one({"account_id": norm_acc, "sku": sku})
             await db.pl_sku_costs.update_one(
-                {"account_id": account_id, "sku": sku},
-                {"$set": {"account_id": account_id, "sku": sku, "cost_price": cost,
+                {"account_id": norm_acc, "sku": sku},
+                {"$set": {"account_id": norm_acc, "sku": sku, "cost_price": cost,
                           "updated_at": datetime.now(timezone.utc)}},
                 upsert=True,
             )

@@ -151,7 +151,9 @@ export default function PLSKUCosts() {
                 <tr key={(i.account_id || "global") + i.sku} data-testid={`pl-cost-row-${i.sku}`}>
                   <td className="font-mono text-[11px]">{i.sku}</td>
                   <td className="font-mono text-[10px] text-[#A1A1AA]">
-                    {i.account_id ? "—" : <span className="text-[#007AFF]">Global</span>}
+                    {i.account_id
+                      ? <span className="text-[#A1A1AA]">{i.account_name || i.account_id.slice(-6)}</span>
+                      : <span className="text-[#007AFF]">Global</span>}
                   </td>
                   <td className="num font-mono text-xs">
                     <input type="number" step="0.01" defaultValue={i.cost_price}
