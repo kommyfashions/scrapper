@@ -34,11 +34,6 @@ fi
 # -------- Backend --------
 echo "==> Setting up backend venv"
 cd "${APP_DIR}/backend"
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip wheel
-pip install -r requirements.txt
-deactivate
 
 if [ ! -f "${APP_DIR}/backend/.env" ]; then
   echo "==> Creating backend/.env from template (EDIT THIS!)"
@@ -51,8 +46,14 @@ ADMIN_PASSWORD=CHANGE_ME
 CORS_ORIGINS=*
 STUCK_JOB_MINUTES=30
 ENV
-  echo "    >>> EDIT ${APP_DIR}/backend/.env BEFORE RESTARTING BACKEND <<<"
+  echo "    >>> EDIT ${APP_DIR}/backend/.env BEFORE THE BACKEND IS USABLE <<<"
 fi
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip wheel
+pip install -r requirements.txt
+deactivate
 
 # -------- Frontend (build) --------
 echo "==> Building frontend"
