@@ -34,6 +34,12 @@ WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "")
 DOWNLOAD_DIR = Path(os.environ.get("MESHO_DOWNLOAD_DIR", "/home/ubuntu/meesho-downloads"))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# Chrome often drops downloads into its default ~/Downloads regardless of our
+# Page.setDownloadBehavior call — especially when the site opens a new tab to
+# trigger the zip. We therefore watch both our configured folder AND the
+# system default, and pick up whichever fires first.
+WATCH_DIRS = [DOWNLOAD_DIR, Path.home() / "Downloads"]
+
 PERIOD_LABEL = {
     "previous_week": "Previous Week",
     "previous_month": "Previous Month",
@@ -45,19 +51,28 @@ def _payments_url(identifier: str) -> str:
     return f"https://supplier.meesho.com/panel/v3/new/payouts/{identifier}/payments"
 
 
-def _wait_for_zip(folder: Path, started_at: float, timeout: int = 180) -> Optional[Path]:
-    """Poll the download folder for a .zip created after `started_at`.
-    Ignore Chrome's `.crdownload` partial files."""
+def _wait_for_zip(folders, started_at: float, timeout: int = 180) -> Optional[Path]:
+    """Poll the given download folders for a .zip created after `started_at`.
+    Ignores Chrome's `.crdownload` partial files. Returns the first stable zip
+    found across all folders."""
+    existing = set()
+    for folder in folders:
+        if folder.exists():
+            for p in folder.iterdir():
+                existing.add(p.resolve())
     deadline = time.time() + timeout
     while time.time() < deadline:
-        candidates = sorted(
-            (p for p in folder.iterdir()
-             if p.suffix.lower() == ".zip" and p.stat().st_mtime >= started_at),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        candidates = []
+        for folder in folders:
+            if not folder.exists():
+                continue
+            for p in folder.iterdir():
+                if (p.suffix.lower() == ".zip"
+                        and p.stat().st_mtime >= started_at
+                        and p.resolve() not in existing):
+                    candidates.append(p)
         if candidates:
-            # ensure it isn't still being written to
+            candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
             p = candidates[0]
             size1 = p.stat().st_size
             time.sleep(2)
@@ -209,10 +224,22 @@ def run_payments_fetch_for_account(acc: dict, period: str, job_id: str) -> dict:
             except Exception:
                 pass
 
-    zip_path = _wait_for_zip(DOWNLOAD_DIR, started_at)
+    zip_path = _wait_for_zip(WATCH_DIRS, started_at)
     if not zip_path:
-        raise RuntimeError(f"no .zip appeared in {DOWNLOAD_DIR} within timeout")
-    print(f"[payments_fetcher] zip downloaded: {zip_path.name}")
+        watched = ", ".join(str(p) for p in WATCH_DIRS)
+        raise RuntimeError(f"no .zip appeared in any of: {watched} within timeout")
+    print(f"[payments_fetcher] zip downloaded: {zip_path}")
+
+    # If Chrome saved into ~/Downloads (or anywhere else), relocate into our
+    # managed folder so cleanup is consistent.
+    if zip_path.parent.resolve() != DOWNLOAD_DIR.resolve():
+        moved = DOWNLOAD_DIR / zip_path.name
+        try:
+            shutil.move(str(zip_path), str(moved))
+            zip_path = moved
+            print(f"[payments_fetcher] relocated → {zip_path}")
+        except Exception as e:
+            print(f"[payments_fetcher] could not relocate (will still process): {e}")
 
     try:
         xlsx_path = _extract_xlsx(zip_path, DOWNLOAD_DIR)
