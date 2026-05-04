@@ -1,0 +1,18 @@
+# Minimal production requirements for the Meesho Seller Dashboard backend.
+# Loose pins (>=) so this works on Python 3.11, 3.12, 3.13, 3.14 alike.
+# The bloated /backend/requirements.txt is the dev pip-freeze output and
+# pulls google-api-core / grpcio / emergentintegrations which we do NOT use.
+
+fastapi>=0.110
+uvicorn[standard]>=0.25
+motor>=3.3
+bcrypt>=4.1
+pyjwt>=2.10
+pydantic>=2.6
+python-dotenv>=1.0
+apscheduler>=3.11
+pandas>=2.2
+openpyxl>=3.1
+python-multipart>=0.0.9
+email-validator>=2.2
+tzdata>=2024.2

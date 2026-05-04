@@ -52,7 +52,8 @@ fi
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip wheel
-pip install -r requirements.txt
+# Use the slim production list, not the bloated dev pip-freeze
+pip install -r "${APP_DIR}/deploy/requirements-prod.txt"
 deactivate
 
 # -------- Frontend (build) --------
