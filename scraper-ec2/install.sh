@@ -18,8 +18,8 @@ if ! command -v google-chrome >/dev/null 2>&1; then
 fi
 ${SUDO} apt-get install -y python3-pip curl
 
-echo "==> Installing Python deps (pymongo, playwright)…"
-pip3 install --user pymongo playwright --break-system-packages
+echo "==> Installing Python deps (pymongo, playwright, requests)…"
+pip3 install --user pymongo playwright requests --break-system-packages
 
 # Playwright browsers — only needed if your labels.py launches its own browser.
 # Since we connect_over_cdp to an already-running Chrome, we don't strictly need
@@ -27,7 +27,8 @@ pip3 install --user pymongo playwright --break-system-packages
 
 echo "==> Copying files to ${INSTALL_DIR}…"
 mkdir -p "${INSTALL_DIR}"
-cp -v label_worker.py labels.py start_chromes.sh "${INSTALL_DIR}/"
+mkdir -p /home/ubuntu/meesho-downloads
+cp -v label_worker.py labels.py payments_fetcher.py start_chromes.sh "${INSTALL_DIR}/"
 chmod +x "${INSTALL_DIR}/start_chromes.sh"
 
 echo "==> Installing systemd unit…"

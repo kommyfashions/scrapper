@@ -36,6 +36,7 @@ ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@meesho-dash.local").lower()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 STUCK_JOB_MINUTES = int(os.environ.get("STUCK_JOB_MINUTES", "30"))
 SCHED_TZ = ZoneInfo("Asia/Kolkata")
+WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "")  # shared secret for EC2 worker upload
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -83,6 +84,13 @@ async def get_current_user(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+async def get_user_or_worker(request: Request) -> dict:
+    """Allow JWT-authenticated dashboard users OR the EC2 worker (shared secret)."""
+    wk = request.headers.get("X-Worker-Key", "")
+    if WORKER_API_KEY and wk and wk == WORKER_API_KEY:
+        return {"id": "worker", "email": "worker@ec2", "name": "EC2 Worker"}
+    return await get_current_user(request)
 
 # --------------------------------------------------------------------------------------
 # Models
@@ -410,6 +418,21 @@ async def reconfigure_scheduler():
             CronTrigger(hour=h, minute=m, timezone=SCHED_TZ),
             id="daily_label", replace_existing=True,
         )
+    # Payments-file auto-fetch (always on; toggle later if needed)
+    # Every Monday 09:00 IST → previous_week
+    scheduler.add_job(
+        enqueue_payments_fetch_jobs,
+        CronTrigger(day_of_week="mon", hour=9, minute=0, timezone=SCHED_TZ),
+        id="weekly_payments_fetch", replace_existing=True,
+        kwargs={"period": "previous_week"},
+    )
+    # Every 5th of month 09:00 IST → previous_month
+    scheduler.add_job(
+        enqueue_payments_fetch_jobs,
+        CronTrigger(day=5, hour=9, minute=0, timezone=SCHED_TZ),
+        id="monthly_payments_fetch", replace_existing=True,
+        kwargs={"period": "previous_month"},
+    )
     # alerts run every 30 minutes regardless of toggles
     scheduler.add_job(
         detect_alerts,
@@ -1175,8 +1198,9 @@ class PLSkuCostIn(BaseModel):
 @api.post("/pl/upload")
 async def pl_upload(
     account_id: str = Query(..., description="Account this file belongs to"),
+    job_id: Optional[str] = Query(None, description="Optional job to mark done after success"),
     file: UploadFile = File(...),
-    user: dict = Depends(get_current_user),
+    user: dict = Depends(get_user_or_worker),
 ):
     # validate account
     oid = pl_oid_or_400(account_id)
@@ -1349,12 +1373,97 @@ async def pl_upload(
         }},
     )
 
+    # If this upload was triggered by a worker job, mark that job done so it
+    # surfaces in the Jobs page with the same lifecycle as scrape/label jobs.
+    if job_id:
+        try:
+            await db.jobs.update_one(
+                {"_id": pl_oid_or_400(job_id)},
+                {"$set": {
+                    "status": "done",
+                    "finished_at": datetime.now(timezone.utc),
+                    "result": {
+                        "upload_id": upload_id,
+                        "inserted": inserted, "updated": updated, "skipped": skipped,
+                        "ads_rows": ads_inserted, "filename": file.filename,
+                    },
+                }},
+            )
+        except Exception as e:
+            logger.warning(f"[pl/upload] job_id update failed: {e}")
+
     return {
         "ok": True, "upload_id": upload_id,
         "inserted": inserted, "updated": updated, "skipped": skipped,
         "ads_rows": ads_inserted,
         "total_processed": int(len(df)),
     }
+
+# ---------- Auto-fetch payment file: enqueue + manual trigger ----------
+PL_PERIODS = {"previous_week", "previous_month", "last_payment", "custom"}
+
+class PLFetchNowIn(BaseModel):
+    account_id: str
+    period: str = "previous_week"
+
+@api.post("/pl/fetch-now")
+async def pl_fetch_now(body: PLFetchNowIn, user: dict = Depends(get_current_user)):
+    if body.period not in PL_PERIODS:
+        raise HTTPException(status_code=400, detail=f"period must be one of {sorted(PL_PERIODS)}")
+    oid = pl_oid_or_400(body.account_id)
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    # avoid duplicate active jobs for same (account, period)
+    dup = await db.jobs.find_one({
+        "type": "payments_fetch",
+        "account_id": body.account_id,
+        "payload.period": body.period,
+        "status": {"$in": ["pending", "processing"]},
+    })
+    if dup:
+        return {"ok": True, "job_id": str(dup["_id"]), "status": dup["status"], "duplicate": True}
+    res = await db.jobs.insert_one({
+        "type": "payments_fetch",
+        "status": "pending",
+        "account_id": body.account_id,
+        "account_name": acc.get("name"),
+        "payload": {"period": body.period},
+        "created_at": datetime.now(timezone.utc),
+        "submitted_by": user.get("email", "user"),
+    })
+    return {"ok": True, "job_id": str(res.inserted_id), "status": "pending"}
+
+async def enqueue_payments_fetch_jobs(period: str):
+    """Cron: enqueue one payments_fetch job per enabled account."""
+    if period not in PL_PERIODS:
+        logger.warning(f"[scheduler] payments_fetch invalid period={period}")
+        return
+    try:
+        now = datetime.now(timezone.utc)
+        count = 0
+        async for acc in db.accounts.find({"enabled": True}):
+            existing = await db.jobs.find_one({
+                "type": "payments_fetch",
+                "account_id": str(acc["_id"]),
+                "payload.period": period,
+                "status": {"$in": ["pending", "processing"]},
+            })
+            if existing:
+                continue
+            await db.jobs.insert_one({
+                "type": "payments_fetch",
+                "status": "pending",
+                "account_id": str(acc["_id"]),
+                "account_name": acc.get("name"),
+                "payload": {"period": period},
+                "created_at": now,
+                "submitted_by": "scheduler",
+            })
+            count += 1
+        logger.info(f"[scheduler] Enqueued {count} payments_fetch job(s) period={period}")
+    except Exception as e:
+        logger.exception(f"[scheduler] payments_fetch enqueue failed: {e}")
 
 @api.get("/pl/uploads")
 async def pl_list_uploads(

@@ -23,6 +23,31 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 5 (2026-05-04) — SKU-cost dedupe + Auto-fetch payments
+**SKU cost fix (Option B)**
+- New helper `_pl_norm_acc()` normalises `""`/`"all"`/`"global"`/`"none"` → `None` on every cost write (POST + Excel upload + DELETE).
+- New helper `_pl_lookup_cost()` makes priority explicit: account-specific cost first, global fallback second.
+- `_pl_load_costs()` now sorts by `updated_at ASC` so the most-recent global wins deterministically.
+- Startup migration `_pl_dedupe_sku_costs()` consolidates legacy duplicate `(account_id, sku)` rows.
+- `GET /api/pl/sku-costs` joins `accounts` to return `account_name` so UI no longer shows ambiguous "—".
+- Frontend `PLSKUCosts.js` renders `account_name` (or "Global") instead of "—".
+- Applied user's IST datetime serialisation tweak (`.replace("+00:00", "Z")` with `tzinfo` fallback).
+
+**Auto-fetch payments worker (P1 from previous fork)**
+- New `payments_fetch` job type alongside `scrape` and `label_download`.
+- Backend: `POST /api/pl/fetch-now` for manual trigger; `enqueue_payments_fetch_jobs(period)` for cron.
+- Two cron entries (timezone Asia/Kolkata):
+   - **Every Monday 09:00 IST** → period `previous_week`
+   - **Every 5th of month 09:00 IST** → period `previous_month`
+- New shared-secret auth: `WORKER_API_KEY` (in `backend/.env`); `get_user_or_worker` allows the EC2 worker to POST `/api/pl/upload` via `X-Worker-Key` header without owning a JWT.
+- `/api/pl/upload` now accepts optional `job_id` query param and marks the job `done` with `result.{inserted, updated, skipped, ads_rows, filename, upload_id}`.
+- `scraper-ec2/payments_fetcher.py` (NEW) — Playwright + CDP-attach driver: navigates to `https://supplier.meesho.com/panel/v3/new/payouts/{name}/payments`, clicks `Download → Payments to Date → <radio> → Download`, waits for .zip, extracts xlsx, POSTs to dashboard `/api/pl/upload`, cleans up.
+- `scraper-ec2/label_worker.py` is now a single dispatcher handling both `label_download` and `payments_fetch` types (`JOB_TYPES = ["label_download", "payments_fetch"]`).
+- `scraper-ec2/install.sh` adds `requests` dep + copies `payments_fetcher.py` + creates `/home/ubuntu/meesho-downloads/`.
+- `meesho-label-worker.service` adds env vars `DASHBOARD_URL`, `WORKER_API_KEY`, `MESHO_DOWNLOAD_DIR`.
+- Frontend `PLUploads.js` adds period dropdown (Previous Week / Previous Month / Last Payment) + "Fetch latest now" button → calls `/api/pl/fetch-now` → user watches Jobs page for completion.
+- `README.md` rewritten: explains both cron schedules, worker env vars, and per-account flow.
+
 ## Implemented — Iteration 4 (2026-05-04) — Profit & Loss module
 **Backend additions** (in `server.py` under `/api/pl/*`)
 - New collections: `pl_orders` (compound unique key `{account_id, sub_order_no}`), `pl_sku_costs`, `pl_uploads`, `pl_ads_cost`.

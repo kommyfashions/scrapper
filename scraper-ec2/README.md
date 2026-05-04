@@ -1,15 +1,17 @@
-# Meesho Seller Central — EC2 Label Download Worker
+# Meesho Seller Central — EC2 Worker (Labels + Payments Auto-fetch)
 
-Runs on **Ubuntu 26.04 EC2**. Polls the same MongoDB the dashboard uses, picks up `label_download` jobs, dispatches them per-account.
+Runs on **Ubuntu 26.04 EC2**. Polls the same MongoDB the dashboard uses, picks up `label_download` and `payments_fetch` jobs, dispatches them per-account.
 
 ## Architecture (recap)
 
 ```
 EC2 Ubuntu
 ├── Multiple Chrome processes (one per supplier account)
-│      port 9222 → /home/ubuntu/chrome-profile1   (Account "Main")
-│      port 9223 → /home/ubuntu/chrome-profile2   (Account "Brand B")
-├── label_worker.py  ← polls jobs, picks the right Chrome by account_id
+│      port 9222 → /home/ubuntu/chrome-profile1   (Account "hrbib")
+│      port 9223 → /home/ubuntu/chrome-profile2   (Account "uobfs")
+├── label_worker.py        ← single dispatcher for both job types
+├── labels.py              ← label-download flow (CDP-attached)
+├── payments_fetcher.py    ← payments xlsx download flow (CDP-attached)
 └── systemd: meesho-label-worker.service
 ```
 
@@ -17,8 +19,9 @@ EC2 Ubuntu
 
 | File | Purpose |
 |---|---|
-| `labels.py` | Your latest bot (verbatim). Globals `DEBUG_PORT`, `PENDING_URL`, `READY_URL` are overridden per-account by `label_worker.py`. |
-| `label_worker.py` | Polls MongoDB, attaches via CDP to the account's port, calls `labels.main()`. |
+| `labels.py` | Your latest label-download bot. Globals overridden per-account by the dispatcher. |
+| `payments_fetcher.py` | Drives the Meesho Payments page → Download → Payments to Date → period radio → unzips → POSTs xlsx to dashboard `/api/pl/upload`. |
+| `label_worker.py` | Single polling loop that handles both `label_download` and `payments_fetch` jobs. |
 | `start_chromes.sh` | Reads enabled accounts from MongoDB and launches one Chrome each. |
 | `install.sh` | One-time install: deps + systemd unit. |
 | `meesho-label-worker.service` | systemd unit. |
@@ -60,9 +63,28 @@ EC2 Ubuntu
 
 ## Day-to-day
 
-- Submit a label run from the dashboard → backend creates a `label_download` job with the chosen `account_id`.
-- The systemd worker picks it up within ~5s, attaches to the right Chrome port, runs `labels.main()`.
-- Job moves to `done` (or `failed` with the full error text).
+- **Labels** — submit from the dashboard → backend creates a `label_download` job → worker picks it up.
+- **Payments auto-fetch** — backend cron enqueues `payments_fetch` jobs:
+   - **Every Monday 09:00 IST** → period = `previous_week`
+   - **Every 5th of month 09:00 IST** → period = `previous_month`
+- **Manual on-demand fetch** — Uploads page → "Fetch latest now" button (period dropdown).
+- The worker opens the supplier panel for the account, clicks `Download → Payments to Date → <period> → Download`, waits for the .zip, extracts the .xlsx, and POSTs it to `/api/pl/upload`. Job moves to `done` automatically.
+
+### Required env on the worker
+
+| Var | Example | Purpose |
+|---|---|---|
+| `MESHO_MONGO_URI` | `mongodb://43.205.229.129:27017/` | Same Mongo as dashboard |
+| `MESHO_DB_NAME` | `meesho` | |
+| `DASHBOARD_URL` | `http://127.0.0.1:8000` | Where the worker POSTs xlsx (your dashboard backend on the same EC2) |
+| `WORKER_API_KEY` | — | **Must match** `WORKER_API_KEY` in `/app/backend/.env`. Already pre-generated in the dashboard `.env`; copy that string into `meesho-label-worker.service`. |
+| `MESHO_DOWNLOAD_DIR` | `/home/ubuntu/meesho-downloads` | Where Chrome drops the .zip and we extract the xlsx (auto-cleaned). |
+
+After editing `meesho-label-worker.service`, run:
+```
+sudo systemctl daemon-reload
+sudo systemctl restart meesho-label-worker
+```
 
 ## Troubleshooting
 

@@ -33,6 +33,7 @@ from pymongo import MongoClient
 from bson import ObjectId
 
 import labels  # the user's labels.py — we override its globals per-job
+import payments_fetcher  # new: handles type=payments_fetch jobs
 
 MONGO_URI = os.environ.get("MESHO_MONGO_URI", "mongodb://43.205.229.129:27017/")
 DB_NAME = os.environ.get("MESHO_DB_NAME", "meesho")
@@ -42,6 +43,8 @@ client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 jobs_col = db["jobs"]
 accounts_col = db["accounts"]
+
+JOB_TYPES = ["label_download", "payments_fetch"]
 
 
 def chrome_alive(port: int) -> bool:
@@ -72,15 +75,7 @@ def get_account(job) -> dict:
 
 def run_label_for_account(acc: dict):
     port = int(acc["debug_port"])
-    if not chrome_alive(port):
-        raise RuntimeError(
-            f"Chrome not running on port {port} for account "
-            f"'{acc.get('name')}'.  Start it with:\n"
-            f"  google-chrome --remote-debugging-port={port} "
-            f"--user-data-dir={acc.get('profile_dir', '/home/ubuntu/chrome-profile')}\n"
-            f"or run ./start_chromes.sh"
-        )
-
+    # chrome_alive was already verified by the dispatcher
     # ── derive per-account supplier URLs ────────────────────────────────────
     # Account `name` IS the Meesho URL suffix (e.g. 'hrbib', 'uobfs').
     # We ALWAYS derive from the name so adding a new account just works,
@@ -114,10 +109,10 @@ def run_label_for_account(acc: dict):
 
 
 def loop():
-    print(f"🚀 Label worker (EC2) — Mongo: {MONGO_URI} db={DB_NAME}")
+    print(f"🚀 Worker (EC2) — Mongo: {MONGO_URI} db={DB_NAME} types={JOB_TYPES}")
     while True:
         job = jobs_col.find_one_and_update(
-            {"status": "pending", "type": "label_download"},
+            {"status": "pending", "type": {"$in": JOB_TYPES}},
             {"$set": {"status": "processing", "started_at": datetime.now(timezone.utc)}},
             sort=[("created_at", 1)],
         )
@@ -125,18 +120,45 @@ def loop():
             time.sleep(POLL)
             continue
 
-        print(f"\n=== label job {job.get('_id')} ===")
+        jtype = job.get("type")
+        print(f"\n=== {jtype} job {job.get('_id')} ===")
         try:
             acc = get_account(job)
-            run_label_for_account(acc)
-            jobs_col.update_one(
-                {"_id": job["_id"]},
-                {"$set": {
+            port = int(acc["debug_port"])
+            if not chrome_alive(port):
+                raise RuntimeError(
+                    f"Chrome not running on port {port} for account "
+                    f"'{acc.get('name')}' — run start_chromes.sh"
+                )
+
+            result_doc = None
+            if jtype == "label_download":
+                run_label_for_account(acc)
+            elif jtype == "payments_fetch":
+                period = (job.get("payload") or {}).get("period", "previous_week")
+                # payments_fetcher handles its own /api/pl/upload + job-done update
+                # via job_id.  We still mark `done` here in case the upload
+                # endpoint couldn't (e.g. dashboard reachable but failed).
+                result_doc = payments_fetcher.run_payments_fetch_for_account(
+                    acc, period, str(job["_id"])
+                )
+            else:
+                raise RuntimeError(f"unknown job type: {jtype}")
+
+            # If the job wasn't already marked done by an upstream upload
+            # call (payments_fetch /api/pl/upload sets status=done), we set
+            # it here.  Re-read to avoid stomping a "done" set by upload.
+            cur = jobs_col.find_one({"_id": job["_id"]}, {"status": 1})
+            if cur and cur.get("status") != "done":
+                set_doc = {
                     "status": "done",
                     "finished_at": datetime.now(timezone.utc),
                     "account_name": acc.get("name"),
-                }},
-            )
+                }
+                if result_doc is not None:
+                    set_doc["result"] = result_doc
+                jobs_col.update_one({"_id": job["_id"]}, {"$set": set_doc})
+
             accounts_col.update_one(
                 {"_id": acc["_id"]},
                 {"$set": {"last_used_at": datetime.now(timezone.utc), "last_status": "ok"}},

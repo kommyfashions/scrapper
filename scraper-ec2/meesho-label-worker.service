@@ -10,6 +10,9 @@ WorkingDirectory=/home/ubuntu/meesho-label-worker
 Environment="MESHO_MONGO_URI=mongodb://43.205.229.129:27017/"
 Environment="MESHO_DB_NAME=meesho"
 Environment="MESHO_POLL_SECONDS=5"
+Environment="DASHBOARD_URL=http://127.0.0.1:8000"
+Environment="WORKER_API_KEY=CHANGE_ME"
+Environment="MESHO_DOWNLOAD_DIR=/home/ubuntu/meesho-downloads"
 ExecStart=/usr/bin/python3 /home/ubuntu/meesho-label-worker/label_worker.py
 Restart=on-failure
 RestartSec=5

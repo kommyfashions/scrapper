@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { UploadSimpleIcon, ArrowsClockwiseIcon, TrashIcon, FileXlsIcon } from "@phosphor-icons/react";
+import { UploadSimpleIcon, ArrowsClockwiseIcon, TrashIcon, FileXlsIcon, CloudArrowDownIcon } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import { usePL, inr } from "./PLLayout";
 
@@ -8,9 +8,11 @@ export default function PLUploads() {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [fetching, setFetching] = useState(false);
   const [err, setErr] = useState("");
   const [msg, setMsg] = useState("");
   const [pickedAccountId, setPickedAccountId] = useState(accountId !== "all" ? accountId : "");
+  const [period, setPeriod] = useState("previous_week");
 
   useEffect(() => {
     setPickedAccountId(accountId !== "all" ? accountId : "");
@@ -58,6 +60,21 @@ export default function PLUploads() {
     } catch (e) { setErr(formatApiError(e)); }
   };
 
+  const fetchNow = async () => {
+    if (!pickedAccountId) { setErr("Select an account first."); return; }
+    setFetching(true); setErr(""); setMsg("");
+    try {
+      const { data } = await api.post("/pl/fetch-now", {
+        account_id: pickedAccountId, period,
+      });
+      const dup = data.duplicate ? " (already pending)" : "";
+      setMsg(`Fetch job queued${dup}: ${data.job_id}. Watch the Jobs page for progress.`);
+      setTimeout(() => setMsg(""), 6000);
+    } catch (e) {
+      setErr(formatApiError(e));
+    } finally { setFetching(false); }
+  };
+
   const accName = (id) => accounts.find((a) => a.id === id)?.name || id;
 
   return (
@@ -89,6 +106,32 @@ export default function PLUploads() {
           </label>
           <button onClick={load} className="btn-ghost text-xs flex items-center gap-1" data-testid="pl-upload-refresh">
             <ArrowsClockwiseIcon size={12} weight="bold" /> Refresh
+          </button>
+        </div>
+      </div>
+
+      <div className="panel p-5 space-y-4">
+        <div className="font-display text-base">Auto-fetch from Meesho</div>
+        <div className="text-[11px] text-[#A1A1AA]">
+          The EC2 worker will open the supplier panel for the selected account, click <span className="code-tag">Download → Payments to Date</span>,
+          select the chosen period, and import the resulting xlsx automatically. Runs every <span className="code-tag">Mon 09:00 IST</span> (previous week)
+          and <span className="code-tag">5th of month 09:00 IST</span> (previous month). Use the button below for an on-demand pull.
+        </div>
+        <div className="flex flex-wrap gap-3 items-end">
+          <div className="min-w-[180px]">
+            <div className="section-label mb-1">/ period</div>
+            <select value={period} onChange={(e) => setPeriod(e.target.value)}
+              className="input-shell font-mono text-xs w-full" data-testid="pl-fetch-period">
+              <option value="previous_week">Previous Week</option>
+              <option value="previous_month">Previous Month</option>
+              <option value="last_payment">Last Payment</option>
+            </select>
+          </div>
+          <button onClick={fetchNow} disabled={!pickedAccountId || fetching}
+            className={`btn-primary text-xs flex items-center gap-2 ${(!pickedAccountId || fetching) ? "opacity-50 pointer-events-none" : ""}`}
+            data-testid="pl-fetch-now-btn">
+            <CloudArrowDownIcon size={14} weight="bold" />
+            {fetching ? "Queueing…" : "Fetch latest now"}
           </button>
         </div>
       </div>
