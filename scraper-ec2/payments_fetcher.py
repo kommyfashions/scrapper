@@ -20,7 +20,6 @@ This module is single-purpose and stateless; the dispatcher in
 from __future__ import annotations
 
 import os
-import re
 import time
 import zipfile
 import shutil
@@ -95,23 +94,82 @@ def _upload_to_dashboard(xlsx_path: Path, account_id: str, job_id: str) -> dict:
     return r.json()
 
 
-def _click_download_flow(page, period_label: str):
-    """Replicate the manual UI flow shown in user's screenshots."""
-    # 1. Top-right "Download" button (split button)
-    page.get_by_role("button", name=re.compile(r"^\s*Download\s*$", re.I)).first.click()
-    page.wait_for_timeout(800)
+def _click_first_visible(page, selectors, what: str, timeout: int = 20_000):
+    """Try a list of locators in order. First one that becomes visible
+    within `timeout` gets clicked. Raises with a helpful message if none match."""
+    last_err = None
+    deadline = time.time() + (timeout / 1000)
+    for sel in selectors:
+        try:
+            loc = sel(page) if callable(sel) else page.locator(sel)
+            loc = loc.first
+            remaining = max(1_000, int((deadline - time.time()) * 1000))
+            loc.wait_for(state="visible", timeout=remaining)
+            loc.click()
+            print(f"[payments_fetcher]   ✓ clicked {what}  via {sel if isinstance(sel, str) else 'lambda'}")
+            return
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"could not find clickable '{what}': {type(last_err).__name__}: {last_err}")
 
-    # 2. Dropdown item "Payments to Date"
-    page.get_by_text("Payments to Date", exact=True).click()
-    page.wait_for_timeout(800)
 
-    # 3. Modal radio
-    radio = page.get_by_text(period_label, exact=True)
-    radio.click()
-    page.wait_for_timeout(400)
+def _click_download_flow(page, period_label: str, debug_dir: Path):
+    """Replicate the manual UI flow shown in user's screenshots.
+    Robust to Meesho rendering Download as <div role=button> vs <button>."""
+    # Wait for the SPA to finish its initial XHR burst.
+    try:
+        page.wait_for_load_state("networkidle", timeout=30_000)
+    except Exception:
+        pass
+    page.wait_for_timeout(2000)
 
-    # 4. Modal "Download" button
-    page.get_by_role("button", name=re.compile(r"^\s*Download\s*$", re.I)).last.click()
+    try:
+        # 1. Top-right "Download" split button
+        _click_first_visible(page, [
+            'button:has-text("Download")',
+            '[role="button"]:has-text("Download")',
+            'div:has-text("Download"):not(:has(*:has-text("Download")))',
+            lambda p: p.get_by_text("Download", exact=True),
+        ], what="top-right Download button")
+        page.wait_for_timeout(1200)
+
+        # 2. Dropdown item "Payments to Date"
+        _click_first_visible(page, [
+            lambda p: p.get_by_text("Payments to Date", exact=True),
+            'text="Payments to Date"',
+            '[role="menuitem"]:has-text("Payments to Date")',
+        ], what="'Payments to Date' menu item")
+        page.wait_for_timeout(1200)
+
+        # 3. Modal radio (Previous Week / Previous Month / Last Payment)
+        _click_first_visible(page, [
+            lambda p: p.get_by_text(period_label, exact=True),
+            f'text="{period_label}"',
+            f'label:has-text("{period_label}")',
+            f'[role="radio"]:has-text("{period_label}")',
+        ], what=f"radio '{period_label}'")
+        page.wait_for_timeout(800)
+
+        # 4. Modal "Download" button (the one inside the dialog).
+        # We scope to the dialog if it exists; otherwise grab the LAST
+        # visible Download (the modal one renders later than the page-level one).
+        _click_first_visible(page, [
+            '[role="dialog"] button:has-text("Download")',
+            '[role="dialog"] [role="button"]:has-text("Download")',
+            lambda p: p.locator('button:has-text("Download")').last,
+            lambda p: p.locator('[role="button"]:has-text("Download")').last,
+        ], what="modal Download button")
+    except Exception:
+        # capture a debug screenshot so user can see UI state at failure
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        path = debug_dir / f"payments_fetch_fail_{ts}.png"
+        try:
+            page.screenshot(path=str(path), full_page=True)
+            print(f"[payments_fetcher] ✗ saved failure screenshot → {path}")
+        except Exception as e2:
+            print(f"[payments_fetcher] could not save screenshot: {e2}")
+        raise
 
 
 def run_payments_fetch_for_account(acc: dict, period: str, job_id: str) -> dict:
@@ -144,7 +202,7 @@ def run_payments_fetch_for_account(acc: dict, period: str, job_id: str) -> dict:
             })
             page.goto(_payments_url(identifier), wait_until="domcontentloaded", timeout=60_000)
             page.wait_for_timeout(4000)  # let the SPA fetch boot
-            _click_download_flow(page, label)
+            _click_download_flow(page, label, DOWNLOAD_DIR)
         finally:
             try:
                 page.close()
