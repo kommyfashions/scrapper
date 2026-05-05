@@ -76,6 +76,9 @@ export default function PLUploads() {
   };
 
   const accName = (id) => accounts.find((a) => a.id === id)?.name || id;
+  const pickedAcc = accounts.find((a) => a.id === pickedAccountId);
+  const lastFetched = pickedAcc?.last_payment_filename;
+  const lastFetchedAt = pickedAcc?.last_payment_at;
 
   return (
     <div className="px-8 py-6 space-y-4" data-testid="pl-uploads-page">
@@ -134,6 +137,17 @@ export default function PLUploads() {
             {fetching ? "Queueing…" : "Fetch latest now"}
           </button>
         </div>
+        {pickedAccountId && lastFetched && (
+          <div className="text-[11px] text-[#71717A] font-mono" data-testid="pl-last-fetched">
+            <span className="text-[#A1A1AA]">Last fetched for </span>
+            <span className="text-white">{pickedAcc?.name}</span>
+            <span className="text-[#A1A1AA]">: </span>
+            <span className="text-[#00E676]">{lastFetched}</span>
+            {lastFetchedAt && (
+              <span className="text-[#71717A]"> · {new Date(lastFetchedAt).toLocaleString()}</span>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="panel">

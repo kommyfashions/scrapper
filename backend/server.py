@@ -1199,6 +1199,10 @@ class PLSkuCostIn(BaseModel):
 async def pl_upload(
     account_id: str = Query(..., description="Account this file belongs to"),
     job_id: Optional[str] = Query(None, description="Optional job to mark done after success"),
+    source_filename: Optional[str] = Query(
+        None,
+        description="Filename Meesho proposed (worker uploads only). Stored for audit.",
+    ),
     file: UploadFile = File(...),
     user: dict = Depends(get_user_or_worker),
 ):
@@ -1229,6 +1233,7 @@ async def pl_upload(
         "account_id": account_id,
         "account_name": acc.get("name"),
         "filename": file.filename,
+        "source_filename": source_filename or file.filename,
         "uploaded_at": datetime.now(timezone.utc),
         "uploaded_by": user["email"],
         "row_count": int(len(df)),
@@ -1386,11 +1391,26 @@ async def pl_upload(
                         "upload_id": upload_id,
                         "inserted": inserted, "updated": updated, "skipped": skipped,
                         "ads_rows": ads_inserted, "filename": file.filename,
+                        "source_filename": source_filename or file.filename,
+                        "settlement_total": round(settlement_total, 2),
+                        "min_order_date": min_date, "max_order_date": max_date,
                     },
                 }},
             )
         except Exception as e:
             logger.warning(f"[pl/upload] job_id update failed: {e}")
+
+        # Also stamp the account so the dashboard can show "Last fetched: …"
+        try:
+            await db.accounts.update_one(
+                {"_id": oid},
+                {"$set": {
+                    "last_payment_filename": source_filename or file.filename,
+                    "last_payment_at": datetime.now(timezone.utc),
+                }},
+            )
+        except Exception as e:
+            logger.warning(f"[pl/upload] account stamp failed: {e}")
 
     return {
         "ok": True, "upload_id": upload_id,

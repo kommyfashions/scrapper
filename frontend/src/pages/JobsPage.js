@@ -14,6 +14,7 @@ const TYPES = [
   { k: "all", label: "ALL TYPES" },
   { k: "product_scrape", label: "SCRAPE" },
   { k: "label_download", label: "LABEL" },
+  { k: "payments_fetch", label: "PAYMENT" },
 ];
 
 export default function JobsPage() {
@@ -226,6 +227,9 @@ export default function JobsPage() {
                       {j.type === "label_download" && (
                         <span className="ml-2 code-tag text-[#F5A623] border-[#F5A623]/40">LABEL</span>
                       )}
+                      {j.type === "payments_fetch" && (
+                        <span className="ml-2 code-tag text-[#00E676] border-[#00E676]/40">PAYMENT</span>
+                      )}
                       {j.error && (
                         <div
                           className="mt-1 max-w-[260px] truncate font-mono text-[10px] text-[#FF3B30]"
@@ -238,6 +242,40 @@ export default function JobsPage() {
                     <td className="max-w-md">
                       {j.type === "label_download" ? (
                         <div className="font-mono text-xs text-[#F5A623]">Label Download job</div>
+                      ) : j.type === "payments_fetch" ? (
+                        <div>
+                          <div className="font-mono text-xs text-[#00E676]">
+                            Payment file fetch
+                            {j.payload?.period && (
+                              <span className="ml-2 text-[10px] text-[#A1A1AA]">
+                                · {String(j.payload.period).replace(/_/g, " ")}
+                              </span>
+                            )}
+                            {j.account_name && (
+                              <span className="ml-2 text-[10px] text-[#A1A1AA]">
+                                · acct {j.account_name}
+                              </span>
+                            )}
+                          </div>
+                          {(j.result?.source_filename || j.result?.filename) && (
+                            <div
+                              className="mt-1 truncate font-mono text-[10px] text-[#71717A]"
+                              title={j.result.source_filename || j.result.filename}
+                              data-testid={`payment-filename-${j.id}`}
+                            >
+                              {j.result.source_filename || j.result.filename}
+                            </div>
+                          )}
+                          {j.result && (
+                            <div className="mt-1 font-mono text-[10px] text-[#A1A1AA]">
+                              <span className="text-[#00E676]">+{j.result.inserted ?? 0}</span>
+                              <span className="mx-1">·</span>
+                              <span className="text-[#007AFF]">~{j.result.updated ?? 0}</span>
+                              <span className="mx-1">·</span>
+                              <span className="text-[#F5A623]">ads {j.result.ads_rows ?? 0}</span>
+                            </div>
+                          )}
+                        </div>
                       ) : (
                         <>
                           <div className="font-mono text-xs text-white truncate">{j.product_url}</div>

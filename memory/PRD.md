@@ -23,6 +23,22 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 6 (2026-05-05) — Robust payments-fetcher + Jobs UI
+**Worker (`scraper-ec2/payments_fetcher.py`) hardened**
+- Switched from folder-polling to Playwright `page.expect_download()`. We now capture the *exact* `suggested_filename` Meesho proposes, eliminating cross-account file mix-ups when multiple jobs run close together.
+- Per-account, per-period download folder: `<DOWNLOAD_DIR>/<safe_account>/<period>/`.
+- Click-flow retried up to **3×** with `page.reload()` between attempts when no download event fires within 30 s. Failures take a debug screenshot.
+- Both `.zip` and bare `.xlsx` downloads supported.
+- Source filename is forwarded to `/api/pl/upload?source_filename=…` for traceability.
+
+**Backend (`server.py`)**
+- `/api/pl/upload` accepts new `source_filename` query param; persisted on `pl_uploads.source_filename` and on the job's `result.source_filename`.
+- After a worker upload, the related `accounts` document gets stamped with `last_payment_filename` + `last_payment_at` for the dashboard.
+
+**Frontend**
+- `JobsPage.js` — added `PAYMENT` type filter and badge, with inline display of the captured filename, period, account, and inserted/updated/ads counts per job.
+- `pl/PLUploads.js` — shows "Last fetched: <filename> · <when>" line below the Auto-fetch panel for the picked account.
+
 ## Implemented — Iteration 5 (2026-05-04) — SKU-cost dedupe + Auto-fetch payments
 **SKU cost fix (Option B)**
 - New helper `_pl_norm_acc()` normalises `""`/`"all"`/`"global"`/`"none"` → `None` on every cost write (POST + Excel upload + DELETE).
