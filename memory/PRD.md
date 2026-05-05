@@ -23,6 +23,17 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 8 (2026-05-05) — Bug fixes + Account alias
+**Fixes**
+- GST fetcher: month-picker popover was blocking the modal Download button. Now after ticking the month, the worker clicks a neutral spot at the modal's top-left (via bounding-box mouse click) to collapse the popover, with `Escape` as fallback.
+- Public share URL was returning 500 (naive-vs-aware `datetime` comparison). Added `_as_aware_utc()` helper; both GST & Tax public endpoints now compare correctly.
+- Authenticated download on GST & Tax pages returned `Not authenticated` because `<a href>` can't carry the Bearer token. Replaced with axios blob download.
+
+**Account alias**
+- New `alias` field on accounts (optional). System `name` is still used for scraping/URLs; `alias` is shown in the UI (dropdowns + Accounts table) as `Kommy Fashions (hrbib)`.
+- Backend: `AccountIn`/`AccountUpdate` models accept alias; it's persisted and returned in `/api/accounts`.
+- Frontend: input added to the Accounts form with help text, alias shown everywhere an account appears.
+
 ## Implemented — Iteration 7 (2026-05-05) — GST Report + Tax Invoice scrapers
 **Workers (`scraper-ec2/`)**
 - New `_meesho_ui.py` shared helpers (CDP attach, click-first-visible, watch-for-download-or-text race).

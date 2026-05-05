@@ -97,13 +97,23 @@ def _open_gst_modal(page, year: int, month_num: int):
     ], what=f"month {month_label}")
     page.wait_for_timeout(700)
 
-    # close the month dropdown by clicking the title (so the Download
-    # button is reachable again) — clicking the modal title is harmless.
+    # close the month dropdown by clicking a neutral spot inside the
+    # modal (not inside the open popover) so the Download button
+    # becomes visible + clickable again.  Meesho's popover is anchored
+    # below the month combobox, so a click near the modal's top-left
+    # (on the title row) reliably lands outside the popover.
     try:
-        page.locator('[role="dialog"]').get_by_text("Download GST reports", exact=True).click()
+        modal = page.locator('[role="dialog"]').first
+        box = modal.bounding_box()
+        if box:
+            # click 24 px into the modal from the top-left — inside the
+            # modal, outside the dropdown popover.
+            page.mouse.click(box["x"] + 24, box["y"] + 24)
+        else:
+            page.keyboard.press("Escape")
     except Exception:  # noqa: BLE001
         page.keyboard.press("Escape")
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(700)
 
 
 def _click_modal_download(page):

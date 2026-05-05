@@ -123,6 +123,7 @@ class ScheduleSettings(BaseModel):
 
 class AccountIn(BaseModel):
     name: str
+    alias: Optional[str] = None
     debug_port: int
     profile_dir: str
     pending_url: Optional[str] = None
@@ -131,6 +132,7 @@ class AccountIn(BaseModel):
 
 class AccountUpdate(BaseModel):
     name: Optional[str] = None
+    alias: Optional[str] = None
     debug_port: Optional[int] = None
     profile_dir: Optional[str] = None
     pending_url: Optional[str] = None
@@ -2217,7 +2219,7 @@ async def pl_gst_public(rec_id: str, token: str):
     if (not rec or rec.get("share_token") != token
             or not rec.get("available")):
         raise HTTPException(status_code=404, detail="invalid or expired link")
-    exp = rec.get("share_token_expires_at")
+    exp = _as_aware_utc(rec.get("share_token_expires_at"))
     if exp and exp < datetime.now(timezone.utc):
         raise HTTPException(status_code=410, detail="link expired")
     fp = rec.get("file_path")
@@ -2410,7 +2412,7 @@ async def pl_tax_public(rec_id: str, token: str):
     if (not rec or rec.get("share_token") != token
             or not rec.get("available")):
         raise HTTPException(status_code=404, detail="invalid or expired link")
-    exp = rec.get("share_token_expires_at")
+    exp = _as_aware_utc(rec.get("share_token_expires_at"))
     if exp and exp < datetime.now(timezone.utc):
         raise HTTPException(status_code=410, detail="link expired")
     fp = rec.get("file_path")
@@ -2480,6 +2482,15 @@ async def enqueue_gst_and_tax_jobs():
 @api.get("/health")
 async def health():
     return {"ok": True}
+
+app.include_router(api)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_methods=["*"], allow_headers=["*"],
+)
 
 app.include_router(api)
 

@@ -97,7 +97,7 @@ export default function PLUploads() {
             <select value={pickedAccountId} onChange={(e) => setPickedAccountId(e.target.value)}
               className="input-shell font-mono text-xs w-full" data-testid="pl-upload-account">
               <option value="">Select account…</option>
-              {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+              {accounts.map((a) => <option key={a.id} value={a.id}>{a.alias ? `${a.alias} (${a.name})` : a.name}</option>)}
             </select>
           </div>
           <label className={`btn-primary text-xs flex items-center gap-2 cursor-pointer ${(!pickedAccountId || uploading) ? "opacity-50 pointer-events-none" : ""}`}

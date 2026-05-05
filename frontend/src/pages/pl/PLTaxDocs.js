@@ -104,7 +104,19 @@ function DocPanel({ title, kind, accentColor }) {
     } catch (e) { setErr(formatApiError(e)); }
   };
 
-  const downloadHref = (id) => `${api.defaults.baseURL}/pl/${kind}/${id}/download`;
+  const download = async (rec) => {
+    try {
+      const resp = await api.get(`/pl/${kind}/${rec.id}/download`, { responseType: "blob" });
+      const url = window.URL.createObjectURL(new Blob([resp.data]));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = rec.stored_filename || `${kind}_${rec.id}`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => window.URL.revokeObjectURL(url), 1000);
+    } catch (e) { setErr(formatApiError(e)); }
+  };
+
+  const accLabel = (a) => a.alias ? `${a.alias} (${a.name})` : a.name;
   const fmtDt = (s) => s ? new Date(s).toLocaleString() : "—";
 
   return (
@@ -125,7 +137,7 @@ function DocPanel({ title, kind, accentColor }) {
           <select value={picked} onChange={(e) => setPicked(e.target.value)}
             className="input-shell font-mono text-xs w-full" data-testid={`${kind}-account`}>
             <option value="">Select account…</option>
-            {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+            {accounts.map((a) => <option key={a.id} value={a.id}>{accLabel(a)}</option>)}
           </select>
         </div>
         <div className="min-w-[110px]">
@@ -202,11 +214,11 @@ function DocPanel({ title, kind, accentColor }) {
                   <div className="flex items-center justify-end gap-1">
                     {r.available && (
                       <>
-                        <a href={downloadHref(r.id)} target="_blank" rel="noreferrer"
+                        <button onClick={() => download(r)}
                           className="btn-ghost text-xs flex items-center gap-1"
                           data-testid={`download-${kind}-${r.id}`}>
                           <CloudArrowDownIcon size={12} weight="bold" /> Download
-                        </a>
+                        </button>
                         <ShareLinkButton kind={kind} recId={r.id} />
                       </>
                     )}

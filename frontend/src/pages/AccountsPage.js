@@ -13,7 +13,7 @@ import api, { formatApiError } from "@/lib/api";
 import PageHeader from "@/components/PageHeader";
 import { fmtRelative } from "@/lib/format";
 
-const EMPTY = { name: "", debug_port: 9222, profile_dir: "", enabled: true };
+const EMPTY = { name: "", alias: "", debug_port: 9222, profile_dir: "", enabled: true };
 
 function AccountModal({ open, account, onClose, onSaved }) {
   const editing = !!account?.id;
@@ -27,6 +27,7 @@ function AccountModal({ open, account, onClose, onSaved }) {
     if (editing) {
       setForm({
         name: account.name || "",
+        alias: account.alias || "",
         debug_port: account.debug_port || 9222,
         profile_dir: account.profile_dir || "",
         enabled: account.enabled ?? true,
@@ -46,6 +47,7 @@ function AccountModal({ open, account, onClose, onSaved }) {
     try {
       const body = {
         name: form.name.trim(),
+        alias: (form.alias || "").trim() || null,
         debug_port: Number(form.debug_port),
         profile_dir: form.profile_dir.trim(),
         enabled: form.enabled,
@@ -102,6 +104,23 @@ function AccountModal({ open, account, onClose, onSaved }) {
             className="input-shell font-mono text-sm w-full"
             data-testid="account-name-input"
           />
+          <div className="text-[10px] font-mono text-[#71717A] mt-1">
+            System identifier — used in Meesho URLs & API paths.
+          </div>
+        </div>
+
+        <div>
+          <div className="section-label mb-1">/ alias (human-friendly label, optional)</div>
+          <input
+            value={form.alias}
+            onChange={(e) => setForm({ ...form, alias: e.target.value })}
+            placeholder="e.g. Kommy Fashions"
+            className="input-shell font-mono text-sm w-full"
+            data-testid="account-alias-input"
+          />
+          <div className="text-[10px] font-mono text-[#71717A] mt-1">
+            Shown in the UI & dropdowns. The system name above is still used for scraping and file paths.
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-3">
@@ -275,7 +294,16 @@ export default function AccountsPage() {
                 )}
                 {items.map((a) => (
                   <tr key={a.id} data-testid={`account-row-${a.id}`}>
-                    <td className="font-mono text-sm">{a.name}</td>
+                    <td className="font-mono text-sm">
+                      {a.alias ? (
+                        <>
+                          <div>{a.alias}</div>
+                          <div className="font-mono text-[10px] text-[#71717A]">{a.name}</div>
+                        </>
+                      ) : (
+                        a.name
+                      )}
+                    </td>
                     <td className="num font-mono text-xs text-[#A1A1AA]">{a.debug_port}</td>
                     <td className="font-mono text-xs text-[#A1A1AA] truncate max-w-[280px]" title={a.profile_dir}>
                       {a.profile_dir}
