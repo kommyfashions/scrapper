@@ -23,6 +23,7 @@ import PLSKUCosts from "@/pages/pl/PLSKUCosts";
 import PLExchangeAnalysis from "@/pages/pl/PLExchangeAnalysis";
 import PLAdOrdersAnalysis from "@/pages/pl/PLAdOrdersAnalysis";
 import PLUploads from "@/pages/pl/PLUploads";
+import PLTaxDocs from "@/pages/pl/PLTaxDocs";
 
 function App() {
   return (
@@ -56,6 +57,7 @@ function App() {
                 <Route path="exchange" element={<PLExchangeAnalysis />} />
                 <Route path="ad-orders" element={<PLAdOrdersAnalysis />} />
                 <Route path="uploads" element={<PLUploads />} />
+                <Route path="tax-docs" element={<PLTaxDocs />} />
               </Route>
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

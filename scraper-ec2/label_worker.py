@@ -33,7 +33,9 @@ from pymongo import MongoClient
 from bson import ObjectId
 
 import labels  # the user's labels.py — we override its globals per-job
-import payments_fetcher  # new: handles type=payments_fetch jobs
+import payments_fetcher  # type=payments_fetch (Excel payments file)
+import gst_report_fetcher  # type=gst_report_fetch
+import tax_invoice_fetcher  # type=tax_invoice_fetch
 
 MONGO_URI = os.environ.get("MESHO_MONGO_URI", "mongodb://43.205.229.129:27017/")
 DB_NAME = os.environ.get("MESHO_DB_NAME", "meesho")
@@ -44,7 +46,7 @@ db = client[DB_NAME]
 jobs_col = db["jobs"]
 accounts_col = db["accounts"]
 
-JOB_TYPES = ["label_download", "payments_fetch"]
+JOB_TYPES = ["label_download", "payments_fetch", "gst_report_fetch", "tax_invoice_fetch"]
 
 
 def chrome_alive(port: int) -> bool:
@@ -141,6 +143,20 @@ def loop():
                 # endpoint couldn't (e.g. dashboard reachable but failed).
                 result_doc = payments_fetcher.run_payments_fetch_for_account(
                     acc, period, str(job["_id"])
+                )
+            elif jtype == "gst_report_fetch":
+                payload = job.get("payload") or {}
+                year = int(payload.get("year"))
+                month = int(payload.get("month"))
+                result_doc = gst_report_fetcher.run_gst_report_fetch_for_account(
+                    acc, year, month, str(job["_id"])
+                )
+            elif jtype == "tax_invoice_fetch":
+                payload = job.get("payload") or {}
+                year = int(payload.get("year"))
+                month = int(payload.get("month"))
+                result_doc = tax_invoice_fetcher.run_tax_invoice_fetch_for_account(
+                    acc, year, month, str(job["_id"])
                 )
             else:
                 raise RuntimeError(f"unknown job type: {jtype}")

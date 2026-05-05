@@ -23,6 +23,26 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 7 (2026-05-05) — GST Report + Tax Invoice scrapers
+**Workers (`scraper-ec2/`)**
+- New `_meesho_ui.py` shared helpers (CDP attach, click-first-visible, watch-for-download-or-text race).
+- New `gst_report_fetcher.py`: navigates Download → GST Report → year + month, races download vs "No GST report" toast. 3× retry, per-account folder, saves zip renamed `<acct>_<YYYY-MM>_GST_REPORT.zip`.
+- New `tax_invoice_fetcher.py`: navigates Download → Tax Invoice, walks calendar back to target month using ← arrow, picks day-1 + last-day, captures download. Extracts only `Tax_invoice_details.xlsx` (PDFs discarded), saves as `<acct>_<YYYY-MM>_TAX_INVOICE.xlsx`.
+- `label_worker.py` dispatches both new job types alongside `label_download` + `payments_fetch`.
+
+**Backend (`server.py`)**
+- New collections: `pl_gst_reports`, `pl_tax_invoices` with indexes.
+- File storage on dashboard at `/app/backend/uploads/{gst_reports,tax_invoices}/<acct>/<YYYY-MM>/…`.
+- Endpoints (per kind): `POST .../fetch-now`, `POST .../upload` (worker, multipart), `GET .../`, `GET .../{id}/download` (auth), `POST .../{id}/share` → 7-day signed URL, `GET .../{id}/public/{token}` (no auth, for CA), `DELETE .../{id}`.
+- Worker reports `available=false` cleanly when Meesho says "no orders" — job is `done`, cron retries next day.
+- Daily cron `daily_gst_tax_fetch` 02:00 IST; self-gates to days 7–15 and only enqueues for accounts/months without an `available=true` record yet.
+- "Already fetched" guard — `409` on `fetch-now` if a successful record exists.
+
+**Frontend**
+- New page `/pl/tax-docs` (`PLTaxDocs.js`) with two panels (GST Report, Tax Invoice). Account/year/month picker (no defaults), per-row Download + Share-link (7-day) + Delete actions, NO DATA badge for `available=false` rows.
+- Sidebar: new "GST & Tax Docs" item under P&L.
+- JobsPage: added `GST` (cyan) + `TAX` (violet) badges and rich row content (period, account, file/no-data reason).
+
 ## Implemented — Iteration 6 (2026-05-05) — Robust payments-fetcher + Jobs UI
 **Worker (`scraper-ec2/payments_fetcher.py`) hardened**
 - Switched from folder-polling to Playwright `page.expect_download()`. We now capture the *exact* `suggested_filename` Meesho proposes, eliminating cross-account file mix-ups when multiple jobs run close together.

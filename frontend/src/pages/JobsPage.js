@@ -15,6 +15,8 @@ const TYPES = [
   { k: "product_scrape", label: "SCRAPE" },
   { k: "label_download", label: "LABEL" },
   { k: "payments_fetch", label: "PAYMENT" },
+  { k: "gst_report_fetch", label: "GST" },
+  { k: "tax_invoice_fetch", label: "TAX" },
 ];
 
 export default function JobsPage() {
@@ -230,6 +232,12 @@ export default function JobsPage() {
                       {j.type === "payments_fetch" && (
                         <span className="ml-2 code-tag text-[#00E676] border-[#00E676]/40">PAYMENT</span>
                       )}
+                      {j.type === "gst_report_fetch" && (
+                        <span className="ml-2 code-tag text-[#22D3EE] border-[#22D3EE]/40">GST</span>
+                      )}
+                      {j.type === "tax_invoice_fetch" && (
+                        <span className="ml-2 code-tag text-[#A78BFA] border-[#A78BFA]/40">TAX</span>
+                      )}
                       {j.error && (
                         <div
                           className="mt-1 max-w-[260px] truncate font-mono text-[10px] text-[#FF3B30]"
@@ -274,6 +282,30 @@ export default function JobsPage() {
                               <span className="mx-1">·</span>
                               <span className="text-[#F5A623]">ads {j.result.ads_rows ?? 0}</span>
                             </div>
+                          )}
+                        </div>
+                      ) : (j.type === "gst_report_fetch" || j.type === "tax_invoice_fetch") ? (
+                        <div>
+                          <div className={`font-mono text-xs ${j.type === "gst_report_fetch" ? "text-[#22D3EE]" : "text-[#A78BFA]"}`}>
+                            {j.type === "gst_report_fetch" ? "GST report fetch" : "Tax invoice fetch"}
+                            {j.payload?.period && (
+                              <span className="ml-2 text-[10px] text-[#A1A1AA]">· {j.payload.period}</span>
+                            )}
+                            {j.account_name && (
+                              <span className="ml-2 text-[10px] text-[#A1A1AA]">· acct {j.account_name}</span>
+                            )}
+                          </div>
+                          {j.result && (
+                            j.result.available === false ? (
+                              <div className="mt-1 font-mono text-[10px] text-[#F5A623]" title={j.result.reason}>
+                                NO DATA — {String(j.result.reason || "").slice(0, 120)}
+                              </div>
+                            ) : j.result.stored_filename ? (
+                              <div className="mt-1 truncate font-mono text-[10px] text-[#71717A]"
+                                   title={j.result.stored_filename}>
+                                {j.result.stored_filename}
+                              </div>
+                            ) : null
                           )}
                         </div>
                       ) : (

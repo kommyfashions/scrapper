@@ -439,6 +439,12 @@ async def reconfigure_scheduler():
         CronTrigger(minute="*/30", timezone=SCHED_TZ),
         id="alerts_check", replace_existing=True,
     )
+    # GST + Tax Invoice — daily 02:00 IST, function self-gates to days 7–15
+    scheduler.add_job(
+        enqueue_gst_and_tax_jobs,
+        CronTrigger(hour=2, minute=0, timezone=SCHED_TZ),
+        id="daily_gst_tax_fetch", replace_existing=True,
+    )
     logger.info(f"[scheduler] reconfigured: jobs={[j.id for j in scheduler.get_jobs()]}")
 
 # --------------------------------------------------------------------------------------
@@ -468,6 +474,17 @@ async def startup():
         await db.pl_ads_cost.create_index(
             [("account_id", 1), ("campaign_id", 1), ("deduction_date", 1)], unique=True
         )
+        # GST reports + Tax invoices
+        await db.pl_gst_reports.create_index(
+            [("account_id", 1), ("year", 1), ("month", 1)]
+        )
+        await db.pl_gst_reports.create_index([("fetched_at", -1)])
+        await db.pl_gst_reports.create_index("share_token", sparse=True)
+        await db.pl_tax_invoices.create_index(
+            [("account_id", 1), ("year", 1), ("month", 1)]
+        )
+        await db.pl_tax_invoices.create_index([("fetched_at", -1)])
+        await db.pl_tax_invoices.create_index("share_token", sparse=True)
     except Exception as e:
         logger.warning(f"Index creation issue: {e}")
 
@@ -1060,7 +1077,7 @@ async def alerts_check_now(user: dict = Depends(get_current_user)):
 import io
 import pandas as pd
 from fastapi import UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pymongo import UpdateOne
 
 PL_VALID_TRANSITIONS = {
@@ -1972,6 +1989,490 @@ async def pl_missing_sku_costs(account_id: Optional[str] = None, user: dict = De
     missing = sorted([s for s in order_skus if s and s not in cost_skus])
     return {"missing_skus": missing, "total_missing": len(missing),
             "total_order_skus": len(order_skus), "total_with_costs": len(cost_skus)}
+
+# --------------------------------------------------------------------------------------
+# GST Report + Tax Invoice — auto-fetch & file storage
+# --------------------------------------------------------------------------------------
+import secrets as _secrets
+import shutil as _shutil
+
+UPLOAD_BASE_DIR = Path(os.environ.get("PL_UPLOAD_DIR", str(ROOT_DIR / "uploads")))
+GST_DIR = UPLOAD_BASE_DIR / "gst_reports"
+TAX_DIR = UPLOAD_BASE_DIR / "tax_invoices"
+GST_DIR.mkdir(parents=True, exist_ok=True)
+TAX_DIR.mkdir(parents=True, exist_ok=True)
+
+MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
+               "July", "August", "September", "October", "November", "December"]
+
+
+def _safe_dir(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "unknown").strip()) or "unknown"
+
+
+def _mk_share_token() -> tuple[str, datetime]:
+    return _secrets.token_urlsafe(24), datetime.now(timezone.utc) + timedelta(days=7)
+
+
+def _public_share_url(req_base: str, kind: str, doc_id: str, token: str) -> str:
+    return f"{req_base.rstrip('/')}/api/pl/{kind}/{doc_id}/public/{token}"
+
+
+# ---------- helpers shared by GST + Tax endpoints ----------
+def _resolve_period_year_month(year: int, month: int) -> tuple[int, int, str]:
+    if not (1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="month must be 1..12")
+    if year < 2020 or year > 2099:
+        raise HTTPException(status_code=400, detail="year out of range")
+    return year, month, f"{year:04d}-{month:02d}"
+
+
+def _previous_month(now_utc: datetime) -> tuple[int, int]:
+    ist_now = now_utc.astimezone(SCHED_TZ)
+    if ist_now.month == 1:
+        return ist_now.year - 1, 12
+    return ist_now.year, ist_now.month - 1
+
+
+# =============== GST REPORT ===============
+class PLGstFetchIn(BaseModel):
+    account_id: str
+    year: int
+    month: int  # 1..12
+
+
+@api.post("/pl/gst-report/fetch-now")
+async def pl_gst_fetch_now(body: PLGstFetchIn, user: dict = Depends(get_current_user)):
+    year, month, period = _resolve_period_year_month(body.year, body.month)
+    oid = pl_oid_or_400(body.account_id)
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    # block if already fetched and available=true
+    existing = await db.pl_gst_reports.find_one({
+        "account_id": body.account_id, "year": year, "month": month,
+        "available": True,
+    })
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"GST report already fetched for {acc.get('name')} {period}. "
+                   f"Download the existing file or delete it first.",
+        )
+    dup = await db.jobs.find_one({
+        "type": "gst_report_fetch",
+        "account_id": body.account_id,
+        "payload.year": year, "payload.month": month,
+        "status": {"$in": ["pending", "processing"]},
+    })
+    if dup:
+        return {"ok": True, "job_id": str(dup["_id"]), "status": dup["status"], "duplicate": True}
+    res = await db.jobs.insert_one({
+        "type": "gst_report_fetch", "status": "pending",
+        "account_id": body.account_id, "account_name": acc.get("name"),
+        "payload": {"year": year, "month": month, "period": period},
+        "created_at": datetime.now(timezone.utc),
+        "submitted_by": user.get("email", "user"),
+    })
+    return {"ok": True, "job_id": str(res.inserted_id), "status": "pending"}
+
+
+@api.post("/pl/gst-report/upload")
+async def pl_gst_upload(
+    account_id: str = Query(...),
+    job_id: str = Query(...),
+    year: int = Query(...),
+    month: int = Query(...),
+    original_filename: str = Query(""),
+    available: str = Query("true"),
+    reason: str = Query(""),
+    file: Optional[UploadFile] = File(None),
+    user: dict = Depends(get_user_or_worker),
+):
+    """Worker pushes the downloaded GST zip here. If available=false the
+    worker only sends the no-data marker."""
+    is_available = available.lower() in ("1", "true", "yes")
+    oid = pl_oid_or_400(account_id)
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    doc = {
+        "account_id": account_id,
+        "account_name": acc.get("name"),
+        "year": year, "month": month,
+        "period": f"{year:04d}-{month:02d}",
+        "original_filename": original_filename,
+        "available": is_available,
+        "reason": reason,
+        "fetched_at": datetime.now(timezone.utc),
+        "fetched_by": user.get("email", "worker"),
+        "job_id": job_id,
+    }
+
+    if is_available:
+        if not file:
+            raise HTTPException(status_code=400, detail="file missing for available=true")
+        target_dir = GST_DIR / _safe_dir(acc.get("name") or "unknown") / f"{year:04d}-{month:02d}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored_name = f"{_safe_dir(acc.get('name') or 'acct')}_{year:04d}-{month:02d}_GST_REPORT.zip"
+        target_path = target_dir / stored_name
+        with open(target_path, "wb") as out:
+            _shutil.copyfileobj(file.file, out)
+        doc.update({
+            "stored_filename": stored_name,
+            "file_path": str(target_path),
+            "size_bytes": target_path.stat().st_size,
+        })
+
+    res = await db.pl_gst_reports.insert_one(doc)
+    rec_id = str(res.inserted_id)
+
+    # mark the job
+    try:
+        await db.jobs.update_one(
+            {"_id": pl_oid_or_400(job_id)},
+            {"$set": {
+                "status": "done",
+                "finished_at": datetime.now(timezone.utc),
+                "result": {
+                    "gst_id": rec_id,
+                    "available": is_available,
+                    "reason": reason,
+                    "stored_filename": doc.get("stored_filename"),
+                    "source_filename": original_filename,
+                },
+            }},
+        )
+    except Exception as e:
+        logger.warning(f"[gst-report/upload] job update failed: {e}")
+
+    return {"ok": True, "id": rec_id, "available": is_available,
+            "stored_filename": doc.get("stored_filename")}
+
+
+@api.get("/pl/gst-report")
+async def pl_gst_list(
+    account_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    q = await pl_resolve_account_filter(account_id)
+    cursor = db.pl_gst_reports.find(q).sort("fetched_at", -1).limit(200)
+    items = []
+    async for d in cursor:
+        items.append(serialize_doc(d))
+    return {"items": items}
+
+
+@api.delete("/pl/gst-report/{rec_id}")
+async def pl_gst_delete(rec_id: str, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_gst_reports.find_one({"_id": oid})
+    if not rec:
+        raise HTTPException(status_code=404, detail="Not found")
+    fp = rec.get("file_path")
+    if fp:
+        try:
+            Path(fp).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"[gst-report/delete] file unlink failed: {e}")
+    await db.pl_gst_reports.delete_one({"_id": oid})
+    return {"ok": True}
+
+
+@api.get("/pl/gst-report/{rec_id}/download")
+async def pl_gst_download(rec_id: str, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_gst_reports.find_one({"_id": oid})
+    if not rec or not rec.get("available"):
+        raise HTTPException(status_code=404, detail="No file for this record")
+    fp = rec.get("file_path")
+    if not fp or not Path(fp).exists():
+        raise HTTPException(status_code=410, detail="File no longer on disk")
+    return FileResponse(fp, filename=rec.get("stored_filename") or Path(fp).name,
+                        media_type="application/zip")
+
+
+@api.post("/pl/gst-report/{rec_id}/share")
+async def pl_gst_share(rec_id: str, request: Request, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_gst_reports.find_one({"_id": oid})
+    if not rec or not rec.get("available"):
+        raise HTTPException(status_code=404, detail="No file for this record")
+    token, expires = _mk_share_token()
+    await db.pl_gst_reports.update_one(
+        {"_id": oid},
+        {"$set": {"share_token": token, "share_token_expires_at": expires}},
+    )
+    base = str(request.base_url).rstrip("/")
+    return {"ok": True, "url": _public_share_url(base, "gst-report", rec_id, token),
+            "expires_at": expires.isoformat().replace("+00:00", "Z")}
+
+
+@api.get("/pl/gst-report/{rec_id}/public/{token}")
+async def pl_gst_public(rec_id: str, token: str):
+    """Public download — used by 3rd parties (CA etc) without auth."""
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_gst_reports.find_one({"_id": oid})
+    if (not rec or rec.get("share_token") != token
+            or not rec.get("available")):
+        raise HTTPException(status_code=404, detail="invalid or expired link")
+    exp = rec.get("share_token_expires_at")
+    if exp and exp < datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="link expired")
+    fp = rec.get("file_path")
+    if not fp or not Path(fp).exists():
+        raise HTTPException(status_code=410, detail="file missing")
+    return FileResponse(fp, filename=rec.get("stored_filename") or Path(fp).name,
+                        media_type="application/zip")
+
+
+# =============== TAX INVOICE ===============
+class PLTaxInvoiceFetchIn(BaseModel):
+    account_id: str
+    year: int
+    month: int  # 1..12
+
+
+@api.post("/pl/tax-invoice/fetch-now")
+async def pl_tax_fetch_now(body: PLTaxInvoiceFetchIn, user: dict = Depends(get_current_user)):
+    year, month, period = _resolve_period_year_month(body.year, body.month)
+    oid = pl_oid_or_400(body.account_id)
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+    existing = await db.pl_tax_invoices.find_one({
+        "account_id": body.account_id, "year": year, "month": month,
+        "available": True,
+    })
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tax invoice already fetched for {acc.get('name')} {period}. "
+                   f"Download the existing file or delete it first.",
+        )
+    dup = await db.jobs.find_one({
+        "type": "tax_invoice_fetch",
+        "account_id": body.account_id,
+        "payload.year": year, "payload.month": month,
+        "status": {"$in": ["pending", "processing"]},
+    })
+    if dup:
+        return {"ok": True, "job_id": str(dup["_id"]), "status": dup["status"], "duplicate": True}
+    res = await db.jobs.insert_one({
+        "type": "tax_invoice_fetch", "status": "pending",
+        "account_id": body.account_id, "account_name": acc.get("name"),
+        "payload": {"year": year, "month": month, "period": period},
+        "created_at": datetime.now(timezone.utc),
+        "submitted_by": user.get("email", "user"),
+    })
+    return {"ok": True, "job_id": str(res.inserted_id), "status": "pending"}
+
+
+@api.post("/pl/tax-invoice/upload")
+async def pl_tax_upload(
+    account_id: str = Query(...),
+    job_id: str = Query(...),
+    year: int = Query(...),
+    month: int = Query(...),
+    from_date: str = Query(""),
+    to_date: str = Query(""),
+    original_filename: str = Query(""),
+    available: str = Query("true"),
+    reason: str = Query(""),
+    file: Optional[UploadFile] = File(None),
+    user: dict = Depends(get_user_or_worker),
+):
+    is_available = available.lower() in ("1", "true", "yes")
+    oid = pl_oid_or_400(account_id)
+    acc = await db.accounts.find_one({"_id": oid})
+    if not acc:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    doc = {
+        "account_id": account_id,
+        "account_name": acc.get("name"),
+        "year": year, "month": month,
+        "period": f"{year:04d}-{month:02d}",
+        "from_date": from_date, "to_date": to_date,
+        "original_filename": original_filename,
+        "available": is_available,
+        "reason": reason,
+        "fetched_at": datetime.now(timezone.utc),
+        "fetched_by": user.get("email", "worker"),
+        "job_id": job_id,
+    }
+
+    if is_available:
+        if not file:
+            raise HTTPException(status_code=400, detail="file missing for available=true")
+        target_dir = TAX_DIR / _safe_dir(acc.get("name") or "unknown") / f"{year:04d}-{month:02d}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stored_name = f"{_safe_dir(acc.get('name') or 'acct')}_{year:04d}-{month:02d}_TAX_INVOICE.xlsx"
+        target_path = target_dir / stored_name
+        with open(target_path, "wb") as out:
+            _shutil.copyfileobj(file.file, out)
+        doc.update({
+            "stored_filename": stored_name,
+            "file_path": str(target_path),
+            "size_bytes": target_path.stat().st_size,
+        })
+
+    res = await db.pl_tax_invoices.insert_one(doc)
+    rec_id = str(res.inserted_id)
+
+    try:
+        await db.jobs.update_one(
+            {"_id": pl_oid_or_400(job_id)},
+            {"$set": {
+                "status": "done",
+                "finished_at": datetime.now(timezone.utc),
+                "result": {
+                    "tax_id": rec_id,
+                    "available": is_available,
+                    "reason": reason,
+                    "stored_filename": doc.get("stored_filename"),
+                    "source_filename": original_filename,
+                },
+            }},
+        )
+    except Exception as e:
+        logger.warning(f"[tax-invoice/upload] job update failed: {e}")
+
+    return {"ok": True, "id": rec_id, "available": is_available,
+            "stored_filename": doc.get("stored_filename")}
+
+
+@api.get("/pl/tax-invoice")
+async def pl_tax_list(
+    account_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    q = await pl_resolve_account_filter(account_id)
+    cursor = db.pl_tax_invoices.find(q).sort("fetched_at", -1).limit(200)
+    items = []
+    async for d in cursor:
+        items.append(serialize_doc(d))
+    return {"items": items}
+
+
+@api.delete("/pl/tax-invoice/{rec_id}")
+async def pl_tax_delete(rec_id: str, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_tax_invoices.find_one({"_id": oid})
+    if not rec:
+        raise HTTPException(status_code=404, detail="Not found")
+    fp = rec.get("file_path")
+    if fp:
+        try:
+            Path(fp).unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"[tax-invoice/delete] file unlink failed: {e}")
+    await db.pl_tax_invoices.delete_one({"_id": oid})
+    return {"ok": True}
+
+
+@api.get("/pl/tax-invoice/{rec_id}/download")
+async def pl_tax_download(rec_id: str, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_tax_invoices.find_one({"_id": oid})
+    if not rec or not rec.get("available"):
+        raise HTTPException(status_code=404, detail="No file for this record")
+    fp = rec.get("file_path")
+    if not fp or not Path(fp).exists():
+        raise HTTPException(status_code=410, detail="File no longer on disk")
+    return FileResponse(
+        fp, filename=rec.get("stored_filename") or Path(fp).name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@api.post("/pl/tax-invoice/{rec_id}/share")
+async def pl_tax_share(rec_id: str, request: Request, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_tax_invoices.find_one({"_id": oid})
+    if not rec or not rec.get("available"):
+        raise HTTPException(status_code=404, detail="No file for this record")
+    token, expires = _mk_share_token()
+    await db.pl_tax_invoices.update_one(
+        {"_id": oid},
+        {"$set": {"share_token": token, "share_token_expires_at": expires}},
+    )
+    base = str(request.base_url).rstrip("/")
+    return {"ok": True, "url": _public_share_url(base, "tax-invoice", rec_id, token),
+            "expires_at": expires.isoformat().replace("+00:00", "Z")}
+
+
+@api.get("/pl/tax-invoice/{rec_id}/public/{token}")
+async def pl_tax_public(rec_id: str, token: str):
+    oid = pl_oid_or_400(rec_id)
+    rec = await db.pl_tax_invoices.find_one({"_id": oid})
+    if (not rec or rec.get("share_token") != token
+            or not rec.get("available")):
+        raise HTTPException(status_code=404, detail="invalid or expired link")
+    exp = rec.get("share_token_expires_at")
+    if exp and exp < datetime.now(timezone.utc):
+        raise HTTPException(status_code=410, detail="link expired")
+    fp = rec.get("file_path")
+    if not fp or not Path(fp).exists():
+        raise HTTPException(status_code=410, detail="file missing")
+    return FileResponse(
+        fp, filename=rec.get("stored_filename") or Path(fp).name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# ---------- Cron: enqueue daily 7th–15th, fetches previous month ----------
+async def enqueue_gst_and_tax_jobs():
+    """Runs daily 02:00 IST. Days 7–15 of month: for every enabled account,
+    if no available=true record exists for the previous month, enqueue
+    one gst_report_fetch and one tax_invoice_fetch."""
+    now = datetime.now(timezone.utc)
+    ist_now = now.astimezone(SCHED_TZ)
+    if not (7 <= ist_now.day <= 15):
+        return
+    year, month = _previous_month(now)
+    period = f"{year:04d}-{month:02d}"
+    enq_gst = enq_tax = 0
+    try:
+        async for acc in db.accounts.find({"enabled": True}):
+            acc_id = str(acc["_id"])
+            # GST
+            done = await db.pl_gst_reports.find_one(
+                {"account_id": acc_id, "year": year, "month": month, "available": True})
+            active = await db.jobs.find_one({
+                "type": "gst_report_fetch", "account_id": acc_id,
+                "payload.year": year, "payload.month": month,
+                "status": {"$in": ["pending", "processing"]},
+            })
+            if not done and not active:
+                await db.jobs.insert_one({
+                    "type": "gst_report_fetch", "status": "pending",
+                    "account_id": acc_id, "account_name": acc.get("name"),
+                    "payload": {"year": year, "month": month, "period": period},
+                    "created_at": now, "submitted_by": "scheduler",
+                })
+                enq_gst += 1
+            # Tax Invoice
+            done = await db.pl_tax_invoices.find_one(
+                {"account_id": acc_id, "year": year, "month": month, "available": True})
+            active = await db.jobs.find_one({
+                "type": "tax_invoice_fetch", "account_id": acc_id,
+                "payload.year": year, "payload.month": month,
+                "status": {"$in": ["pending", "processing"]},
+            })
+            if not done and not active:
+                await db.jobs.insert_one({
+                    "type": "tax_invoice_fetch", "status": "pending",
+                    "account_id": acc_id, "account_name": acc.get("name"),
+                    "payload": {"year": year, "month": month, "period": period},
+                    "created_at": now, "submitted_by": "scheduler",
+                })
+                enq_tax += 1
+        logger.info(f"[scheduler] gst/tax enqueue period={period} gst={enq_gst} tax={enq_tax}")
+    except Exception as e:
+        logger.exception(f"[scheduler] gst/tax enqueue failed: {e}")
+
 
 # --------------------------------------------------------------------------------------
 # Health + Mount

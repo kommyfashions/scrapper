@@ -13,6 +13,7 @@ const SUB = [
   { to: "/pl/ad-orders", label: "Ad Orders", testid: "pl-nav-ad-orders" },
   { to: "/pl/sku-costs", label: "SKU Costs", testid: "pl-nav-sku-costs" },
   { to: "/pl/uploads", label: "Uploads", testid: "pl-nav-uploads" },
+  { to: "/pl/tax-docs", label: "GST & Tax Docs", testid: "pl-nav-tax-docs" },
 ];
 
 export default function PLLayout() {
