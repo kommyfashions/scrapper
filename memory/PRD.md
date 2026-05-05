@@ -23,6 +23,13 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 9 (2026-05-05) — Share URL fix + Tax depends on GST + alias rename
+**Fixes**
+- Share link 500 → root cause was `_as_aware_utc` was referenced but never committed to `server.py` (silent edit-loss). Helper now lives alongside `_mk_share_token` and both public endpoints use it. Verified: share POST 200, public GET returns proper 410 when file not on disk (vs previous 500).
+- Share URL now honors `PUBLIC_BASE_URL` env var so production EC2 links point at the externally-reachable hostname (not the internal ingress).
+- Cron: `tax_invoice_fetch` is now gated on a successful GST record existing for the same period. Tax is Meesho's downstream artifact — skipping saves a pointless browser run when GST isn't ready.
+- Stored filenames now use the account's **alias** when set (fallback to `name`): `KommyHrbib_2026-03_GST_REPORT.zip`, `KommyHrbib_2026-03_TAX_INVOICE.xlsx`.
+
 ## Implemented — Iteration 8 (2026-05-05) — Bug fixes + Account alias
 **Fixes**
 - GST fetcher: month-picker popover was blocking the modal Download button. Now after ticking the month, the worker clicks a neutral spot at the modal's top-left (via bounding-box mouse click) to collapse the popover, with `Escape` as fallback.

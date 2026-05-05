@@ -2016,8 +2016,19 @@ def _mk_share_token() -> tuple[str, datetime]:
     return _secrets.token_urlsafe(24), datetime.now(timezone.utc) + timedelta(days=7)
 
 
+def _as_aware_utc(dt):
+    """MongoDB returns naive datetimes by default. Normalize to UTC-aware
+    so comparisons with datetime.now(timezone.utc) don't raise TypeError."""
+    if dt and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _public_share_url(req_base: str, kind: str, doc_id: str, token: str) -> str:
-    return f"{req_base.rstrip('/')}/api/pl/{kind}/{doc_id}/public/{token}"
+    # Allow ops override (e.g. prod EC2 public URL) so share links point at
+    # the externally-reachable hostname, not the internal ingress one.
+    base = os.environ.get("PUBLIC_BASE_URL") or req_base
+    return f"{base.rstrip('/')}/api/pl/{kind}/{doc_id}/public/{token}"
 
 
 # ---------- helpers shared by GST + Tax endpoints ----------
@@ -2115,9 +2126,10 @@ async def pl_gst_upload(
     if is_available:
         if not file:
             raise HTTPException(status_code=400, detail="file missing for available=true")
+        acc_label = acc.get("alias") or acc.get("name") or "acct"
         target_dir = GST_DIR / _safe_dir(acc.get("name") or "unknown") / f"{year:04d}-{month:02d}"
         target_dir.mkdir(parents=True, exist_ok=True)
-        stored_name = f"{_safe_dir(acc.get('name') or 'acct')}_{year:04d}-{month:02d}_GST_REPORT.zip"
+        stored_name = f"{_safe_dir(acc_label)}_{year:04d}-{month:02d}_GST_REPORT.zip"
         target_path = target_dir / stored_name
         with open(target_path, "wb") as out:
             _shutil.copyfileobj(file.file, out)
@@ -2308,9 +2320,10 @@ async def pl_tax_upload(
     if is_available:
         if not file:
             raise HTTPException(status_code=400, detail="file missing for available=true")
+        acc_label = acc.get("alias") or acc.get("name") or "acct"
         target_dir = TAX_DIR / _safe_dir(acc.get("name") or "unknown") / f"{year:04d}-{month:02d}"
         target_dir.mkdir(parents=True, exist_ok=True)
-        stored_name = f"{_safe_dir(acc.get('name') or 'acct')}_{year:04d}-{month:02d}_TAX_INVOICE.xlsx"
+        stored_name = f"{_safe_dir(acc_label)}_{year:04d}-{month:02d}_TAX_INVOICE.xlsx"
         target_path = target_dir / stored_name
         with open(target_path, "wb") as out:
             _shutil.copyfileobj(file.file, out)
@@ -2455,7 +2468,17 @@ async def enqueue_gst_and_tax_jobs():
                     "created_at": now, "submitted_by": "scheduler",
                 })
                 enq_gst += 1
-            # Tax Invoice
+            # Tax Invoice — only if GST for the same month was already
+            # fetched successfully (Meesho generates tax invoices only
+            # after the GST file is available for that month).
+            gst_done = await db.pl_gst_reports.find_one(
+                {"account_id": acc_id, "year": year, "month": month, "available": True})
+            if not gst_done:
+                logger.info(
+                    f"[scheduler] skip tax_invoice for acct={acc.get('name')} "
+                    f"{period}: GST not yet available"
+                )
+                continue
             done = await db.pl_tax_invoices.find_one(
                 {"account_id": acc_id, "year": year, "month": month, "available": True})
             active = await db.jobs.find_one({
