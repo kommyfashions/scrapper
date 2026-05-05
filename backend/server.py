@@ -476,6 +476,13 @@ async def startup():
         await db.pl_ads_cost.create_index(
             [("account_id", 1), ("campaign_id", 1), ("deduction_date", 1)], unique=True
         )
+        # Article master (one canonical product across accounts)
+        await db.articles.create_index("name", unique=True)
+        await db.articles.create_index([("name", 1)])
+        await db.article_sku_map.create_index(
+            [("account_id", 1), ("sku", 1)], unique=True
+        )
+        await db.article_sku_map.create_index("article_id")
         # GST reports + Tax invoices
         await db.pl_gst_reports.create_index(
             [("account_id", 1), ("year", 1), ("month", 1)]
@@ -1148,18 +1155,36 @@ def _pl_norm_acc(v) -> Optional[str]:
         return None
     return s
 
+
+# ---- Article-master cost lookup ------------------------------------------------
+# Cost resolution is article-driven (one default cost per article).
+# article_sku_map maps (account_id, sku) -> article_id. Orders resolve to
+# articles via that map; the article's default_cost_price is the cost.
+# Orders whose (account_id, sku) is not mapped use UNKNOWN (0) and surface
+# on the "Missing Articles" page.
+
 def _pl_lookup_cost(costs: dict, account_id, sku) -> float:
-    """Account-specific cost takes priority over global (None) fallback."""
+    """`costs` here is (account_id, sku) -> default_cost_price resolved
+    via the article map. 0 if the SKU isn't mapped."""
     if (account_id, sku) in costs:
         return costs[(account_id, sku)] or 0
-    return costs.get((None, sku), 0) or 0
+    return 0
 
-async def _pl_load_costs(sku_costs_q: dict) -> dict:
-    """Load costs sorted by updated_at ASC so the most recent write wins
-    (handles the rare residual duplicate after migration)."""
-    costs = {}
-    async for c in db.pl_sku_costs.find(sku_costs_q, {"_id": 0}).sort("updated_at", 1):
-        costs[(c.get("account_id"), c["sku"])] = c.get("cost_price") or 0
+
+async def _pl_load_costs(_unused_q: dict = None) -> dict:
+    """Build a (account_id, sku) -> default_cost_price dict by joining
+    article_sku_map with articles. `_unused_q` accepted for call-site
+    compatibility with the legacy sku-costs filter."""
+    # Pre-fetch all articles once (expect O(100s), fits in memory).
+    articles = {}
+    async for a in db.articles.find({}, {"_id": 1, "default_cost_price": 1}):
+        articles[a["_id"]] = float(a.get("default_cost_price") or 0)
+    costs: Dict[tuple, float] = {}
+    async for m in db.article_sku_map.find({}, {"_id": 0}):
+        price = articles.get(m.get("article_id"))
+        if price is None:
+            continue
+        costs[(_pl_norm_acc(m.get("account_id")), m.get("sku"))] = price
     return costs
 
 async def _pl_dedupe_sku_costs():
@@ -1645,6 +1670,20 @@ async def pl_dashboard(
     }
 
 # ---------- Orders ----------
+async def _pl_load_sku_article_labels() -> dict:
+    """Build (account_id, sku) -> article_name for display enrichment.
+    Call once per request, apply to many rows."""
+    names = {}
+    async for a in db.articles.find({}, {"_id": 1, "name": 1}):
+        names[a["_id"]] = a.get("name")
+    out: Dict[tuple, str] = {}
+    async for m in db.article_sku_map.find({}, {"_id": 0}):
+        nm = names.get(m.get("article_id"))
+        if nm:
+            out[(_pl_norm_acc(m.get("account_id")), m.get("sku"))] = nm
+    return out
+
+
 @api.get("/pl/orders")
 async def pl_orders(
     account_id: Optional[str] = None,
@@ -1668,10 +1707,12 @@ async def pl_orders(
         regex = {"$regex": re.escape(q), "$options": "i"}
         query["$or"] = [{"sub_order_no": regex}, {"sku": regex}, {"product_name": regex}]
     cursor = db.pl_orders.find(query, {"_id": 0}).sort("last_updated", -1).skip(skip).limit(limit)
+    labels = await _pl_load_sku_article_labels()
     items = []
     async for d in cursor:
         if isinstance(d.get("last_updated"), datetime):
             d["last_updated"] = d["last_updated"].isoformat()
+        d["article_name"] = labels.get((_pl_norm_acc(d.get("account_id")), d.get("sku")))
         items.append(d)
     total = await db.pl_orders.count_documents(query)
     return {"items": items, "total": total}
@@ -1980,17 +2021,206 @@ async def pl_sku_costs_upload(
 
 @api.get("/pl/missing-sku-costs")
 async def pl_missing_sku_costs(account_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Now delegates to /pl/articles/missing-skus for consistency — every SKU
+    seen in orders that doesn't yet have an article mapping is 'missing'."""
     if account_id and account_id != "all":
         await pl_resolve_account_filter(account_id)
     order_q = {} if not account_id or account_id == "all" else {"account_id": account_id}
     order_skus = await db.pl_orders.distinct("sku", order_q)
-    cost_q = {} if not account_id or account_id == "all" else {"$or": [{"account_id": account_id}, {"account_id": None}]}
-    cost_skus = set()
-    async for c in db.pl_sku_costs.find(cost_q, {"_id": 0, "sku": 1}):
-        cost_skus.add(c["sku"])
-    missing = sorted([s for s in order_skus if s and s not in cost_skus])
+    # build mapped set from article_sku_map
+    map_q = {} if not account_id or account_id == "all" else {"account_id": account_id}
+    mapped = set()
+    async for m in db.article_sku_map.find(map_q, {"_id": 0, "sku": 1}):
+        mapped.add(m.get("sku"))
+    missing = sorted([s for s in order_skus if s and s not in mapped])
     return {"missing_skus": missing, "total_missing": len(missing),
-            "total_order_skus": len(order_skus), "total_with_costs": len(cost_skus)}
+            "total_order_skus": len(order_skus), "total_with_costs": len(mapped)}
+
+
+# --------------------------------------------------------------------------------------
+# Article Master (canonical product → per-account SKU → single default cost)
+# --------------------------------------------------------------------------------------
+class ArticleSkuMapIn(BaseModel):
+    account_id: str
+    sku: str
+
+
+class ArticleIn(BaseModel):
+    name: str
+    default_cost_price: float
+    sku_map: List[ArticleSkuMapIn] = []
+
+
+class ArticleUpdate(BaseModel):
+    name: Optional[str] = None
+    default_cost_price: Optional[float] = None
+    sku_map: Optional[List[ArticleSkuMapIn]] = None
+
+
+async def _article_to_dict(art: dict) -> dict:
+    """Serialize an article with its SKU map attached."""
+    out = serialize_doc(art)
+    maps = []
+    async for m in db.article_sku_map.find({"article_id": art["_id"]}):
+        maps.append({
+            "account_id": m.get("account_id"),
+            "sku": m.get("sku"),
+        })
+    out["sku_map"] = maps
+    return out
+
+
+@api.get("/pl/articles")
+async def pl_articles_list(user: dict = Depends(get_current_user)):
+    items = []
+    async for a in db.articles.find({}).sort("name", 1):
+        items.append(await _article_to_dict(a))
+    return {"items": items}
+
+
+async def _apply_sku_map(article_id, sku_map: List[ArticleSkuMapIn]):
+    """Replace all SKU mappings for an article. Each entry's (account_id, sku)
+    is globally unique across all articles — clashes return 409.
+    Blank SKUs are ignored (allows leaving the slot empty for an account)."""
+    # Clean + dedupe incoming mappings
+    cleaned = []
+    seen = set()
+    for m in sku_map:
+        acc = _pl_norm_acc(m.account_id) or m.account_id  # we want a concrete account id, not None
+        sku = (m.sku or "").strip()
+        if not acc or not sku:
+            continue
+        if (acc, sku) in seen:
+            continue
+        seen.add((acc, sku))
+        cleaned.append({"article_id": article_id, "account_id": acc, "sku": sku})
+
+    # Validate no other article claims these (account_id, sku) keys
+    if cleaned:
+        taken = db.article_sku_map.find(
+            {"$or": [{"account_id": c["account_id"], "sku": c["sku"]} for c in cleaned],
+             "article_id": {"$ne": article_id}},
+        )
+        async for t in taken:
+            raise HTTPException(
+                status_code=409,
+                detail=f"SKU '{t['sku']}' on account {t['account_id']} "
+                       f"is already mapped to another article.",
+            )
+
+    # Wipe old mapping, write fresh
+    await db.article_sku_map.delete_many({"article_id": article_id})
+    if cleaned:
+        await db.article_sku_map.insert_many(cleaned)
+
+
+@api.post("/pl/articles")
+async def pl_articles_create(body: ArticleIn, user: dict = Depends(get_current_user)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    if body.default_cost_price < 0:
+        raise HTTPException(status_code=400, detail="default_cost_price must be >= 0")
+    if await db.articles.find_one({"name": name}):
+        raise HTTPException(status_code=409, detail=f"Article '{name}' already exists")
+    now = datetime.now(timezone.utc)
+    doc = {
+        "name": name,
+        "default_cost_price": float(body.default_cost_price),
+        "created_at": now,
+        "updated_at": now,
+        "created_by": user.get("email"),
+    }
+    res = await db.articles.insert_one(doc)
+    await _apply_sku_map(res.inserted_id, body.sku_map)
+    art = await db.articles.find_one({"_id": res.inserted_id})
+    return {"ok": True, "article": await _article_to_dict(art)}
+
+
+@api.put("/pl/articles/{article_id}")
+async def pl_articles_update(article_id: str, body: ArticleUpdate,
+                             user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(article_id)
+    art = await db.articles.find_one({"_id": oid})
+    if not art:
+        raise HTTPException(status_code=404, detail="Article not found")
+    upd = {"updated_at": datetime.now(timezone.utc)}
+    if body.name is not None:
+        nm = body.name.strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="name cannot be blank")
+        dup = await db.articles.find_one({"name": nm, "_id": {"$ne": oid}})
+        if dup:
+            raise HTTPException(status_code=409, detail=f"Article '{nm}' already exists")
+        upd["name"] = nm
+    if body.default_cost_price is not None:
+        if body.default_cost_price < 0:
+            raise HTTPException(status_code=400, detail="default_cost_price must be >= 0")
+        upd["default_cost_price"] = float(body.default_cost_price)
+    await db.articles.update_one({"_id": oid}, {"$set": upd})
+    if body.sku_map is not None:
+        await _apply_sku_map(oid, body.sku_map)
+    art = await db.articles.find_one({"_id": oid})
+    return {"ok": True, "article": await _article_to_dict(art)}
+
+
+@api.delete("/pl/articles/{article_id}")
+async def pl_articles_delete(article_id: str, user: dict = Depends(get_current_user)):
+    oid = pl_oid_or_400(article_id)
+    art = await db.articles.find_one({"_id": oid})
+    if not art:
+        raise HTTPException(status_code=404, detail="Article not found")
+    await db.article_sku_map.delete_many({"article_id": oid})
+    await db.articles.delete_one({"_id": oid})
+    return {"ok": True}
+
+
+@api.get("/pl/articles/missing-skus")
+async def pl_articles_missing_skus(account_id: Optional[str] = None,
+                                   user: dict = Depends(get_current_user)):
+    """Every SKU seen in orders that doesn't yet have any article mapping,
+    grouped by account for one-click mapping."""
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    match = {"sku": {"$nin": [None, ""]}}
+    if account_id and account_id != "all":
+        match["account_id"] = account_id
+    pipeline = [
+        {"$match": match},
+        {"$group": {"_id": {"account_id": "$account_id", "sku": "$sku"},
+                    "orders": {"$sum": 1},
+                    "last_seen": {"$max": "$order_date"}}},
+        {"$sort": {"orders": -1}},
+    ]
+    seen = []
+    async for row in db.pl_orders.aggregate(pipeline):
+        seen.append({
+            "account_id": row["_id"]["account_id"],
+            "sku": row["_id"]["sku"],
+            "orders": row["orders"],
+            "last_seen": row.get("last_seen"),
+        })
+    # filter out already-mapped
+    mapped_pairs = set()
+    async for m in db.article_sku_map.find({}, {"_id": 0, "account_id": 1, "sku": 1}):
+        mapped_pairs.add((m.get("account_id"), m.get("sku")))
+    missing = [s for s in seen if (s["account_id"], s["sku"]) not in mapped_pairs]
+    # enrich with account_name / alias
+    acc_ids = {s["account_id"] for s in missing if s["account_id"]}
+    acc_lookup = {}
+    if acc_ids:
+        oids = [pl_oid_or_400(x) for x in acc_ids]
+        async for a in db.accounts.find({"_id": {"$in": oids}}):
+            acc_lookup[str(a["_id"])] = {"name": a.get("name"), "alias": a.get("alias")}
+    for s in missing:
+        info = acc_lookup.get(s["account_id"], {})
+        s["account_name"] = info.get("name")
+        s["account_alias"] = info.get("alias")
+        if s.get("last_seen"):
+            s["last_seen"] = s["last_seen"].isoformat().replace("+00:00", "Z") \
+                if hasattr(s["last_seen"], "isoformat") else s["last_seen"]
+    return {"items": missing, "total": len(missing)}
+
 
 # --------------------------------------------------------------------------------------
 # GST Report + Tax Invoice — auto-fetch & file storage

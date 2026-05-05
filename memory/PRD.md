@@ -23,6 +23,32 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 10 (2026-05-05) — Article Master (canonical product)
+**Schema (new collections)**
+- `articles`: `{_id, name (unique), default_cost_price, created_at, updated_at, created_by}`
+- `article_sku_map`: `{_id, article_id, account_id, sku}` — unique on `(account_id, sku)` (one SKU per account can only map to one article).
+
+**Cost lookup migrated**
+- `_pl_load_costs` and `_pl_lookup_cost` now resolve cost via `article_sku_map → articles.default_cost_price`. Old `pl_sku_costs` records are no longer read for P&L (kept on disk for audit; user can clear later).
+- Unmapped (account, sku) pairs resolve to `0` and surface in Missing Articles.
+
+**Endpoints**
+- `GET /api/pl/articles` — list with embedded sku_map
+- `POST /api/pl/articles` — create (rejects duplicate name + clashing (account, sku))
+- `PUT /api/pl/articles/{id}` — update name/cost/sku_map (replaces map atomically; same clash protection)
+- `DELETE /api/pl/articles/{id}` — drops article + all its mappings
+- `GET /api/pl/articles/missing-skus` — every (account, sku) pair seen in `pl_orders` that isn't yet mapped, with order count, last_seen, account name + alias.
+- `/api/pl/orders` enriched with `article_name` per row (resolved via `_pl_load_sku_article_labels`).
+
+**Frontend**
+- `PLSKUCosts.js` rewritten as a 2-tab page:
+  - **Articles** (default): table with column-per-account (label = `alias (name)`), inline edit form auto-renders an SKU input per enabled account (new accounts show empty slots automatically). Global Cost field stores the canonical cost.
+  - **Missing Articles**: list of unmapped (account, sku) pairs with order counts, search filter, and a `Map` button that jumps to the Articles tab to create/attach.
+- `PLOrders.js`: SKU column now shows `Article Name` as primary (white) with the SKU as sub-text (grey). Falls back to the SKU alone if no article mapping exists.
+
+**Verified end-to-end via curl**
+- Create / dup-name 409 / cross-article SKU clash 409 / orders enrichment / missing-skus filter / delete.
+
 ## Implemented — Iteration 9 (2026-05-05) — Share URL fix + Tax depends on GST + alias rename
 **Fixes**
 - Share link 500 → root cause was `_as_aware_utc` was referenced but never committed to `server.py` (silent edit-loss). Helper now lives alongside `_mk_share_token` and both public endpoints use it. Verified: share POST 200, public GET returns proper 410 when file not on disk (vs previous 500).

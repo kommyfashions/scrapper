@@ -112,7 +112,16 @@ export default function PLOrders() {
               {items.map((o) => (
                 <tr key={o.account_id + o.sub_order_no} data-testid={`pl-order-${o.sub_order_no}`}>
                   <td className="font-mono text-[10px]">{o.sub_order_no}</td>
-                  <td className="font-mono text-[11px]">{o.sku}</td>
+                  <td className="font-mono text-[11px]">
+                    {o.article_name ? (
+                      <>
+                        <div className="text-white">{o.article_name}</div>
+                        <div className="text-[10px] text-[#71717A]">{o.sku}</div>
+                      </>
+                    ) : (
+                      <span className="text-[#A1A1AA]">{o.sku}</span>
+                    )}
+                  </td>
                   <td className="text-[11px] truncate max-w-[260px]" title={o.product_name}>{o.product_name}</td>
                   <td>
                     <span className="font-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-sm"
