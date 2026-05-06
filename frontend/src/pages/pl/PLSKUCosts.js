@@ -15,21 +15,51 @@ function ArticleForm({ accounts, initial, onSave, onCancel, saving }) {
   const [name, setName] = useState(initial?.name || "");
   const [cost, setCost] = useState(initial?.default_cost_price ?? "");
   const initialMap = useMemo(() => {
+    // group sku_map by account_id → list of skus
     const m = {};
-    (initial?.sku_map || []).forEach((r) => { m[r.account_id] = r.sku; });
+    (initial?.sku_map || []).forEach((r) => {
+      m[r.account_id] = m[r.account_id] || [];
+      // split any comma-separated legacy entries on the way in
+      String(r.sku || "").split(",").map((s) => s.trim()).filter(Boolean).forEach((s) => {
+        if (!m[r.account_id].includes(s)) m[r.account_id].push(s);
+      });
+    });
     return m;
   }, [initial]);
   const [skuByAcc, setSkuByAcc] = useState(initialMap);
+  const [draftByAcc, setDraftByAcc] = useState({});
+
+  const addChip = (accId) => {
+    const v = (draftByAcc[accId] || "").trim();
+    if (!v) return;
+    const cur = skuByAcc[accId] || [];
+    if (cur.includes(v)) { setDraftByAcc({ ...draftByAcc, [accId]: "" }); return; }
+    setSkuByAcc({ ...skuByAcc, [accId]: [...cur, v] });
+    setDraftByAcc({ ...draftByAcc, [accId]: "" });
+  };
+  const removeChip = (accId, sku) => {
+    setSkuByAcc({ ...skuByAcc, [accId]: (skuByAcc[accId] || []).filter((x) => x !== sku) });
+  };
 
   const onSubmit = (e) => {
     e.preventDefault();
     if (!name.trim()) return;
+    // commit any draft input that the user typed but didn't enter
+    const finalMap = { ...skuByAcc };
+    Object.entries(draftByAcc).forEach(([accId, v]) => {
+      const t = (v || "").trim();
+      if (t) {
+        finalMap[accId] = [...(finalMap[accId] || []), ...(finalMap[accId]?.includes(t) ? [] : [t])];
+      }
+    });
+    const flat = [];
+    Object.entries(finalMap).forEach(([accId, list]) => {
+      (list || []).forEach((sku) => flat.push({ account_id: accId, sku }));
+    });
     onSave({
       name: name.trim(),
       default_cost_price: Number(cost) || 0,
-      sku_map: accounts
-        .map((a) => ({ account_id: a.id, sku: (skuByAcc[a.id] || "").trim() }))
-        .filter((r) => r.sku),
+      sku_map: flat,
     });
   };
 
@@ -57,21 +87,53 @@ function ArticleForm({ accounts, initial, onSave, onCancel, saving }) {
         </div>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        {accounts.map((a) => (
-          <div key={a.id}>
-            <div className="section-label mb-1">
-              / sku on <span className="text-white">{a.alias || a.name}</span>
-              {a.alias && <span className="text-[#71717A]"> ({a.name})</span>}
+        {accounts.map((a) => {
+          const chips = skuByAcc[a.id] || [];
+          return (
+            <div key={a.id}>
+              <div className="section-label mb-1">
+                / skus on <span className="text-white">{a.alias || a.name}</span>
+                {a.alias && <span className="text-[#71717A]"> ({a.name})</span>}
+                <span className="text-[#3F3F46] ml-2">enter ↵ or , to add</span>
+              </div>
+              <div className="input-shell flex flex-wrap gap-1 min-h-[38px] py-1">
+                {chips.map((s) => (
+                  <span key={s}
+                    className="inline-flex items-center gap-1 bg-[#007AFF]/20 border border-[#007AFF]/40 text-[#7DB9FF] font-mono text-[11px] px-2 py-0.5 rounded-sm"
+                    data-testid={`article-chip-${a.id}-${s}`}>
+                    {s}
+                    <button type="button" onClick={() => removeChip(a.id, s)}
+                      className="hover:text-white text-[#7DB9FF]/70">
+                      <XIcon size={10} weight="bold" />
+                    </button>
+                  </span>
+                ))}
+                <input
+                  value={draftByAcc[a.id] || ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v.endsWith(",")) {
+                      setDraftByAcc({ ...draftByAcc, [a.id]: v.slice(0, -1) });
+                      setTimeout(() => addChip(a.id), 0);
+                    } else {
+                      setDraftByAcc({ ...draftByAcc, [a.id]: v });
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === ",") {
+                      e.preventDefault(); addChip(a.id);
+                    } else if (e.key === "Backspace" && !(draftByAcc[a.id] || "") && chips.length) {
+                      removeChip(a.id, chips[chips.length - 1]);
+                    }
+                  }}
+                  placeholder={chips.length ? "" : "leave blank if not sold here"}
+                  className="bg-transparent flex-1 min-w-[120px] outline-none font-mono text-xs"
+                  data-testid={`article-sku-input-${a.id}`}
+                />
+              </div>
             </div>
-            <input
-              value={skuByAcc[a.id] || ""}
-              onChange={(e) => setSkuByAcc({ ...skuByAcc, [a.id]: e.target.value })}
-              placeholder="leave blank if not sold on this account"
-              className="input-shell font-mono text-sm w-full"
-              data-testid={`article-sku-input-${a.id}`}
-            />
-          </div>
-        ))}
+          );
+        })}
       </div>
       <div className="flex gap-2 justify-end">
         <button type="button" onClick={onCancel} className="btn-ghost text-xs">Cancel</button>
@@ -179,7 +241,7 @@ function ArticlesTab({ accounts }) {
                 </td></tr>
               )}
               {items.map((art) => {
-                const skuOn = (accId) => (art.sku_map || []).find((x) => x.account_id === accId)?.sku;
+                const skusOn = (accId) => (art.sku_map || []).filter((x) => x.account_id === accId).map((x) => x.sku);
                 return (
                   <tr key={art.id} data-testid={`article-row-${art.id}`}>
                     <td>
@@ -189,11 +251,21 @@ function ArticlesTab({ accounts }) {
                       </div>
                     </td>
                     {accounts.map((a) => {
-                      const s = skuOn(a.id);
+                      const ss = skusOn(a.id);
                       return (
                         <td key={a.id} className="font-mono text-[11px]">
-                          {s ? <span className="text-white">{s}</span>
-                             : <span className="text-[#3F3F46]">—</span>}
+                          {ss.length === 0 ? (
+                            <span className="text-[#3F3F46]">—</span>
+                          ) : (
+                            <div className="flex flex-wrap gap-1">
+                              {ss.map((s) => (
+                                <span key={s}
+                                  className="bg-[#1F2937] border border-[#2A2A2A] text-white px-1.5 py-0.5 rounded-sm text-[10px]">
+                                  {s}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                         </td>
                       );
                     })}

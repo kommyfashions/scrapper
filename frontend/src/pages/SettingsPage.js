@@ -62,6 +62,7 @@ export default function SettingsPage() {
         scrape_time: data.scrape_time,
         label_enabled: data.label_enabled,
         label_time: data.label_time,
+        label_times: [...new Set(data.label_times || [])].filter(Boolean).sort(),
         skip_dates: [...new Set(data.skip_dates || [])].sort(),
         skip_weekdays: [...new Set(data.skip_weekdays || [])].sort((a, b) => a - b),
       };
@@ -210,14 +211,59 @@ export default function SettingsPage() {
               />
             </div>
             <div>
-              <div className="section-label mb-1">/ time (24h)</div>
-              <input
-                type="time"
-                value={data.label_time}
-                onChange={(e) => setData({ ...data, label_time: e.target.value })}
-                className="input-shell font-mono text-sm w-32"
-                data-testid="label-time-input"
-              />
+              <div className="section-label mb-1">/ run times (IST, 24h)</div>
+              <div className="flex flex-wrap items-center gap-2">
+                {(data.label_times && data.label_times.length > 0
+                  ? data.label_times
+                  : [data.label_time || "09:30"]
+                ).map((t, idx) => (
+                  <div key={`${t}-${idx}`} className="flex items-center gap-1">
+                    <input
+                      type="time"
+                      value={t}
+                      onChange={(e) => {
+                        const cur = data.label_times && data.label_times.length > 0
+                          ? [...data.label_times]
+                          : [data.label_time || "09:30"];
+                        cur[idx] = e.target.value;
+                        setData({ ...data, label_times: cur, label_time: cur[0] });
+                      }}
+                      className="input-shell font-mono text-sm w-32"
+                      data-testid={`label-time-input-${idx}`}
+                    />
+                    <button
+                      onClick={() => {
+                        const cur = data.label_times && data.label_times.length > 0
+                          ? [...data.label_times]
+                          : [data.label_time || "09:30"];
+                        if (cur.length <= 1) return;
+                        cur.splice(idx, 1);
+                        setData({ ...data, label_times: cur, label_time: cur[0] });
+                      }}
+                      disabled={
+                        (data.label_times && data.label_times.length <= 1) ||
+                        (!data.label_times || data.label_times.length === 0)
+                      }
+                      className="btn-ghost text-xs px-1.5 disabled:opacity-30 disabled:pointer-events-none"
+                      title="Remove this time"
+                      data-testid={`label-time-remove-${idx}`}
+                    >×</button>
+                  </div>
+                ))}
+                <button
+                  onClick={() => {
+                    const cur = data.label_times && data.label_times.length > 0
+                      ? [...data.label_times]
+                      : [data.label_time || "09:30"];
+                    setData({ ...data, label_times: [...cur, "12:00"] });
+                  }}
+                  className="btn-ghost text-xs flex items-center gap-1"
+                  data-testid="label-time-add"
+                >+ Add time</button>
+              </div>
+              <div className="text-[10px] font-mono text-[#71717A] mt-1">
+                Each time runs label-download for every enabled account.
+              </div>
             </div>
             <div>
               <div className="section-label mb-1">/ next run</div>

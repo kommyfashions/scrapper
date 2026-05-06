@@ -23,6 +23,26 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 11 (2026-05-06) — Multi-SKU per article + Article-grouped SKU Analysis + Multi-time label cron + Shipping cols
+**Multi-SKU chip input on Articles form**
+- Each per-account input is now a chip-list. Type → Enter or `,` → adds chip; × removes; Backspace deletes last chip when input empty. Articles table cell renders all SKUs as chips (handles cases like Sofia-Blue → `WSS-SFA-Blue`, `WSS-Sofiya(Blue)` on the same account).
+- Save commits any uncommitted draft text. Existing comma-blob entries auto-split on edit.
+
+**Shipping charge columns persisted (no calc impact)**
+- `pl_upload` now writes `shipping_charge` and `return_shipping_charge` raw fields on every `pl_orders` row (sourced from columns AD + AB of Meesho payment XLSX). Existing P&L Profit/Loss/Net calculations untouched.
+
+**SKU Analysis page redesign**
+- Top-right toggle **By SKU / By Article** (`?group_by=sku|article` on backend).
+- New `Article` column on both views; `Ship Out` (sum of `shipping_charge` for delivered) and `Ship Return` (sum of `return_shipping_charge` for returns) columns.
+- By-Article view rolls up all SKUs per article; everything without a mapping collapses into one **"Unmapped — please define an article"** bucket row with `sku_count` and tooltip listing the SKUs.
+- Backend gated with `Query("sku", regex="^(sku|article)$")`.
+
+**Label download — multiple schedule times**
+- `ScheduleSettings.label_times: List[str]` (legacy `label_time` kept for back-compat).
+- `reconfigure_scheduler` now registers one `daily_label_<idx>` cron per HH:MM in `label_times`.
+- `PUT /settings` validates HH:MM each entry, dedupes, sorts.
+- Settings page: time list with `+ Add time` and `×` per row (the last one can't be removed). All times run for every enabled account.
+
 ## Implemented — Iteration 10 (2026-05-05) — Article Master (canonical product)
 **Schema (new collections)**
 - `articles`: `{_id, name (unique), default_cost_price, created_at, updated_at, created_by}`

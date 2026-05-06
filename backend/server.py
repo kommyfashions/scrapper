@@ -117,7 +117,8 @@ class ScheduleSettings(BaseModel):
     scrape_enabled: bool = True
     scrape_time: str = "11:00"   # HH:MM 24h IST
     label_enabled: bool = False
-    label_time: str = "09:30"
+    label_time: str = "09:30"           # legacy single-time field (kept for back-compat)
+    label_times: List[str] = []         # new: multiple HH:MM entries; takes precedence
     skip_dates: List[str] = []        # ["2026-05-03", ...]
     skip_weekdays: List[int] = []     # 0=Mon ... 6=Sun (Python weekday())
 
@@ -414,12 +415,18 @@ async def reconfigure_scheduler():
             id="daily_snapshot", replace_existing=True,
         )
     if s.get("label_enabled", False):
-        h, m = _parse_hhmm(s.get("label_time", "09:30"))
-        scheduler.add_job(
-            enqueue_daily_label_job,
-            CronTrigger(hour=h, minute=m, timezone=SCHED_TZ),
-            id="daily_label", replace_existing=True,
-        )
+        # Use the new `label_times` array when present, else fall back to the
+        # single legacy `label_time` field.
+        raw_times = s.get("label_times") or [s.get("label_time", "09:30")]
+        # de-dupe + sort
+        clean_times = sorted({t for t in raw_times if t and HHMM_RE.match(t)})
+        for idx, t in enumerate(clean_times):
+            h, m = _parse_hhmm(t)
+            scheduler.add_job(
+                enqueue_daily_label_job,
+                CronTrigger(hour=h, minute=m, timezone=SCHED_TZ),
+                id=f"daily_label_{idx}", replace_existing=True,
+            )
     # Payments-file auto-fetch (always on; toggle later if needed)
     # Every Monday 09:00 IST → previous_week
     scheduler.add_job(
@@ -920,9 +927,19 @@ async def put_settings(body: ScheduleSettings, user: dict = Depends(get_current_
         raise HTTPException(status_code=400, detail="scrape_time must be HH:MM (24h)")
     if not HHMM_RE.match(body.label_time):
         raise HTTPException(status_code=400, detail="label_time must be HH:MM (24h)")
+    cleaned_times = []
+    for t in (body.label_times or []):
+        if not HHMM_RE.match(t):
+            raise HTTPException(status_code=400,
+                detail=f"label_times entry '{t}' must be HH:MM (24h)")
+        if t not in cleaned_times:
+            cleaned_times.append(t)
+    cleaned_times.sort()
+    payload = body.model_dump()
+    payload["label_times"] = cleaned_times
     await db.settings.update_one(
         {"_id": "schedule"},
-        {"$set": body.model_dump()},
+        {"$set": payload},
         upsert=True,
     )
     await reconfigure_scheduler()
@@ -1341,6 +1358,8 @@ async def pl_upload(
                 "payment_date": payment_date_str,
                 "total_deductions": round(commission + shipping + tds + tcs + recovery, 2),
                 "return_charges": round(return_shipping, 2),
+                "shipping_charge": round(shipping, 2),
+                "return_shipping_charge": round(return_shipping, 2),
                 "compensation_amount": round(compensation, 2),
                 "order_source": order_source,
                 "quantity": int(pl_safe_float(row.get("Quantity", 1))) or 1,
@@ -1756,6 +1775,7 @@ async def pl_sku_analysis(
     account_id: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    group_by: str = Query("sku", regex="^(sku|article)$"),
     user: dict = Depends(get_current_user),
 ):
     if account_id and account_id != "all":
@@ -1764,53 +1784,136 @@ async def pl_sku_analysis(
     orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
     sku_costs_q = await pl_resolve_account_filter(account_id)
     costs = await _pl_load_costs(sku_costs_q)
+    article_labels = await _pl_load_sku_article_labels()
 
-    sku_data = {}
+    # First pass — aggregate everything at SKU level (always needed)
+    sku_data: Dict[str, dict] = {}
     for o in orders:
         s = o["sku"]
+        if not s:
+            continue
         if s not in sku_data:
-            sku_data[s] = {"units_ordered": 0, "units_delivered": 0, "units_returned": 0,
-                           "exposure_units": 0, "profit": 0.0, "loss": 0.0,
-                           "product_name": o.get("product_name", "")}
-        sku_data[s]["units_ordered"] += 1
+            sku_data[s] = {
+                "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
+                "exposure_units": 0, "profit": 0.0, "loss": 0.0,
+                "ship_out": 0.0, "ship_return": 0.0,
+                "product_name": o.get("product_name", ""),
+                "account_id": o.get("account_id"),
+            }
+        d = sku_data[s]
+        d["units_ordered"] += 1
         if o["order_status"] == "DELIVERED":
-            sku_data[s]["units_delivered"] += 1
+            d["units_delivered"] += 1
+            d["ship_out"] += o.get("shipping_charge") or 0
             if o["payment_status"] == "PAID":
                 cost = _pl_lookup_cost(costs, o.get("account_id"), s)
-                sku_data[s]["profit"] += o["net_settlement_amount"] - cost
+                d["profit"] += o["net_settlement_amount"] - cost
         if o["order_status"] in ("RTO", "RETURNED"):
-            sku_data[s]["units_returned"] += 1
-            sku_data[s]["loss"] += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
+            d["units_returned"] += 1
+            d["ship_return"] += o.get("return_shipping_charge") or 0
+            d["loss"] += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
         if o["order_status"] == "SHIPPED":
-            sku_data[s]["exposure_units"] += 1
+            d["exposure_units"] += 1
 
-    out = []
+    def _classify(rr, contrib):
+        if contrib > 0 and rr < 20:
+            return "Winner"
+        if rr > 40 or contrib < 0:
+            return "Loser"
+        return "Risky"
+
+    # Build per-SKU rows enriched with article_name (always needed for By-SKU view)
+    sku_rows = []
     for sku, d in sku_data.items():
         ordered = d["units_ordered"]
         rr = (d["units_returned"] / ordered * 100) if ordered else 0
         ppu = d["profit"] / d["units_delivered"] if d["units_delivered"] else 0
         lpu = d["loss"] / d["units_returned"] if d["units_returned"] else 0
         contrib = d["profit"] - d["loss"]
-        if contrib > 0 and rr < 20:
-            cls = "Winner"
-        elif rr > 40 or contrib < 0:
-            cls = "Loser"
-        else:
-            cls = "Risky"
-        out.append({
+        article_name = article_labels.get((_pl_norm_acc(d["account_id"]), sku))
+        sku_rows.append({
             "sku": sku, "product_name": d["product_name"],
+            "article_name": article_name,
             "units_ordered": ordered, "units_delivered": d["units_delivered"],
             "units_returned": d["units_returned"], "return_rate": round(rr, 2),
             "net_realized_profit": round(d["profit"], 2),
             "total_return_loss": round(d["loss"], 2),
             "net_sku_contribution": round(contrib, 2),
             "exposure_units": d["exposure_units"],
+            "ship_out": round(d["ship_out"], 2),
+            "ship_return": round(d["ship_return"], 2),
             "profit_per_delivered_unit": round(ppu, 2),
             "loss_per_returned_unit": round(lpu, 2),
-            "classification": cls,
+            "classification": _classify(rr, contrib),
         })
+
+    if group_by == "sku":
+        sku_rows.sort(key=lambda x: x["net_sku_contribution"], reverse=True)
+        return {"items": sku_rows, "group_by": "sku"}
+
+    # group_by=article: roll mapped SKUs up by article_name; bucket the rest
+    by_article: Dict[str, dict] = {}
+    unmapped_bucket = {
+        "article_name": "Unmapped — please define an article",
+        "is_unmapped": True, "sku_count": 0, "skus": [],
+        "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
+        "net_realized_profit": 0.0, "total_return_loss": 0.0,
+        "net_sku_contribution": 0.0, "exposure_units": 0,
+        "ship_out": 0.0, "ship_return": 0.0,
+        "product_name": "",
+    }
+    for r in sku_rows:
+        if not r["article_name"]:
+            unmapped_bucket["sku_count"] += 1
+            unmapped_bucket["skus"].append(r["sku"])
+            for k in ("units_ordered", "units_delivered", "units_returned",
+                     "net_realized_profit", "total_return_loss",
+                     "net_sku_contribution", "exposure_units",
+                     "ship_out", "ship_return"):
+                unmapped_bucket[k] += r[k]
+            continue
+        a = r["article_name"]
+        if a not in by_article:
+            by_article[a] = {
+                "article_name": a, "is_unmapped": False, "sku_count": 0,
+                "skus": [], "product_name": r["product_name"],
+                "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
+                "net_realized_profit": 0.0, "total_return_loss": 0.0,
+                "net_sku_contribution": 0.0, "exposure_units": 0,
+                "ship_out": 0.0, "ship_return": 0.0,
+            }
+        agg = by_article[a]
+        agg["sku_count"] += 1
+        agg["skus"].append(r["sku"])
+        for k in ("units_ordered", "units_delivered", "units_returned",
+                 "net_realized_profit", "total_return_loss",
+                 "net_sku_contribution", "exposure_units",
+                 "ship_out", "ship_return"):
+            agg[k] += r[k]
+
+    out = []
+    for a in by_article.values():
+        ordered = a["units_ordered"]
+        rr = (a["units_returned"] / ordered * 100) if ordered else 0
+        ppu = a["net_realized_profit"] / a["units_delivered"] if a["units_delivered"] else 0
+        a["return_rate"] = round(rr, 2)
+        a["profit_per_delivered_unit"] = round(ppu, 2)
+        a["classification"] = _classify(rr, a["net_sku_contribution"])
+        for k in ("net_realized_profit", "total_return_loss",
+                 "net_sku_contribution", "ship_out", "ship_return"):
+            a[k] = round(a[k], 2)
+        out.append(a)
     out.sort(key=lambda x: x["net_sku_contribution"], reverse=True)
-    return {"items": out}
+    if unmapped_bucket["sku_count"] > 0:
+        rr = (unmapped_bucket["units_returned"] / unmapped_bucket["units_ordered"] * 100) if unmapped_bucket["units_ordered"] else 0
+        unmapped_bucket["return_rate"] = round(rr, 2)
+        unmapped_bucket["profit_per_delivered_unit"] = 0
+        unmapped_bucket["classification"] = "Risky"
+        for k in ("net_realized_profit", "total_return_loss",
+                 "net_sku_contribution", "ship_out", "ship_return"):
+            unmapped_bucket[k] = round(unmapped_bucket[k], 2)
+        out.append(unmapped_bucket)
+    return {"items": out, "group_by": "article"}
 
 # ---------- Exchange Analysis ----------
 @api.get("/pl/exchange-analysis")
