@@ -1776,37 +1776,63 @@ async def pl_sku_analysis(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     group_by: str = Query("sku", regex="^(sku|article)$"),
+    q: Optional[str] = None,
     user: dict = Depends(get_current_user),
 ):
+    """Analyze P&L per (account, sku) selling unit.
+
+    - group_by=sku → flat list of (account, sku) rows.
+    - group_by=article → interleaved [header_row, child_row, child_row, …]
+      so the frontend can render an article-grouped table with collapsible
+      children. Headers carry `is_header=True, sku_count`; children carry
+      `is_child=True, parent_article`.
+
+    `q` is a free-text filter applied on the server across SKU, article
+    name, account name/alias, and product name (case-insensitive contains).
+    """
     if account_id and account_id != "all":
         await pl_resolve_account_filter(account_id)
-    q = _pl_date_query(account_id, start_date, end_date, {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
-    orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+    base_q = _pl_date_query(account_id, start_date, end_date,
+                            {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
+    orders = await db.pl_orders.find(base_q, {"_id": 0}).to_list(None)
     sku_costs_q = await pl_resolve_account_filter(account_id)
     costs = await _pl_load_costs(sku_costs_q)
     article_labels = await _pl_load_sku_article_labels()
 
-    # First pass — aggregate everything at SKU level (always needed)
-    sku_data: Dict[str, dict] = {}
+    # Account lookup for name/alias
+    acc_lookup: Dict[str, dict] = {}
+    async for a in db.accounts.find({}):
+        acc_lookup[str(a["_id"])] = {
+            "name": a.get("name"), "alias": a.get("alias"),
+        }
+
+    # Aggregate per (account, sku)
+    cells: Dict[tuple, dict] = {}
     for o in orders:
-        s = o["sku"]
-        if not s:
+        s = o.get("sku")
+        acc = _pl_norm_acc(o.get("account_id"))
+        if not s or not acc:
             continue
-        if s not in sku_data:
-            sku_data[s] = {
+        key = (acc, s)
+        if key not in cells:
+            ainfo = acc_lookup.get(acc, {})
+            cells[key] = {
+                "account_id": acc,
+                "account_name": ainfo.get("name"),
+                "account_alias": ainfo.get("alias"),
+                "sku": s,
+                "product_name": o.get("product_name", ""),
                 "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
                 "exposure_units": 0, "profit": 0.0, "loss": 0.0,
                 "ship_out": 0.0, "ship_return": 0.0,
-                "product_name": o.get("product_name", ""),
-                "account_id": o.get("account_id"),
             }
-        d = sku_data[s]
+        d = cells[key]
         d["units_ordered"] += 1
         if o["order_status"] == "DELIVERED":
             d["units_delivered"] += 1
             d["ship_out"] += o.get("shipping_charge") or 0
             if o["payment_status"] == "PAID":
-                cost = _pl_lookup_cost(costs, o.get("account_id"), s)
+                cost = _pl_lookup_cost(costs, acc, s)
                 d["profit"] += o["net_settlement_amount"] - cost
         if o["order_status"] in ("RTO", "RETURNED"):
             d["units_returned"] += 1
@@ -1822,99 +1848,103 @@ async def pl_sku_analysis(
             return "Loser"
         return "Risky"
 
-    # Build per-SKU rows enriched with article_name (always needed for By-SKU view)
-    sku_rows = []
-    for sku, d in sku_data.items():
+    # Build a row for each (account, sku) cell with derived metrics
+    leaf_rows = []
+    for (acc, sku), d in cells.items():
         ordered = d["units_ordered"]
         rr = (d["units_returned"] / ordered * 100) if ordered else 0
         ppu = d["profit"] / d["units_delivered"] if d["units_delivered"] else 0
         lpu = d["loss"] / d["units_returned"] if d["units_returned"] else 0
         contrib = d["profit"] - d["loss"]
-        article_name = article_labels.get((_pl_norm_acc(d["account_id"]), sku))
-        sku_rows.append({
+        article_name = article_labels.get((acc, sku))
+        leaf_rows.append({
+            "account_id": d["account_id"],
+            "account_name": d["account_name"],
+            "account_alias": d["account_alias"],
             "sku": sku, "product_name": d["product_name"],
             "article_name": article_name,
             "units_ordered": ordered, "units_delivered": d["units_delivered"],
             "units_returned": d["units_returned"], "return_rate": round(rr, 2),
+            "ship_out": round(d["ship_out"], 2),
+            "ship_return": round(d["ship_return"], 2),
             "net_realized_profit": round(d["profit"], 2),
             "total_return_loss": round(d["loss"], 2),
             "net_sku_contribution": round(contrib, 2),
             "exposure_units": d["exposure_units"],
-            "ship_out": round(d["ship_out"], 2),
-            "ship_return": round(d["ship_return"], 2),
             "profit_per_delivered_unit": round(ppu, 2),
             "loss_per_returned_unit": round(lpu, 2),
             "classification": _classify(rr, contrib),
         })
 
-    if group_by == "sku":
-        sku_rows.sort(key=lambda x: x["net_sku_contribution"], reverse=True)
-        return {"items": sku_rows, "group_by": "sku"}
+    # Apply server-side text filter (SKU, Article, Account name/alias, Product)
+    if q:
+        needle = q.strip().lower()
+        if needle:
+            leaf_rows = [
+                r for r in leaf_rows if any(
+                    needle in str(r.get(f) or "").lower()
+                    for f in ("sku", "article_name", "account_name",
+                              "account_alias", "product_name")
+                )
+            ]
 
-    # group_by=article: roll mapped SKUs up by article_name; bucket the rest
-    by_article: Dict[str, dict] = {}
-    unmapped_bucket = {
-        "article_name": "Unmapped — please define an article",
-        "is_unmapped": True, "sku_count": 0, "skus": [],
-        "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
-        "net_realized_profit": 0.0, "total_return_loss": 0.0,
-        "net_sku_contribution": 0.0, "exposure_units": 0,
-        "ship_out": 0.0, "ship_return": 0.0,
-        "product_name": "",
-    }
-    for r in sku_rows:
-        if not r["article_name"]:
-            unmapped_bucket["sku_count"] += 1
-            unmapped_bucket["skus"].append(r["sku"])
+    if group_by == "sku":
+        leaf_rows.sort(key=lambda x: x["net_sku_contribution"], reverse=True)
+        return {"items": leaf_rows, "group_by": "sku"}
+
+    # group_by=article — group leaf rows by article name; "" / None → unmapped
+    UNMAPPED = "Unmapped — please define an article"
+    by_art: Dict[str, list] = {}
+    for r in leaf_rows:
+        key = r["article_name"] or UNMAPPED
+        by_art.setdefault(key, []).append(r)
+
+    # Build per-article aggregates
+    headers = []
+    for art_name, children in by_art.items():
+        agg = {
+            "is_header": True,
+            "is_unmapped": art_name == UNMAPPED,
+            "article_name": art_name,
+            "sku_count": len(children),
+            "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
+            "exposure_units": 0, "ship_out": 0.0, "ship_return": 0.0,
+            "net_realized_profit": 0.0, "total_return_loss": 0.0,
+            "net_sku_contribution": 0.0,
+        }
+        for c in children:
             for k in ("units_ordered", "units_delivered", "units_returned",
+                     "exposure_units", "ship_out", "ship_return",
                      "net_realized_profit", "total_return_loss",
-                     "net_sku_contribution", "exposure_units",
-                     "ship_out", "ship_return"):
-                unmapped_bucket[k] += r[k]
-            continue
-        a = r["article_name"]
-        if a not in by_article:
-            by_article[a] = {
-                "article_name": a, "is_unmapped": False, "sku_count": 0,
-                "skus": [], "product_name": r["product_name"],
-                "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
-                "net_realized_profit": 0.0, "total_return_loss": 0.0,
-                "net_sku_contribution": 0.0, "exposure_units": 0,
-                "ship_out": 0.0, "ship_return": 0.0,
-            }
-        agg = by_article[a]
-        agg["sku_count"] += 1
-        agg["skus"].append(r["sku"])
-        for k in ("units_ordered", "units_delivered", "units_returned",
-                 "net_realized_profit", "total_return_loss",
-                 "net_sku_contribution", "exposure_units",
-                 "ship_out", "ship_return"):
-            agg[k] += r[k]
+                     "net_sku_contribution"):
+                agg[k] += c[k]
+        ordered = agg["units_ordered"]
+        agg["return_rate"] = round((agg["units_returned"] / ordered * 100) if ordered else 0, 2)
+        agg["profit_per_delivered_unit"] = round(
+            (agg["net_realized_profit"] / agg["units_delivered"]) if agg["units_delivered"] else 0,
+            2,
+        )
+        agg["classification"] = _classify(agg["return_rate"], agg["net_sku_contribution"])
+        for k in ("ship_out", "ship_return", "net_realized_profit",
+                 "total_return_loss", "net_sku_contribution"):
+            agg[k] = round(agg[k], 2)
+        headers.append((agg, children))
+
+    # Sort articles by metric (mapped first, unmapped last regardless)
+    headers.sort(
+        key=lambda hc: (
+            1 if hc[0]["is_unmapped"] else 0,
+            -hc[0]["net_sku_contribution"],
+        )
+    )
 
     out = []
-    for a in by_article.values():
-        ordered = a["units_ordered"]
-        rr = (a["units_returned"] / ordered * 100) if ordered else 0
-        ppu = a["net_realized_profit"] / a["units_delivered"] if a["units_delivered"] else 0
-        a["return_rate"] = round(rr, 2)
-        a["profit_per_delivered_unit"] = round(ppu, 2)
-        a["classification"] = _classify(rr, a["net_sku_contribution"])
-        for k in ("net_realized_profit", "total_return_loss",
-                 "net_sku_contribution", "ship_out", "ship_return"):
-            a[k] = round(a[k], 2)
-        out.append(a)
-    out.sort(key=lambda x: x["net_sku_contribution"], reverse=True)
-    if unmapped_bucket["sku_count"] > 0:
-        rr = (unmapped_bucket["units_returned"] / unmapped_bucket["units_ordered"] * 100) if unmapped_bucket["units_ordered"] else 0
-        unmapped_bucket["return_rate"] = round(rr, 2)
-        unmapped_bucket["profit_per_delivered_unit"] = 0
-        unmapped_bucket["classification"] = "Risky"
-        for k in ("net_realized_profit", "total_return_loss",
-                 "net_sku_contribution", "ship_out", "ship_return"):
-            unmapped_bucket[k] = round(unmapped_bucket[k], 2)
-        out.append(unmapped_bucket)
+    for header, children in headers:
+        out.append(header)
+        # children appear in their natural order (no per-child sort, per user)
+        for c in children:
+            out.append({**c, "is_child": True, "parent_article": header["article_name"]})
     return {"items": out, "group_by": "article"}
-
 # ---------- Exchange Analysis ----------
 @api.get("/pl/exchange-analysis")
 async def pl_exchange_analysis(
@@ -2181,15 +2211,14 @@ async def pl_articles_list(user: dict = Depends(get_current_user)):
     return {"items": items}
 
 
-async def _apply_sku_map(article_id, sku_map: List[ArticleSkuMapIn]):
-    """Replace all SKU mappings for an article. Each entry's (account_id, sku)
-    is globally unique across all articles — clashes return 409.
-    Blank SKUs are ignored (allows leaving the slot empty for an account)."""
-    # Clean + dedupe incoming mappings
+async def _validate_sku_map(article_id, sku_map: List[ArticleSkuMapIn]):
+    """Check incoming SKU map for clashes with other articles.
+    Returns the cleaned list of mappings. Raises 409 if any (account, sku)
+    is already claimed by a different article."""
     cleaned = []
     seen = set()
     for m in sku_map:
-        acc = _pl_norm_acc(m.account_id) or m.account_id  # we want a concrete account id, not None
+        acc = _pl_norm_acc(m.account_id) or m.account_id
         sku = (m.sku or "").strip()
         if not acc or not sku:
             continue
@@ -2197,21 +2226,26 @@ async def _apply_sku_map(article_id, sku_map: List[ArticleSkuMapIn]):
             continue
         seen.add((acc, sku))
         cleaned.append({"article_id": article_id, "account_id": acc, "sku": sku})
-
-    # Validate no other article claims these (account_id, sku) keys
     if cleaned:
-        taken = db.article_sku_map.find(
-            {"$or": [{"account_id": c["account_id"], "sku": c["sku"]} for c in cleaned],
-             "article_id": {"$ne": article_id}},
-        )
-        async for t in taken:
+        clash_q = {
+            "$or": [{"account_id": c["account_id"], "sku": c["sku"]} for c in cleaned],
+        }
+        if article_id is not None:
+            clash_q["article_id"] = {"$ne": article_id}
+        existing = await db.article_sku_map.find_one(clash_q)
+        if existing:
             raise HTTPException(
                 status_code=409,
-                detail=f"SKU '{t['sku']}' on account {t['account_id']} "
+                detail=f"SKU '{existing['sku']}' on account {existing['account_id']} "
                        f"is already mapped to another article.",
             )
+    return cleaned
 
-    # Wipe old mapping, write fresh
+
+async def _apply_sku_map(article_id, sku_map: List[ArticleSkuMapIn]):
+    """Replace all SKU mappings for an article. Validates first to surface
+    409 before any write."""
+    cleaned = await _validate_sku_map(article_id, sku_map)
     await db.article_sku_map.delete_many({"article_id": article_id})
     if cleaned:
         await db.article_sku_map.insert_many(cleaned)
@@ -2226,6 +2260,8 @@ async def pl_articles_create(body: ArticleIn, user: dict = Depends(get_current_u
         raise HTTPException(status_code=400, detail="default_cost_price must be >= 0")
     if await db.articles.find_one({"name": name}):
         raise HTTPException(status_code=409, detail=f"Article '{name}' already exists")
+    # Validate sku_map BEFORE inserting the article so a clash doesn't leave an orphan.
+    await _validate_sku_map(None, body.sku_map)
     now = datetime.now(timezone.utc)
     doc = {
         "name": name,

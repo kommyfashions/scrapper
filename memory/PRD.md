@@ -23,6 +23,24 @@ Single admin (Meesho seller) managing their own products + daily label printing.
 - **Settings page** — editable daily schedule times (Asia/Kolkata), manual "Run now" triggers.
 - Extensible sidebar (AUTOMATION section) for future modules.
 
+## Implemented — Iteration 12 (2026-05-06) — SKU Analysis hierarchical view + search + clash-safe articles
+**Root cause acknowledged**: previous SKU Analysis aggregated by `sku` only (lost per-account view) and "By Article" produced a single roll-up row (lost per-SKU drilldown). User couldn't tell which SKU on which account was performing.
+
+**Backend `/pl/sku-analysis` rewritten**
+- Aggregation now at `(account_id, sku)` granularity — same SKU on different accounts gets distinct rows.
+- Each row carries `account_id`, `account_name`, `account_alias`, `article_name`.
+- `group_by=article` returns **interleaved** `[header_row, child_row, child_row, ...]` so frontend can render hierarchy: header rows have `is_header=True`, `sku_count`, aggregated metrics; children have `is_child=True`, `parent_article`.
+- `q` query param: server-side text search across SKU, article name, account name, account alias, product name (case-insensitive contains).
+- Articles sorted by metric (mapped first, "Unmapped" bucket always last).
+
+**Backend bug fix** — `_validate_sku_map()` now runs *before* `db.articles.insert_one()` on POST, so a SKU clash returns 409 cleanly without leaving an orphan article.
+
+**Frontend `PLSKUAnalysis.js` rewritten**
+- New columns: Article | Account | SKU | Product | Ordered | Delivered | Returned | RR% | Ship Out | Ship Return | Profit | Loss | Net | P/U | Class.
+- Debounced search box (350ms) wired to the new `q` param.
+- Group-by-article view: header rows are bold + caret + `N skus` chip; **click toggles collapse** of children. Children are visually indented with `↳`.
+- Summary cards relabel to "Winner / Risky / Loser Articles" in by-article view.
+
 ## Implemented — Iteration 11 (2026-05-06) — Multi-SKU per article + Article-grouped SKU Analysis + Multi-time label cron + Shipping cols
 **Multi-SKU chip input on Articles form**
 - Each per-account input is now a chip-list. Type → Enter or `,` → adds chip; × removes; Backspace deletes last chip when input empty. Articles table cell renders all SKUs as chips (handles cases like Sofia-Blue → `WSS-SFA-Blue`, `WSS-Sofiya(Blue)` on the same account).
