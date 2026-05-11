@@ -131,7 +131,16 @@ input:focus, select:focus, textarea:focus, button:focus {
     font-family: 'IBM Plex Sans', sans-serif;
     border-radius: 2px;
     width: 100%;
+    color-scheme: dark;
     transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.input-shell::-webkit-calendar-picker-indicator {
+    filter: invert(0.7);
+    cursor: pointer;
+    opacity: 0.85;
+}
+.input-shell::-webkit-calendar-picker-indicator:hover {
+    opacity: 1;
 }
 .input-shell:focus {
     border-color: var(--accent);

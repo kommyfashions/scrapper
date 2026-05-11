@@ -50,6 +50,11 @@ export default function LabelsPage() {
 
   const enabledAccounts = useMemo(() => accounts.filter((a) => a.enabled), [accounts]);
 
+  const visibleRuns = useMemo(() => {
+    if (selected === "__all__") return runs;
+    return runs.filter((r) => r.account_id === selected);
+  }, [runs, selected]);
+
   const runNow = async () => {
     setBusy(true); setErr(""); setQueuedMsg("");
     try {
@@ -178,12 +183,14 @@ export default function LabelsPage() {
                     <span className="cursor-blink">LOADING</span>
                   </td></tr>
                 )}
-                {!loading && runs.length === 0 && (
+                {!loading && visibleRuns.length === 0 && (
                   <tr><td colSpan={7} className="text-center py-10 text-[#71717A] text-sm">
-                    No runs yet. Click "Run Now" to queue the first one.
+                    {selected === "__all__"
+                      ? `No runs yet. Click "Run Now" to queue the first one.`
+                      : `No runs for this account yet.`}
                   </td></tr>
                 )}
-                {runs.map((r) => {
+                {visibleRuns.map((r) => {
                   const accName = r.account_name || accNameMap[r.account_id] || "—";
                   return (
                     <tr key={r.id} data-testid={`label-run-${r.id}`}>

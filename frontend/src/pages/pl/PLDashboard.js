@@ -98,7 +98,7 @@ export default function PLDashboard() {
               label="Total Return Loss"
               value={inr(data.total_return_loss)}
               color="#FF3B30"
-              hint={`${data.returned_orders + data.rto_orders} returns + RTO`}
+              hint={`${data.returned_orders} returned`}
               testid="pl-card-return-loss"
               Icon={TrendDownIcon}
             />

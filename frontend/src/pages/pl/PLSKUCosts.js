@@ -147,12 +147,26 @@ function ArticleForm({ accounts, initial, onSave, onCancel, saving }) {
   );
 }
 
-function ArticlesTab({ accounts }) {
+function ArticlesTab({ accounts, accountId }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [editing, setEditing] = useState(null); // null = closed; "new" or article obj
   const [saving, setSaving] = useState(false);
+
+  // When a specific account is chosen in the PL top-bar, only show that
+  // column and filter articles that have a SKU mapped under it.
+  const visibleAccounts = useMemo(() => {
+    if (!accountId || accountId === "all") return accounts;
+    return accounts.filter((a) => a.id === accountId);
+  }, [accounts, accountId]);
+
+  const visibleItems = useMemo(() => {
+    if (!accountId || accountId === "all") return items;
+    return items.filter((art) =>
+      (art.sku_map || []).some((m) => m.account_id === accountId)
+    );
+  }, [items, accountId]);
 
   const accLookup = useMemo(() => {
     const m = {};
@@ -223,7 +237,7 @@ function ArticlesTab({ accounts }) {
             <thead>
               <tr>
                 <th>Article</th>
-                {accounts.map((a) => (
+                {visibleAccounts.map((a) => (
                   <th key={a.id} className="font-mono text-[10px]">
                     {a.alias || a.name}
                     {a.alias && <span className="text-[#71717A]"> ({a.name})</span>}
@@ -234,13 +248,15 @@ function ArticlesTab({ accounts }) {
               </tr>
             </thead>
             <tbody>
-              {loading && <tr><td colSpan={accounts.length + 3} className="text-center py-10 text-[#71717A]"><span className="cursor-blink">LOADING</span></td></tr>}
-              {!loading && items.length === 0 && (
-                <tr><td colSpan={accounts.length + 3} className="text-center py-10 text-[#71717A] text-sm">
-                  No articles yet. Click <span className="code-tag">New Article</span> to get started.
+              {loading && <tr><td colSpan={visibleAccounts.length + 3} className="text-center py-10 text-[#71717A]"><span className="cursor-blink">LOADING</span></td></tr>}
+              {!loading && visibleItems.length === 0 && (
+                <tr><td colSpan={visibleAccounts.length + 3} className="text-center py-10 text-[#71717A] text-sm">
+                  {accountId && accountId !== "all"
+                    ? "No articles mapped to this account yet. Switch to All Accounts or map SKUs."
+                    : (<>No articles yet. Click <span className="code-tag">New Article</span> to get started.</>)}
                 </td></tr>
               )}
-              {items.map((art) => {
+              {visibleItems.map((art) => {
                 const skusOn = (accId) => (art.sku_map || []).filter((x) => x.account_id === accId).map((x) => x.sku);
                 return (
                   <tr key={art.id} data-testid={`article-row-${art.id}`}>
@@ -250,7 +266,7 @@ function ArticlesTab({ accounts }) {
                         <span className="font-display text-sm">{art.name}</span>
                       </div>
                     </td>
-                    {accounts.map((a) => {
+                    {visibleAccounts.map((a) => {
                       const ss = skusOn(a.id);
                       return (
                         <td key={a.id} className="font-mono text-[11px]">
@@ -292,7 +308,7 @@ function ArticlesTab({ accounts }) {
   );
 }
 
-function MissingArticlesTab({ accounts, onMap }) {
+function MissingArticlesTab({ accounts, accountId, onMap }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
@@ -311,11 +327,15 @@ function MissingArticlesTab({ accounts, onMap }) {
 
   const rows = useMemo(() => {
     const filt = q.trim().toLowerCase();
-    if (!filt) return items;
-    return items.filter(
-      (r) => r.sku?.toLowerCase().includes(filt) || r.account_name?.toLowerCase().includes(filt)
+    let r = items;
+    if (accountId && accountId !== "all") {
+      r = r.filter((x) => x.account_id === accountId);
+    }
+    if (!filt) return r;
+    return r.filter(
+      (x) => x.sku?.toLowerCase().includes(filt) || x.account_name?.toLowerCase().includes(filt)
     );
-  }, [items, q]);
+  }, [items, q, accountId]);
 
   return (
     <div className="space-y-4" data-testid="missing-tab">
@@ -379,7 +399,7 @@ function MissingArticlesTab({ accounts, onMap }) {
 }
 
 export default function PLSKUCosts() {
-  const { accounts, reloadAccounts } = usePL();
+  const { accounts, accountId, reloadAccounts } = usePL();
   const [tab, setTab] = useState("articles");
   const [prefill, setPrefill] = useState(null); // {account_id, sku} → open Articles tab in "new" mode with prefill
 
@@ -403,8 +423,8 @@ export default function PLSKUCosts() {
           </button>
         ))}
       </div>
-      {tab === "articles" && <ArticlesTab accounts={accounts} key={prefill?.sku || "plain"} />}
-      {tab === "missing" && <MissingArticlesTab accounts={accounts} onMap={handleMap} />}
+      {tab === "articles" && <ArticlesTab accounts={accounts} accountId={accountId} key={(prefill?.sku || "plain") + ":" + (accountId || "all")} />}
+      {tab === "missing" && <MissingArticlesTab accounts={accounts} accountId={accountId} onMap={handleMap} />}
     </div>
   );
 }

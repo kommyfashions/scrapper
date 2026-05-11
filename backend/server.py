@@ -1646,13 +1646,12 @@ async def pl_dashboard(
         elif o["order_status"] == "SHIPPED":
             open_exposure += o["net_settlement_amount"]
             shipped += 1
-        if o["order_status"] in ("RTO", "RETURNED"):
-            # full formula: |settlement| + return_charges − compensation
-            return_loss += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
-            if o["order_status"] == "RETURNED":
-                returned += 1
-            else:
-                rto += 1
+        if o["order_status"] == "RETURNED":
+            # Return loss = return_shipping_charge − compensation (only RETURNED, not RTO)
+            return_loss += (o.get("return_shipping_charge") or 0) - (o.get("compensation_amount") or 0)
+            returned += 1
+        elif o["order_status"] == "RTO":
+            rto += 1
         if o["payment_status"] == "PENDING":
             pending += o["net_settlement_amount"]
 
@@ -1834,10 +1833,12 @@ async def pl_sku_analysis(
             if o["payment_status"] == "PAID":
                 cost = _pl_lookup_cost(costs, acc, s)
                 d["profit"] += o["net_settlement_amount"] - cost
-        if o["order_status"] in ("RTO", "RETURNED"):
+        if o["order_status"] == "RETURNED":
+            # Per business rule: RTO is excluded from returns/loss in SKU Analysis.
+            # Only customer-returned orders count, and loss = return_shipping_charge − compensation.
             d["units_returned"] += 1
             d["ship_return"] += o.get("return_shipping_charge") or 0
-            d["loss"] += abs(o["net_settlement_amount"]) + (o.get("return_charges") or 0) - (o.get("compensation_amount") or 0)
+            d["loss"] += (o.get("return_shipping_charge") or 0) - (o.get("compensation_amount") or 0)
         if o["order_status"] == "SHIPPED":
             d["exposure_units"] += 1
 
