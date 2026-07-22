@@ -1,7 +1,7 @@
 [Unit]
 Description=Meesho Label Worker (EC2)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target mongod.service meesho-chromes.service
+Wants=network-online.target meesho-chromes.service
 
 [Service]
 Type=simple

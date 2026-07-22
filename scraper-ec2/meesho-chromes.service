@@ -1,0 +1,24 @@
+[Unit]
+Description=Meesho Persistent Chrome Instances (CDP attach targets)
+Documentation=start_chromes.sh launches one Chrome per enabled account
+After=network-online.target mongod.service
+Wants=network-online.target mongod.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# KillMode=process keeps the child Chrome processes alive after the launcher exits
+KillMode=process
+User=ubuntu
+WorkingDirectory=/home/ubuntu/meesho-label-worker
+Environment="MESHO_MONGO_URI=mongodb://43.205.229.129:27017/"
+Environment="MESHO_DB_NAME=meesho"
+Environment="DISPLAY=:0"
+# Give Mongo a moment to accept connections after boot
+ExecStartPre=/bin/sleep 5
+ExecStart=/home/ubuntu/meesho-label-worker/start_chromes.sh
+StandardOutput=append:/var/log/meesho-chromes.log
+StandardError=append:/var/log/meesho-chromes.log
+
+[Install]
+WantedBy=multi-user.target

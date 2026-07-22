@@ -48,14 +48,17 @@ for line in "${ACCOUNTS[@]}"; do
 
     mkdir -p "${DIR}"
     echo "🚀 Launching Chrome for '${NAME}' on port ${PORT} (profile=${DIR})..."
-    nohup "${CHROME_BIN}" \
+    # setsid + nohup fully detaches Chrome from any parent (shell or systemd unit)
+    # so it survives after start_chromes.sh (or the systemd oneshot) exits.
+    setsid nohup "${CHROME_BIN}" \
         --remote-debugging-port="${PORT}" \
         --remote-debugging-address=127.0.0.1 \
         --user-data-dir="${DIR}" \
         --no-first-run \
         --no-default-browser-check \
         --disable-features=Translate \
-        > "/tmp/chrome-${PORT}.log" 2>&1 &
+        > "/tmp/chrome-${PORT}.log" 2>&1 < /dev/null &
+    disown || true
 
     sleep 2
 done
