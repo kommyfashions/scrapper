@@ -11,7 +11,7 @@ RemainAfterExit=yes
 KillMode=process
 User=ubuntu
 WorkingDirectory=/home/ubuntu/meesho-label-worker
-Environment="MESHO_MONGO_URI=mongodb://43.205.229.129:27017/"
+Environment="MESHO_MONGO_URI=mongodb://127.0.0.1:27017/"
 Environment="MESHO_DB_NAME=meesho"
 Environment="DISPLAY=:0"
 # Give Mongo a moment to accept connections after boot

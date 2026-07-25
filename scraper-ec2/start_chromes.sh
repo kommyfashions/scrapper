@@ -7,7 +7,7 @@
 # =====================================================================
 set -euo pipefail
 
-MONGO_URI="${MESHO_MONGO_URI:-mongodb://43.205.229.129:27017/}"
+MONGO_URI="${MESHO_MONGO_URI:-mongodb://127.0.0.1:27017/}"
 DB_NAME="${MESHO_DB_NAME:-meesho}"
 
 CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || true)"

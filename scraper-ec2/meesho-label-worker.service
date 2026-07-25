@@ -7,7 +7,7 @@ Wants=network-online.target meesho-chromes.service
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/meesho-label-worker
-Environment="MESHO_MONGO_URI=mongodb://43.205.229.129:27017/"
+Environment="MESHO_MONGO_URI=mongodb://127.0.0.1:27017/"
 Environment="MESHO_DB_NAME=meesho"
 Environment="MESHO_POLL_SECONDS=5"
 Environment="DASHBOARD_URL=http://127.0.0.1:8000"

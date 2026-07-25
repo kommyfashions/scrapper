@@ -37,7 +37,7 @@ import payments_fetcher  # type=payments_fetch (Excel payments file)
 import gst_report_fetcher  # type=gst_report_fetch
 import tax_invoice_fetcher  # type=tax_invoice_fetch
 
-MONGO_URI = os.environ.get("MESHO_MONGO_URI", "mongodb://43.205.229.129:27017/")
+MONGO_URI = os.environ.get("MESHO_MONGO_URI", "mongodb://127.0.0.1:27017/")
 DB_NAME = os.environ.get("MESHO_DB_NAME", "meesho")
 POLL = int(os.environ.get("MESHO_POLL_SECONDS", "5"))
 
