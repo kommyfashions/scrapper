@@ -1,23 +1,144 @@
-<analysis>/pl/sku-analysisPLSKUAnalysis.js(account_id, sku)TargetClosedErrorCancelledErrorlabels.pytry/exceptproduct_review.pyserver.pybackend/routers/pl.pyaccounts.pyproducts.pygst_report_fetcher.pytax_invoice_fetcher.pyPLTaxDocs.jsaliasarticlesarticle_sku_mapshipping_chargereturn_shipping_chargeTargetClosedErrorlabels.pypayments_fetcher.pytry/except
-/app
-├── backend/
-│   ├── server.py             (FastAPI routes, Motor DB, APScheduler, ~3000 lines - NEEDS REFACTOR)
-│   ├── .env                  
-│   └── requirements.txt
-├── frontend/
-│   ├── src/pages/pl/         (PLTaxDocs.js, PLSKUAnalysis.js, PLSKUCosts.js, PLLayout.js, etc.)
-│   └── ...
-├── scraper-ec2/              (Ubuntu Worker)
-│   ├── label_worker.py       
-│   ├── payments_fetcher.py   
-│   ├── gst_report_fetcher.py (NEW)
-│   ├── tax_invoice_fetcher.py(NEW)
-│   ├── _meesho_ui.py         (NEW helper logic for UI interactions)
-│   ├── labels.py             
-│   ├── start_chromes.sh
-│   ├── install.sh
-│   └── meesho-label-worker.service
-└── memory/
-    ├── PRD.md
-    └── test_credentials.md
-start_chromes.shaccounts{name, alias, debug_port}aliasarticles{name, default_cost_price, created_at, updated_at}article_sku_map{account_id, sku, article_id}[account_id, sku]pl_uploads{type, filename, status, period, share_token, share_token_expires_at}/app/backend/server.py/app/scraper-ec2/gst_report_fetcher.pytax_invoice_fetcher.py/app/frontend/src/pages/pl/PLTaxDocs.js/app/frontend/src/pages/pl/PLSKUCosts.js/app/frontend/src/pages/pl/PLSKUAnalysis.js/app/frontend/src/pages/SettingsPage.js/app/backend/server.pyAPIRouterbackend/routers/pl.pybackend/routers/accounts.pyPOST /api/pl/tax-invoice/fetch-nowGET /api/pl/tax-invoice/{id}/public/{token}GET /api/pl/sku-analysisgroup_by=articlegroup_by=skuqgit pullscraper-ec2/~/meesho-label-worker/yarn buildstart_chromes.shpl_sku_analysisis_header: Trueis_child: Truegroup_by=article/app/memory/PRD.md(account_id, sku)1a, 2a, 3b, 4acurladmin@meesho-dash.localadmin123/app/memory/test_credentials.mdserver.pyserver.py/app/frontend/src/pages/pl/PLSKUAnalysis.js/app/backend/server.pypl_sku_analysis</analysis>
+<analysis>**original_problem_statement**: Create a web dashboard to submit Meesho product URLs, view scraped reviews/analytics, and download shipping labels. PRODUCT REQUIREMENTS: React Frontend, FastAPI Backend, MongoDB. 
+*Recent Requirements Additions:* 
+1. Auto-start app/services on VM reboot without manual intervention.
+2. Master Excel Upload feature to seed data for Missing SKU and other modules.
+
+**User's preferred language**: English (INSTRUCT next agent to respond in English only)
+
+**what currently exists?**: A React + FastAPI dashboard with a full P&L module, scheduled label download workers, order review scrapers, payments fetcher, and GST/Tax invoice fetchers. Systemd services are configured to launch persistent headless Chrome processes (via Xvfb) and worker scripts automatically on EC2 reboot. SKU Analysis correctly isolates returns and losses without double-counting RTOs.
+
+**Last working item**:
+    - Last item agent was working: Gathering requirements for the new Master Excel Upload feature. Auto-start services on the EC2 VM have been fully implemented, tested, and verified working by the user after a reboot. The agent sent an  tool request to get 5 specific clarification answers about how the Master Excel sheet should behave and map to DB collections.
+    - Status: USER VERIFICATION PENDING (Waiting for user response to the questionnaire).
+    - Agent Testing Done: Y (Verified via  static review and curl).
+    - Which testing method agent to use?: NA (For requirements gathering).
+    - User Testing Done: Y (User tested VM reboot and confirmed services auto-started successfully).
+
+**All Pending/In progress Issue list**:
+  Issue 1: 🟡  and  traces at the end of  execution (P2)
+     - Next debug checklist: Add an asyncio exception filter or  block to suppress Playwright async exceptions upon browser cleanup. (User has ignored this for now).
+     - Status: NOT STARTED
+     - Is recurring issue?: Y
+     - Should Test frontend/backend/both after fix?: NA
+
+  Issue 2: 🟡 Windows scraper () hangs on CDP connect and pagination (P2)
+     - Attempted fixes: Proposed adding explicit timeouts and bounded limits in a past session.
+     - Next debug checklist: The user previously requested to let it be like this for now. DO NOT act on this unless explicitly brought up by the user.
+     - Status: BLOCKED (Paused per user request)
+
+**In progress Task List**:
+  Task 1: Master Excel Upload feature (P0)
+     - Where to resume: Read user's incoming response about the Excel sheet structure. Build an upload endpoint and parser to seed SKU mapping data/master data.
+     - What will be achieved with this?: Single source of truth upload for the system to reference for missing SKUs and other features.
+     - Status: NOT STARTED
+     - Should Test frontend/backend/both after fix?: Both
+     - Blocked on something: Waiting for user requirements/clarification.
+
+**Upcoming and Future Tasks**:
+    Upcoming Tasks:
+    - Refactor : Break down the massive 3000+ line file into  (e.g. , , ). **(P0 - CRITICAL as file size is heavily impacting context/linting)**
+    - Dashboard enhancement: Export to Excel button on SKU Analysis view. (P1)
+    - Add Inventory Loss column to SKU Analysis (units_returned × cost_price) to track margin leakage (P1 - suggested by agent)
+    - GST/Tax fetch enhancement: Re-run from yesterday manual button. (P1)
+    - Worker heartbeat (laptop/EC2 online indicator). (P2)
+    Future Tasks:
+    - Pagination for Jobs and Products. (P2)
+    - Compare vs 7 days ago card flagging products whose avg rating moved by ≥0.20 overnight. (P2)
+    - Resend Email integration to auto-email the CA the 7-day signed links for GST/Tax docs. (P2)
+
+**Completed work in this session**:
+- Fixed SKU Analysis Math Logic: Removed RTO orders from  and  formulas. Changed  to exclusively sum  for  orders (preventing double-counting). (DONE)
+- Applied updated return/loss formulas to P&L Dashboard logic. (DONE)
+- Fixed UI Bug: Label Download Run History account filter not working. (DONE)
+- Fixed UI Bug: SKU Costs account filter and Missing Articles tab sync not working. (DONE)
+- Fixed UI Bug: P&L Dashboard date filter not showing calendar icon (added dark mode color-scheme css). (DONE)
+- Created  and updated  with  to ensure persistent Chrome CDP instances launch automatically on EC2 reboot and stay detached. (DONE)
+- Updated EC2 deployment  and scripts to use  instead of hardcoded external IPs. (DONE)
+
+**Earlier issues found/mentioned but not fixed**:
+   - Issue 1:  traces showing up in worker logs because async Playwright cleanup happens after Chrome closes.
+   - Debug checklist: Wrap cleanup logic in  and  with .
+   - Why to solve this issue and what will be achieved with this?: Reduces log noise and prevents fake crash alerts.
+   - Should Test frontend/backend/both after fix: Backend
+   - Is recurring issue?: Y
+
+**Known issue recurrence from previous fork**:
+  - Issue recurrence in previous fork: 
+  - Recurrence count: 1
+  - Status: NOT STARTED
+
+**Code Architecture**:
+
+
+**Key Technical Concepts**:
+React, Tailwind CSS, FastAPI, Motor (Async MongoDB), pandas, Playwright (CDP attach flow via ), systemd (oneshot/KillMode process management), Xvfb.
+
+**key DB schema**:
+  - :  (systemd launches Chrome dynamically based on )
+  - : 
+  - :  
+  - : 
+
+**changes in tech stack**:
+- Added formal systemd multi-service orchestration ( -> ).
+
+**All files of reference**:
+1. : Math formulas updated for  and dashboard.
+2. : Added  styles.
+3. : Fixed dropdown filtering.
+4.  & : Fixed dropdown filtering.
+5. : Updated for  detachment.
+6. : Newly created.
+7. : Dependency updated.
+
+**Areas that need refactoring**:
+-  is ~3000 lines. The agent MUST prioritize breaking this down into an  structure (e.g. , ) to avoid context limits and linting failures as new features like Excel Upload are added.
+
+**key api endpoints**:
+- : Aggregated P&L numbers. Returns correct RTO vs Returned calculations now.
+- : Top level P&L analytics. 
+
+**Critical Info for New Agent**:
+- **Deployment Mechanics:** The user operates on an EC2 instance directly. Backend and DB live on the same machine. IPs were recently updated from  to  locally. **NOTE:** Because the preview environment cannot access the user's remote EC2 MongoDB,  E2E checks might fail with  or . Validate math via bash  with python scripts inside your environment instead.
+- **Xvfb & Chrome:** The persistent Chrome processes rely on  (Xvfb) on the EC2 to run headed without a physical monitor. Do not remove this env variable from the systemd script.
+
+**documents and test reports created in this job**:
+  - 
+
+**Last 10 User Messages and any pending HUMAN messages**:
+- *User:* Uploaded screenshot of SKU Analysis, asked how values are calculated.
+- *Agent:* Detailed mathematical breakdown of how counters, money columns, and the Risky classifier logic works. Walked through data for SKU .
+- *User:* Stated the NSA calculation of ₹3,859.64 for loss was wrong, asked for raw data.
+- *Agent:* Pulled raw DB data. Showed that 20 RETURNED orders had duplicated charge fields, and 43 RTOs had zero fields, leading to double counting.
+- *User:* Provided explicit new formulas:  must only count  status (not ).  must only sum  for . Highlighted 3 UI filter/calendar bugs.
+- *Agent:* Applied backend math updates, fixed 3 UI bugs, verified logic via bash script against DB, and provided deployment summary.
+- *User:* Stated they restarted their VM, but had to manually start everything. Requested auto-start on reboot. Also requested a Master Excel Upload feature.
+- *Agent:* Fixed EC2 systemd configuration (, ). Tested configuration logic. Noticed MongoDB IP mismatch and fixed  configurations. Sent final setup instructions.
+- *User:* Confirmed they applied instructions, rebooted VM, and services successfully auto-started.
+- *Agent:* Confirmed completion. Fired  to get clarification on the new Master Excel Upload feature.
+- *Pending Human Message:* Waiting for user to provide the rules/structure for the Master Excel Upload sheet.
+
+**Project Health Check:**
+- Broken: None.
+- Mocked: None.
+
+**3rd Party Integrations**:
+- Playwright (Web Scraping via CDP Attach on ports 9222/9223)
+- Motor (MongoDB)
+
+**Testing status**:
+  - Testing agent used after significant changes: YES (E2E failed due to IP constraints on Preview, but static code checks passed).
+  - Troubleshoot agent used after agent stuck in loop: NO
+  - Test files created: []
+  - Known regressions: None
+
+**Credentials to test flow**:
+ /  (Listed in )
+
+**What agent forgot to execute**:
+The agent has repeatedly deferred the  refactoring (P0) due to continuous high-priority feature requests from the user. It must be addressed before the file becomes completely unmanageable.
+
+**Debugging checklist for current issue**
+    Task: Excel Master Upload feature
+    Files to check:  (or new router file if refactored) to create , parsing logic using .
+    Database to check:  and  collections.</analysis>
