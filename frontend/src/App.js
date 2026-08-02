@@ -13,13 +13,14 @@ import ProductsPage from "@/pages/ProductsPage";
 import ProductDetailPage from "@/pages/ProductDetailPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import LabelsPage from "@/pages/LabelsPage";
+import PDFSorterPage from "@/pages/PDFSorterPage";
 import AccountsPage from "@/pages/AccountsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import PLLayout from "@/pages/pl/PLLayout";
 import PLDashboard from "@/pages/pl/PLDashboard";
 import PLOrders from "@/pages/pl/PLOrders";
 import PLSKUAnalysis from "@/pages/pl/PLSKUAnalysis";
-import PLSKUCosts from "@/pages/pl/PLSKUCosts";
+import PLProductMaster from "@/pages/pl/PLProductMaster";
 import PLExchangeAnalysis from "@/pages/pl/PLExchangeAnalysis";
 import PLAdOrdersAnalysis from "@/pages/pl/PLAdOrdersAnalysis";
 import PLUploads from "@/pages/pl/PLUploads";
@@ -46,6 +47,7 @@ function App() {
               <Route path="/products/:productId" element={<ProductDetailPage />} />
               <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="/labels" element={<LabelsPage />} />
+              <Route path="/pdf-sorter" element={<PDFSorterPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/pl" element={<PLLayout />}>
@@ -53,7 +55,8 @@ function App() {
                 <Route path="dashboard" element={<PLDashboard />} />
                 <Route path="orders" element={<PLOrders />} />
                 <Route path="sku-analysis" element={<PLSKUAnalysis />} />
-                <Route path="sku-costs" element={<PLSKUCosts />} />
+                <Route path="product-master" element={<PLProductMaster />} />
+                <Route path="sku-costs" element={<PLProductMaster />} />
                 <Route path="exchange" element={<PLExchangeAnalysis />} />
                 <Route path="ad-orders" element={<PLAdOrdersAnalysis />} />
                 <Route path="uploads" element={<PLUploads />} />

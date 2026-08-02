@@ -11,7 +11,7 @@ const SUB = [
   { to: "/pl/sku-analysis", label: "SKU Analysis", testid: "pl-nav-sku-analysis" },
   { to: "/pl/exchange", label: "Exchange", testid: "pl-nav-exchange" },
   { to: "/pl/ad-orders", label: "Ad Orders", testid: "pl-nav-ad-orders" },
-  { to: "/pl/sku-costs", label: "SKU Costs", testid: "pl-nav-sku-costs" },
+  { to: "/pl/product-master", label: "Product Master", testid: "pl-nav-product-master" },
   { to: "/pl/uploads", label: "Uploads", testid: "pl-nav-uploads" },
   { to: "/pl/tax-docs", label: "GST & Tax Docs", testid: "pl-nav-tax-docs" },
 ];
@@ -41,11 +41,11 @@ export default function PLLayout() {
   return (
     <PLContext.Provider value={{ accounts, accountId, setAccountId, dateRange, setDateRange, reloadAccounts: loadAccounts }}>
       <div data-testid="pl-layout">
-        <div className="border-b border-[#2A2A2A] px-8 py-5">
+        <div className="border-b border-[var(--border)] px-8 py-5">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <div className="section-label mb-1">/ profit &amp; loss</div>
-              <h1 className="font-display text-3xl font-semibold tracking-tight text-white">
+              <h1 className="font-display text-3xl font-semibold tracking-tight text-[var(--text-primary)]">
                 P&amp;L Analyzer
               </h1>
             </div>
@@ -73,8 +73,8 @@ export default function PLLayout() {
                 className={({ isActive }) =>
                   "px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider border-b-2 transition-colors " +
                   (isActive
-                    ? "border-[#007AFF] text-white"
-                    : "border-transparent text-[#71717A] hover:text-[#A1A1AA]")
+                    ? "border-[var(--accent)] text-[var(--text-primary)]"
+                    : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]")
                 }
               >
                 {s.label}

@@ -1,0 +1,284 @@
+"""PDF Sorter service.
+
+Ported (and cleaned) from kommyfashions/print. Bug fixes applied:
+ - Order-No extraction + dedupe within a single run
+ - Missing `import json` fixed (uses this module's own persistence)
+ - No import-time Excel reads — SKU normalisation + courier rules read from
+   MongoDB (`sku_normalization`, `courier_rules` collections)
+ - Atomic writes: runs are self-contained; no global JSON state files
+ - Per-account attribution
+ - Warns when order is CANCELLED / RTO in `pl_orders` (surfaced via response)
+
+Storage layout:
+  /app/backend/pdf_sorter/uploads/<run_id>/*.pdf   # inbound
+  /app/backend/pdf_sorter/outputs/<run_id>/*.pdf   # results
+"""
+from __future__ import annotations
+
+import copy
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import pdfplumber
+from pypdf import PdfReader, PdfWriter
+
+# ---- Config (kept in-service; no external env deps) -----------------------
+BASE = Path("/app/backend/pdf_sorter")
+UPLOAD_DIR = BASE / "uploads"
+OUTPUT_DIR = BASE / "outputs"
+TIER1_MIN_PAGES = 10
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class PageMeta:
+    reader_idx: int
+    page_idx: int
+    size: str
+    sku_raw: str
+    sku_norm: str
+    courier: str
+    order_no: Optional[str]
+    file_name: str
+
+
+@dataclass
+class RunResult:
+    run_id: str
+    total_pages: int
+    unique_orders: int
+    duplicates_skipped: int
+    unknown_sku: int
+    unknown_courier: int
+    sku_totals: Dict[str, int] = field(default_factory=dict)
+    courier_totals: Dict[str, int] = field(default_factory=dict)
+    size_totals: Dict[str, int] = field(default_factory=dict)
+    warnings: List[Dict[str, Any]] = field(default_factory=list)
+    files: List[str] = field(default_factory=list)
+
+
+# ---- Regex helpers ---------------------------------------------------------
+SKU_LINE_RE = re.compile(r"SKU Size Qty Color Order No\.?\s+(?P<rest>.+)",
+                          re.IGNORECASE)
+# Order number appears after color column; Meesho order numbers are alnum ~15+ chars
+ORDER_NO_RE = re.compile(r"\b(\d{8,20}[_-]?\d{0,20})\b")
+SIZE_TOKENS = ["XXS", "XS", "SM", "MD", "LG", "XL", "XXL", "3XL", "4XL", "5XL",
+                "S", "M", "L"]
+
+
+def _extract_size(rest: str) -> str:
+    """Grab size token after SKU (best-effort)."""
+    parts = rest.split()
+    if len(parts) < 2:
+        return ""
+    # Numeric size (IND-3, 32, 42.5)
+    tok = parts[1]
+    if any(c.isdigit() for c in tok):
+        return tok
+    if tok.upper() in SIZE_TOKENS:
+        return tok
+    return tok
+
+
+def _size_sort_key(size: str) -> Tuple[int, float, str]:
+    nums = re.findall(r"\d+\.?\d*", size or "")
+    if nums:
+        return (0, float(nums[0]), size or "")
+    return (1, 999.0, size or "")
+
+
+# ---- Config loaders (Mongo-backed) ---------------------------------------
+async def load_sku_normalisation(db) -> Dict[str, str]:
+    """raw_sku -> normalized_sku. Reads from `sku_normalization` collection."""
+    out: Dict[str, str] = {}
+    async for m in db.sku_normalization.find({}, {"_id": 0}):
+        raw = str(m.get("raw_sku") or "").strip()
+        norm = str(m.get("normalized_sku") or "").strip()
+        if raw and norm:
+            out[raw] = norm
+    return out
+
+
+async def load_courier_rules(db) -> List[Tuple[str, re.Pattern]]:
+    """[(courier_name, compiled_regex), ...]"""
+    rules: List[Tuple[str, re.Pattern]] = []
+    async for m in db.courier_rules.find({}, {"_id": 0}):
+        name = str(m.get("courier_name") or "").strip()
+        pattern = str(m.get("match_text") or "").strip()
+        if not name or not pattern:
+            continue
+        rules.append((name, re.compile(re.escape(pattern), re.IGNORECASE)))
+    return rules
+
+
+def _extract_courier(label_text: str, rules) -> str:
+    for name, rgx in rules:
+        if rgx.search(label_text):
+            return name
+    return "UNKNOWN"
+
+
+# ---- Core processor -------------------------------------------------------
+async def process_pdfs(
+    db,
+    pdf_paths: List[Path],
+    account_id: Optional[str] = None,
+    actor_email: str = "upload",
+) -> RunResult:
+    sku_map = await load_sku_normalisation(db)
+    courier_rules = await load_courier_rules(db)
+
+    readers: List[PdfReader] = []
+    pages: List[PageMeta] = []
+    seen_orders: set = set()
+    duplicates_skipped = 0
+    unknown_sku = 0
+    unknown_courier = 0
+
+    for idx, pdf_path in enumerate(pdf_paths):
+        readers.append(PdfReader(str(pdf_path)))
+        with pdfplumber.open(pdf_path) as pdf:
+            for p_idx, page in enumerate(pdf.pages):
+                text = (page.extract_text() or "").replace("\n", " ")
+                if "Product Details" not in text:
+                    continue
+                m = SKU_LINE_RE.search(text)
+                if not m:
+                    continue
+                rest = m.group("rest")
+                parts = rest.split()
+                sku_raw = parts[0] if parts else ""
+                sku_norm = sku_map.get(sku_raw, sku_raw)
+                size = _extract_size(rest)
+                order_no_m = ORDER_NO_RE.search(rest)
+                order_no = order_no_m.group(1) if order_no_m else None
+                courier = _extract_courier(text, courier_rules)
+                if not sku_raw:
+                    continue
+                if sku_raw == sku_norm and sku_raw not in sku_map:
+                    unknown_sku += 1
+                if courier == "UNKNOWN":
+                    unknown_courier += 1
+                if order_no and order_no in seen_orders:
+                    duplicates_skipped += 1
+                    continue
+                if order_no:
+                    seen_orders.add(order_no)
+                pages.append(PageMeta(
+                    reader_idx=idx, page_idx=p_idx, size=size,
+                    sku_raw=sku_raw, sku_norm=sku_norm,
+                    courier=courier, order_no=order_no,
+                    file_name=pdf_path.name,
+                ))
+
+    # Cross-check against pl_orders — RTO / CANCELLED warnings
+    warnings: List[Dict[str, Any]] = []
+    if pages and account_id:
+        order_nos = [p.order_no for p in pages if p.order_no]
+        if order_nos:
+            async for o in db.pl_orders.find({
+                "account_id": account_id,
+                "sub_order_no": {"$in": order_nos},
+                "order_status": {"$in": ["CANCELLED", "RTO"]},
+            }, {"_id": 0, "sub_order_no": 1, "order_status": 1}):
+                warnings.append({
+                    "order_no": o.get("sub_order_no"),
+                    "status": o.get("order_status"),
+                })
+
+    # Group by normalized SKU
+    by_sku: Dict[str, List[PageMeta]] = defaultdict(list)
+    for pg in pages:
+        by_sku[pg.sku_norm].append(pg)
+
+    tier1 = {k: v for k, v in by_sku.items() if len(v) >= TIER1_MIN_PAGES}
+    tier2 = {k: v for k, v in by_sku.items() if len(v) < TIER1_MIN_PAGES}
+    tier1_sorted = sorted(tier1.keys(), key=lambda k: -len(tier1[k]))
+    tier2_sorted = sorted(tier2.keys())
+
+    run_id = "RUN_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = OUTPUT_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    master = PdfWriter()
+    t1 = PdfWriter()
+    t2 = PdfWriter()
+
+    for sku in tier1_sorted:
+        group = sorted(tier1[sku],
+                       key=lambda x: _size_sort_key(x.size))
+        for i, pg in enumerate(group):
+            original = readers[pg.reader_idx].pages[pg.page_idx]
+            page1 = copy.copy(original)
+            page2 = copy.copy(original)
+            if i == len(group) - 1:  # flip last page as separator
+                page1.rotate(180)
+                page2.rotate(180)
+            master.add_page(page1)
+            t1.add_page(page2)
+
+    for sku in tier2_sorted:
+        group = sorted(tier2[sku],
+                       key=lambda x: _size_sort_key(x.size))
+        for pg in group:
+            original = readers[pg.reader_idx].pages[pg.page_idx]
+            master.add_page(copy.copy(original))
+            t2.add_page(copy.copy(original))
+
+    files = []
+    for fname, writer in [("MASTER_PRINT.pdf", master),
+                           ("TIER1_HIGH_VOLUME.pdf", t1),
+                           ("TIER2_LOW_VOLUME.pdf", t2)]:
+        with (run_dir / fname).open("wb") as fh:
+            writer.write(fh)
+        files.append(fname)
+
+    # Stats
+    sku_totals: Dict[str, int] = defaultdict(int)
+    courier_totals: Dict[str, int] = defaultdict(int)
+    size_totals: Dict[str, int] = defaultdict(int)
+    for pg in pages:
+        sku_totals[pg.sku_norm] += 1
+        courier_totals[pg.courier] += 1
+        if pg.size:
+            size_totals[pg.size] += 1
+
+    result = RunResult(
+        run_id=run_id,
+        total_pages=len(pages),
+        unique_orders=len(seen_orders),
+        duplicates_skipped=duplicates_skipped,
+        unknown_sku=unknown_sku,
+        unknown_courier=unknown_courier,
+        sku_totals=dict(sku_totals),
+        courier_totals=dict(courier_totals),
+        size_totals=dict(size_totals),
+        warnings=warnings,
+        files=files,
+    )
+
+    # Persist run metadata for history views
+    await db.pdf_sorter_runs.insert_one({
+        "run_id": run_id,
+        "account_id": account_id,
+        "created_at": datetime.now(timezone.utc),
+        "created_by": actor_email,
+        "total_pages": result.total_pages,
+        "unique_orders": result.unique_orders,
+        "duplicates_skipped": result.duplicates_skipped,
+        "unknown_sku": result.unknown_sku,
+        "unknown_courier": result.unknown_courier,
+        "sku_totals": result.sku_totals,
+        "courier_totals": result.courier_totals,
+        "size_totals": result.size_totals,
+        "warnings": result.warnings,
+        "files": result.files,
+    })
+
+    return result

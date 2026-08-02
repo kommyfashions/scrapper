@@ -25,6 +25,10 @@ from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from routers import product_master as pm_router
+from routers import pdf_sorter as ps_router
+from services import product_master as pm_service
+
 # --------------------------------------------------------------------------------------
 # Config / DB
 # --------------------------------------------------------------------------------------
@@ -490,6 +494,25 @@ async def startup():
             [("account_id", 1), ("sku", 1)], unique=True
         )
         await db.article_sku_map.create_index("article_id")
+        # Product Master (single source of truth) — pm_* namespace to avoid
+        # colliding with the Meesho scraper's `products` collection.
+        await db.pm_products.create_index(
+            [("account_id", 1), ("main_category", 1), ("color", 1)],
+            unique=True, name="pm_business_key",
+        )
+        await db.pm_products.create_index("main_category")
+        await db.pm_products.create_index("color")
+        await db.pm_products.create_index("updated_at")
+        await db.pm_skus.create_index(
+            [("account_id", 1), ("sku", 1)], unique=True,
+            name="pm_sku_unique",
+        )
+        await db.pm_skus.create_index("product_id")
+        await db.pm_sizes.create_index("product_id")
+        # PDF Sorter
+        await db.sku_normalization.create_index("raw_sku", unique=True)
+        await db.courier_rules.create_index("courier_name", unique=True)
+        await db.pdf_sorter_runs.create_index([("created_at", -1)])
         # GST reports + Tax invoices
         await db.pl_gst_reports.create_index(
             [("account_id", 1), ("year", 1), ("month", 1)]
@@ -1189,10 +1212,13 @@ def _pl_lookup_cost(costs: dict, account_id, sku) -> float:
 
 
 async def _pl_load_costs(_unused_q: dict = None) -> dict:
-    """Build a (account_id, sku) -> default_cost_price dict by joining
-    article_sku_map with articles. `_unused_q` accepted for call-site
-    compatibility with the legacy sku-costs filter."""
-    # Pre-fetch all articles once (expect O(100s), fits in memory).
+    """Build a (account_id, sku) -> cost_price dict from the Product Master.
+    Falls back to legacy article_sku_map only if Product Master is empty
+    (transition safety). `_unused_q` accepted for call-site compat."""
+    pm_count = await db.pm_products.estimated_document_count()
+    if pm_count > 0:
+        return await pm_service.load_cost_map(db)
+    # Legacy fallback (pre-migration)
     articles = {}
     async for a in db.articles.find({}, {"_id": 1, "default_cost_price": 1}):
         articles[a["_id"]] = float(a.get("default_cost_price") or 0)
@@ -1689,8 +1715,18 @@ async def pl_dashboard(
 
 # ---------- Orders ----------
 async def _pl_load_sku_article_labels() -> dict:
-    """Build (account_id, sku) -> article_name for display enrichment.
-    Call once per request, apply to many rows."""
+    """Build (account_id, sku) -> label (Category/Color) for display enrichment.
+    Reads from Product Master if seeded; falls back to legacy article names."""
+    pm_count = await db.pm_products.estimated_document_count()
+    if pm_count > 0:
+        lbls = await pm_service.load_product_label_map(db)
+        # keep the same API shape (string label); combine cat + color
+        return {
+            (_pl_norm_acc(a), s): f"{v.get('main_category') or ''} / "
+                                  f"{v.get('color') or ''}".strip(" /")
+            for (a, s), v in lbls.items()
+        }
+    # legacy
     names = {}
     async for a in db.articles.find({}, {"_id": 1, "name": 1}):
         names[a["_id"]] = a.get("name")
@@ -1946,6 +1982,258 @@ async def pl_sku_analysis(
         for c in children:
             out.append({**c, "is_child": True, "parent_article": header["article_name"]})
     return {"items": out, "group_by": "article"}
+
+
+# ---------- SKU Analysis (Product-first tree) ----------
+@api.get("/pl/sku-analysis-tree")
+async def pl_sku_analysis_tree(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    q: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Product-first hierarchical view backed by Product Master.
+
+    Shape:
+      main_category → color → account → skus[] → metrics
+    Existing math (RR, profit, loss, contribution, classification) is
+    preserved verbatim. Products with NO mapped SKUs are still emitted so the
+    user can see 'No SKU Assigned' and complete mapping.
+    """
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+
+    base_q = _pl_date_query(account_id, start_date, end_date,
+                            {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
+    orders = await db.pl_orders.find(base_q, {"_id": 0}).to_list(None)
+    costs = await _pl_load_costs()
+
+    # Load all products (+skus, +sizes) — respect account filter
+    prod_q: Dict[str, Any] = {}
+    if account_id and account_id != "all":
+        prod_q["account_id"] = account_id
+    products = [p async for p in db.pm_products.find(prod_q)]
+    await pm_service.bulk_hydrate_products(db, products)
+
+    # index: (account_id, sku) -> product_id  (from PM)
+    sku_to_product: Dict[tuple, Any] = {}
+    for p in products:
+        for s in p.get("skus", []):
+            sku_to_product[(p["account_id"], s)] = p["_id"]
+
+    # Aggregate order metrics per (account_id, sku)
+    cells: Dict[tuple, dict] = {}
+    for o in orders:
+        s = o.get("sku")
+        acc = _pl_norm_acc(o.get("account_id"))
+        if not s or not acc:
+            continue
+        key = (acc, s)
+        if key not in cells:
+            cells[key] = {
+                "account_id": acc, "sku": s,
+                "product_name": o.get("product_name", ""),
+                "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
+                "exposure_units": 0, "profit": 0.0, "loss": 0.0,
+                "ship_out": 0.0, "ship_return": 0.0,
+            }
+        d = cells[key]
+        d["units_ordered"] += 1
+        if o["order_status"] == "DELIVERED":
+            d["units_delivered"] += 1
+            d["ship_out"] += o.get("shipping_charge") or 0
+            if o["payment_status"] == "PAID":
+                cost = _pl_lookup_cost(costs, acc, s)
+                d["profit"] += o["net_settlement_amount"] - cost
+        if o["order_status"] == "RETURNED":
+            d["units_returned"] += 1
+            d["ship_return"] += o.get("return_shipping_charge") or 0
+            d["loss"] += (o.get("return_shipping_charge") or 0) - (o.get("compensation_amount") or 0)
+        if o["order_status"] == "SHIPPED":
+            d["exposure_units"] += 1
+
+    def _classify(rr, contrib):
+        if contrib > 0 and rr < 20:
+            return "Winner"
+        if rr > 40 or contrib < 0:
+            return "Loser"
+        return "Risky"
+
+    def _sku_row(d):
+        ordered = d["units_ordered"]
+        rr = (d["units_returned"] / ordered * 100) if ordered else 0
+        ppu = d["profit"] / d["units_delivered"] if d["units_delivered"] else 0
+        contrib = d["profit"] - d["loss"]
+        return {
+            "sku": d["sku"], "product_name": d["product_name"],
+            "units_ordered": ordered,
+            "units_delivered": d["units_delivered"],
+            "units_returned": d["units_returned"],
+            "return_rate": round(rr, 2),
+            "ship_out": round(d["ship_out"], 2),
+            "ship_return": round(d["ship_return"], 2),
+            "net_realized_profit": round(d["profit"], 2),
+            "total_return_loss": round(d["loss"], 2),
+            "net_sku_contribution": round(contrib, 2),
+            "exposure_units": d["exposure_units"],
+            "profit_per_delivered_unit": round(ppu, 2),
+            "classification": _classify(rr, contrib),
+        }
+
+    def _aggregate(rows: List[dict]) -> dict:
+        agg = {"units_ordered": 0, "units_delivered": 0, "units_returned": 0,
+               "exposure_units": 0, "ship_out": 0.0, "ship_return": 0.0,
+               "net_realized_profit": 0.0, "total_return_loss": 0.0,
+               "net_sku_contribution": 0.0}
+        for r in rows:
+            for k in agg:
+                agg[k] += r.get(k, 0)
+        ordered = agg["units_ordered"]
+        agg["return_rate"] = round((agg["units_returned"] / ordered * 100) if ordered else 0, 2)
+        agg["profit_per_delivered_unit"] = round(
+            (agg["net_realized_profit"] / agg["units_delivered"]) if agg["units_delivered"] else 0, 2)
+        agg["classification"] = _classify(agg["return_rate"], agg["net_sku_contribution"])
+        for k in ("ship_out", "ship_return", "net_realized_profit",
+                  "total_return_loss", "net_sku_contribution"):
+            agg[k] = round(agg[k], 2)
+        return agg
+
+    # Account lookup
+    acc_lookup: Dict[str, dict] = {}
+    async for a in db.accounts.find({}):
+        acc_lookup[str(a["_id"])] = {"name": a.get("name"),
+                                     "alias": a.get("alias")}
+
+    # Build tree: main_category -> color -> account -> sku_rows[]
+    tree: Dict[str, Dict[str, Dict[str, dict]]] = {}
+    used_cells: set = set()
+
+    for p in products:
+        cat = p.get("main_category") or "Uncategorized"
+        color = p.get("color") or "-"
+        aid = p["account_id"]
+        node = (tree.setdefault(cat, {})
+                    .setdefault(color, {})
+                    .setdefault(aid, {"account_id": aid,
+                                       "account_name": acc_lookup.get(aid, {}).get("name"),
+                                       "account_alias": acc_lookup.get(aid, {}).get("alias"),
+                                       "product_id": str(p["_id"]),
+                                       "cost_price": float(p.get("cost_price") or 0),
+                                       "sizes": p.get("sizes", []),
+                                       "sku_rows": [], "no_skus": False}))
+        if not p.get("skus"):
+            node["no_skus"] = True
+            continue
+        for s in p["skus"]:
+            cell = cells.get((aid, s))
+            if cell is None:
+                # SKU is mapped in PM but has no orders in the window
+                node["sku_rows"].append({
+                    "sku": s, "product_name": "",
+                    "units_ordered": 0, "units_delivered": 0,
+                    "units_returned": 0, "return_rate": 0,
+                    "ship_out": 0, "ship_return": 0,
+                    "net_realized_profit": 0, "total_return_loss": 0,
+                    "net_sku_contribution": 0, "exposure_units": 0,
+                    "profit_per_delivered_unit": 0,
+                    "classification": "No Data",
+                })
+            else:
+                node["sku_rows"].append(_sku_row(cell))
+            used_cells.add((aid, s))
+
+    # SKUs seen in orders but NOT in Product Master → surface under a
+    # synthetic "Unmapped" category so nothing is lost.
+    for key, d in cells.items():
+        if key in used_cells:
+            continue
+        aid, sku = key
+        node = (tree.setdefault("Unmapped", {})
+                    .setdefault("-", {})
+                    .setdefault(aid, {"account_id": aid,
+                                       "account_name": acc_lookup.get(aid, {}).get("name"),
+                                       "account_alias": acc_lookup.get(aid, {}).get("alias"),
+                                       "product_id": None,
+                                       "cost_price": 0.0,
+                                       "sizes": [],
+                                       "sku_rows": [], "no_skus": False,
+                                       "is_unmapped": True}))
+        node["sku_rows"].append(_sku_row(d))
+
+    # Server-side text filter (SKU / category / color / account / product name)
+    if q:
+        needle = q.strip().lower()
+
+        def _row_matches(row):
+            return needle in " ".join([
+                str(row.get("sku") or ""),
+                str(row.get("product_name") or ""),
+            ]).lower()
+
+        pruned: Dict[str, Any] = {}
+        for cat, colors in tree.items():
+            for color, accs in colors.items():
+                for aid, acc_node in accs.items():
+                    account_hit = (
+                        needle in (acc_node.get("account_name") or "").lower()
+                        or needle in (acc_node.get("account_alias") or "").lower()
+                    )
+                    hit_rows = [r for r in acc_node["sku_rows"]
+                                if _row_matches(r)]
+                    cat_hit = needle in cat.lower()
+                    color_hit = needle in color.lower()
+                    if account_hit or cat_hit or color_hit:
+                        # keep full account_node
+                        pruned.setdefault(cat, {}).setdefault(color, {})[aid] = acc_node
+                    elif hit_rows:
+                        clone = {**acc_node, "sku_rows": hit_rows}
+                        pruned.setdefault(cat, {}).setdefault(color, {})[aid] = clone
+        tree = pruned
+
+    # Serialize into nested lists with aggregates at each level
+    out_categories = []
+    for cat, colors in sorted(tree.items()):
+        cat_all_rows: List[dict] = []
+        color_nodes = []
+        for color, accs in sorted(colors.items()):
+            color_all_rows: List[dict] = []
+            acc_nodes = []
+            for aid, acc_node in sorted(accs.items(),
+                                        key=lambda kv: (kv[1].get("account_name") or "")):
+                acc_all = acc_node["sku_rows"]
+                acc_agg = _aggregate(acc_all) if acc_all else {}
+                acc_nodes.append({
+                    "account_id": acc_node["account_id"],
+                    "account_name": acc_node.get("account_name"),
+                    "account_alias": acc_node.get("account_alias"),
+                    "product_id": acc_node.get("product_id"),
+                    "cost_price": acc_node.get("cost_price", 0),
+                    "sizes": acc_node.get("sizes", []),
+                    "no_skus": acc_node.get("no_skus", False),
+                    "is_unmapped": acc_node.get("is_unmapped", False),
+                    "skus": acc_all,
+                    "aggregate": acc_agg,
+                })
+                color_all_rows.extend(acc_all)
+            color_agg = _aggregate(color_all_rows) if color_all_rows else {}
+            color_nodes.append({
+                "color": color,
+                "accounts": acc_nodes,
+                "aggregate": color_agg,
+            })
+            cat_all_rows.extend(color_all_rows)
+        cat_agg = _aggregate(cat_all_rows) if cat_all_rows else {}
+        out_categories.append({
+            "main_category": cat,
+            "colors": color_nodes,
+            "aggregate": cat_agg,
+        })
+
+    return {"categories": out_categories,
+            "group_by": "product-tree"}
+
+
 # ---------- Exchange Analysis ----------
 @api.get("/pl/exchange-analysis")
 async def pl_exchange_analysis(
@@ -2318,7 +2606,7 @@ async def pl_articles_delete(article_id: str, user: dict = Depends(get_current_u
 @api.get("/pl/articles/missing-skus")
 async def pl_articles_missing_skus(account_id: Optional[str] = None,
                                    user: dict = Depends(get_current_user)):
-    """Every SKU seen in orders that doesn't yet have any article mapping,
+    """Every SKU seen in orders that isn't yet mapped in Product Master,
     grouped by account for one-click mapping."""
     if account_id and account_id != "all":
         await pl_resolve_account_filter(account_id)
@@ -2340,10 +2628,15 @@ async def pl_articles_missing_skus(account_id: Optional[str] = None,
             "orders": row["orders"],
             "last_seen": row.get("last_seen"),
         })
-    # filter out already-mapped
+    # Build mapped set from Product Master (fallback to legacy).
     mapped_pairs = set()
-    async for m in db.article_sku_map.find({}, {"_id": 0, "account_id": 1, "sku": 1}):
-        mapped_pairs.add((m.get("account_id"), m.get("sku")))
+    pm_count = await db.pm_products.estimated_document_count()
+    if pm_count > 0:
+        async for m in db.pm_skus.find({}, {"_id": 0, "account_id": 1, "sku": 1}):
+            mapped_pairs.add((m.get("account_id"), m.get("sku")))
+    else:
+        async for m in db.article_sku_map.find({}, {"_id": 0, "account_id": 1, "sku": 1}):
+            mapped_pairs.add((m.get("account_id"), m.get("sku")))
     missing = [s for s in seen if (s["account_id"], s["sku"]) not in mapped_pairs]
     # enrich with account_name / alias
     acc_ids = {s["account_id"] for s in missing if s["account_id"]}
@@ -2878,14 +3171,21 @@ async def health():
 
 app.include_router(api)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"], allow_headers=["*"],
+# Product Master module
+pm_router.configure(db, get_current_user)
+app.include_router(
+    pm_router.router,
+    prefix="/api",
+    dependencies=[Depends(get_current_user)],
 )
 
-app.include_router(api)
+# PDF Sorter module
+ps_router.configure(db)
+app.include_router(
+    ps_router.router,
+    prefix="/api",
+    dependencies=[Depends(get_current_user)],
+)
 
 app.add_middleware(
     CORSMiddleware,

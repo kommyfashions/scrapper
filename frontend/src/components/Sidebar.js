@@ -35,6 +35,7 @@ const NAV_SECTIONS = [
     items: [
       { to: "/accounts", label: "Accounts", Icon: UserCircleIcon, testid: "nav-accounts" },
       { to: "/labels", label: "Label Download", Icon: PrinterIcon, testid: "nav-labels" },
+      { to: "/pdf-sorter", label: "PDF Sorter", Icon: PrinterIcon, testid: "nav-pdf-sorter" },
       { to: "/settings", label: "Settings", Icon: GearIcon, testid: "nav-settings" },
     ],
   },
@@ -44,7 +45,7 @@ const NAV_SECTIONS = [
       { to: "/pl/dashboard", label: "P&L Dashboard", Icon: CurrencyInrIcon, testid: "nav-pl-dashboard" },
       { to: "/pl/orders", label: "P&L Orders", Icon: ListChecksIcon, testid: "nav-pl-orders" },
       { to: "/pl/sku-analysis", label: "SKU Analysis", Icon: ChartBarIcon, testid: "nav-pl-sku-analysis" },
-      { to: "/pl/sku-costs", label: "SKU Costs", Icon: PackageIcon, testid: "nav-pl-sku-costs" },
+      { to: "/pl/product-master", label: "Product Master", Icon: PackageIcon, testid: "nav-pl-product-master" },
       { to: "/pl/uploads", label: "Uploads", Icon: PlusCircleIcon, testid: "nav-pl-uploads" },
     ],
   },
@@ -61,17 +62,17 @@ export default function Sidebar() {
 
   return (
     <aside
-      className="flex h-screen w-64 flex-col border-r border-[#2A2A2A] bg-[#0A0A0A]"
+      className="flex h-screen w-64 flex-col border-r border-[var(--border)] bg-[var(--bg-app)]"
       data-testid="sidebar"
     >
-      <div className="flex items-center gap-2 px-5 py-5 border-b border-[#2A2A2A]">
-        <TerminalWindowIcon size={22} weight="bold" color="#007AFF" />
+      <div className="flex items-center gap-2 px-5 py-5 border-b border-[var(--border)]">
+        <TerminalWindowIcon size={22} weight="bold" color="#10B981" />
         <div>
           <div className="font-display text-base font-semibold tracking-tight">
             Seller Central
           </div>
-          <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-[#71717A]">
-            v0.1 · meesho ops
+          <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-[var(--text-muted)]">
+            v0.2 · meesho ops
           </div>
         </div>
       </div>
@@ -105,10 +106,10 @@ export default function Sidebar() {
             {["Auto Payment Scraper", "Inventory Loss"].map((m) => (
               <div
                 key={m}
-                className="flex items-center justify-between text-xs text-[#71717A] py-1"
+                className="flex items-center justify-between text-xs text-[var(--text-muted)] py-1"
               >
                 <span>{m}</span>
-                <span className="font-mono text-[9px] tracking-widest text-[#3a3a3a]">
+                <span className="font-mono text-[9px] tracking-widest text-[var(--border)]">
                   SOON
                 </span>
               </div>
@@ -117,8 +118,8 @@ export default function Sidebar() {
         </div>
       </nav>
 
-      <div className="border-t border-[#2A2A2A] px-4 py-3">
-        <div className="text-xs text-[#A1A1AA] truncate" data-testid="sidebar-user-email">
+      <div className="border-t border-[var(--border)] px-4 py-3">
+        <div className="text-xs text-[var(--text-secondary)] truncate" data-testid="sidebar-user-email">
           {user?.email}
         </div>
         <button
