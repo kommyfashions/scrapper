@@ -215,7 +215,9 @@ async def list_products(
 
     total = await db.pm_products.count_documents(filt)
     cursor = (db.pm_products.find(filt)
-              .sort(sort_field, sort_dir)
+              # secondary sort by _id ensures deterministic pagination when
+              # multiple rows share the primary sort value.
+              .sort([(sort_field, sort_dir), ("_id", 1)])
               .skip((page - 1) * page_size)
               .limit(page_size))
     docs = [d async for d in cursor]
