@@ -35,7 +35,7 @@ const NAV_SECTIONS = [
     items: [
       { to: "/accounts", label: "Accounts", Icon: UserCircleIcon, testid: "nav-accounts" },
       { to: "/labels", label: "Label Download", Icon: PrinterIcon, testid: "nav-labels" },
-      { to: "/pdf-sorter", label: "PDF Sorter", Icon: PrinterIcon, testid: "nav-pdf-sorter" },
+      { to: "/printout-labels", label: "Printout Labels", Icon: PrinterIcon, testid: "nav-printout-labels" },
       { to: "/settings", label: "Settings", Icon: GearIcon, testid: "nav-settings" },
     ],
   },

@@ -13,7 +13,7 @@ import ProductsPage from "@/pages/ProductsPage";
 import ProductDetailPage from "@/pages/ProductDetailPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import LabelsPage from "@/pages/LabelsPage";
-import PDFSorterPage from "@/pages/PDFSorterPage";
+import PrintoutLabelsPage from "@/pages/PrintoutLabelsPage";
 import AccountsPage from "@/pages/AccountsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import PLLayout from "@/pages/pl/PLLayout";
@@ -47,7 +47,8 @@ function App() {
               <Route path="/products/:productId" element={<ProductDetailPage />} />
               <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="/labels" element={<LabelsPage />} />
-              <Route path="/pdf-sorter" element={<PDFSorterPage />} />
+              <Route path="/pdf-sorter" element={<PrintoutLabelsPage />} />
+              <Route path="/printout-labels" element={<PrintoutLabelsPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/pl" element={<PLLayout />}>

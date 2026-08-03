@@ -174,13 +174,13 @@ async def upload_courier_rules(file: UploadFile = File(...)):
 # ---------- Process ----------
 @router.post("/process")
 async def process(
-    account_id: Optional[str] = Query(None),
     files: List[UploadFile] = File(...),
 ):
+    """Sort PDFs by SKU using the Product Master. Upload PDFs from any/multi
+    accounts in one batch — SKU matching is what groups them."""
     db = get_db()
     if not files:
         raise HTTPException(status_code=400, detail="no files uploaded")
-    # Stash uploads under a fresh dir keyed by timestamp
     stamp = "IN_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     in_dir = UPLOAD_DIR / stamp
     in_dir.mkdir(parents=True, exist_ok=True)
@@ -194,12 +194,8 @@ async def process(
         paths.append(target)
     if not paths:
         raise HTTPException(status_code=400, detail="no valid PDF files")
-    try:
-        result = await process_pdfs(db, paths, account_id=account_id,
-                                     actor_email="dashboard")
-    finally:
-        # keep input pdfs for a while for debugging; caller need not see them
-        pass
+    result = await process_pdfs(db, paths, account_id=None,
+                                 actor_email="dashboard")
     return {
         "run_id": result.run_id,
         "total_pages": result.total_pages,
@@ -212,6 +208,78 @@ async def process(
         "size_totals": result.size_totals,
         "warnings": result.warnings,
         "files": result.files,
+    }
+
+
+# ---------- Analytics ----------
+@router.get("/analytics")
+async def analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    q: Optional[str] = None,
+):
+    """Aggregated view across all past runs.
+
+    Filters:
+      - start_date/end_date: 'YYYY-MM-DD' (inclusive, on run created_at)
+      - q: text filter on SKU/product/courier keys (server-side, case-insens)
+    """
+    db = get_db()
+    match: Dict[str, Any] = {}
+    if start_date or end_date:
+        cr: Dict[str, Any] = {}
+        if start_date:
+            cr["$gte"] = datetime.fromisoformat(start_date + "T00:00:00+00:00")
+        if end_date:
+            cr["$lte"] = datetime.fromisoformat(end_date + "T23:59:59+00:00")
+        match["created_at"] = cr
+
+    total_runs = 0
+    total_pages = 0
+    unique_orders = 0
+    duplicates_skipped = 0
+    sku_totals: Dict[str, int] = {}
+    courier_totals: Dict[str, int] = {}
+    daily: Dict[str, int] = {}
+    async for r in db.pdf_sorter_runs.find(match):
+        total_runs += 1
+        total_pages += int(r.get("total_pages") or 0)
+        unique_orders += int(r.get("unique_orders") or 0)
+        duplicates_skipped += int(r.get("duplicates_skipped") or 0)
+        for k, v in (r.get("sku_totals") or {}).items():
+            sku_totals[k] = sku_totals.get(k, 0) + int(v or 0)
+        for k, v in (r.get("courier_totals") or {}).items():
+            courier_totals[k] = courier_totals.get(k, 0) + int(v or 0)
+        d = r.get("created_at")
+        if isinstance(d, datetime):
+            key = d.strftime("%Y-%m-%d")
+            daily[key] = daily.get(key, 0) + int(r.get("total_pages") or 0)
+
+    if q:
+        needle = q.strip().lower()
+        if needle:
+            sku_totals = {k: v for k, v in sku_totals.items()
+                          if needle in k.lower()}
+            courier_totals = {k: v for k, v in courier_totals.items()
+                              if needle in k.lower()}
+
+    def _rows(d: Dict[str, int]) -> List[Dict[str, Any]]:
+        return sorted(
+            [{"name": k, "count": v} for k, v in d.items()],
+            key=lambda x: -x["count"],
+        )
+
+    return {
+        "total_runs": total_runs,
+        "total_pages": total_pages,
+        "unique_orders": unique_orders,
+        "duplicates_skipped": duplicates_skipped,
+        "sku_totals": _rows(sku_totals),
+        "courier_totals": _rows(courier_totals),
+        "daily_series": sorted(
+            [{"date": k, "count": v} for k, v in daily.items()],
+            key=lambda x: x["date"],
+        ),
     }
 
 

@@ -40,13 +40,19 @@ pdf_sorter_runs                    # NEW  (run history)
 - SKU Analysis rewritten as tree: `Category → Color → Account → SKUs → metrics`
   (`/api/pl/sku-analysis-tree`) — existing math preserved verbatim.
 
-## PDF Sorter (Feb 2026)
-- Independent of Product Master (user maintains manually).
-- Configs (`sku_normalization`, `courier_rules`) stored in Mongo, not local xlsx.
-- Endpoints: `/api/pdf-sorter/process`, `/api/pdf-sorter/runs`,
-  `/api/pdf-sorter/runs/{id}/files/{name}`, `/api/pdf-sorter/config` + CRUD/uploads
-- Order-No extraction → dedupe within a single run.
-- Cross-checks against `pl_orders` → warns if `CANCELLED` or `RTO`.
+## PDF Sorter → Printout Labels (Feb 2026, revised)
+- Renamed to **Printout Labels** at `/printout-labels` (old `/pdf-sorter` still routes here).
+- **No account attribution** — upload PDFs from any mix of accounts in one shot.
+- **Uses Product Master SKUs** as the primary grouping source: raw SKU on the
+  label is looked up in `pm_skus` → grouped by the product's Category / Color.
+- **Overrides tab** (renamed from "Config") only for edge-case raw SKUs that
+  are not in Product Master, plus courier detection rules.
+- **Analytics tab** — historical courier totals, SKU/Product totals, daily
+  volume bar chart, date range filter + search. Endpoint:
+  `GET /api/pdf-sorter/analytics?start_date=&end_date=&q=`
+- Run history tab removed (aggregated view is now the analytics tab).
+- Order-No dedupe within a run + CANCELLED/RTO warnings from `pl_orders`
+  remain.
 
 ## Theme (Feb 2026)
 Warm Slate palette. Deep indigo-slate background `#0F172A`, cards `#1E293B`,

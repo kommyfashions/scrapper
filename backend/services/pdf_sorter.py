@@ -105,6 +105,38 @@ async def load_sku_normalisation(db) -> Dict[str, str]:
     return out
 
 
+async def load_pm_sku_map(db) -> Dict[str, Dict[str, Any]]:
+    """raw_sku → {product_id, main_category, color, group_label}.
+
+    Product Master is the primary source of truth. Any label whose SKU is
+    mapped here groups by (main_category / color).  Case-insensitive lookup.
+    """
+    products: Dict[Any, Dict[str, Any]] = {}
+    async for p in db.pm_products.find(
+        {}, {"_id": 1, "main_category": 1, "color": 1}
+    ):
+        products[p["_id"]] = {
+            "main_category": p.get("main_category"),
+            "color": p.get("color"),
+        }
+    out: Dict[str, Dict[str, Any]] = {}
+    async for m in db.pm_skus.find({}, {"_id": 0}):
+        prod = products.get(m.get("product_id"))
+        if not prod:
+            continue
+        raw = str(m.get("sku") or "").strip()
+        if not raw:
+            continue
+        label = f"{prod.get('main_category') or '-'} / {prod.get('color') or '-'}"
+        out[raw.lower()] = {
+            "product_id": str(m.get("product_id")),
+            "main_category": prod.get("main_category"),
+            "color": prod.get("color"),
+            "group_label": label,
+        }
+    return out
+
+
 async def load_courier_rules(db) -> List[Tuple[str, re.Pattern]]:
     """[(courier_name, compiled_regex), ...]"""
     rules: List[Tuple[str, re.Pattern]] = []
@@ -131,7 +163,8 @@ async def process_pdfs(
     account_id: Optional[str] = None,
     actor_email: str = "upload",
 ) -> RunResult:
-    sku_map = await load_sku_normalisation(db)
+    sku_map = await load_sku_normalisation(db)   # optional overrides
+    pm_map = await load_pm_sku_map(db)            # primary source
     courier_rules = await load_courier_rules(db)
 
     readers: List[PdfReader] = []
@@ -154,14 +187,23 @@ async def process_pdfs(
                 rest = m.group("rest")
                 parts = rest.split()
                 sku_raw = parts[0] if parts else ""
-                sku_norm = sku_map.get(sku_raw, sku_raw)
+                # Lookup in Product Master first (case-insensitive); then
+                # fall back to sku_normalization override; else use raw.
+                pm_hit = pm_map.get(sku_raw.lower())
+                if pm_hit:
+                    sku_norm = pm_hit["group_label"]  # "Vertis / Blue"
+                    is_known = True
+                else:
+                    override = sku_map.get(sku_raw)
+                    sku_norm = override or sku_raw
+                    is_known = bool(override)
                 size = _extract_size(rest)
                 order_no_m = ORDER_NO_RE.search(rest)
                 order_no = order_no_m.group(1) if order_no_m else None
                 courier = _extract_courier(text, courier_rules)
                 if not sku_raw:
                     continue
-                if sku_raw == sku_norm and sku_raw not in sku_map:
+                if not is_known:
                     unknown_sku += 1
                 if courier == "UNKNOWN":
                     unknown_courier += 1
