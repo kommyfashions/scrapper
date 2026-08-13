@@ -175,6 +175,79 @@ function UploadZone({ onFilesReady, processing }) {
   );
 }
 
+// ---------------- Last-run downloads (right under upload) ----------------
+function LastRunDownloads({ run }) {
+  if (!run || !run.files || !run.files.length) return null;
+  const download = async (fname) => {
+    const r = await api.get(`/pdf-sorter/runs/${run.run_id}/files/${fname}`,
+      { responseType: "blob" });
+    const cd = r.headers?.["content-disposition"] || "";
+    const match = /filename="?([^"]+)"?/i.exec(cd);
+    const name = (match && match[1]) || fname;
+    const url = URL.createObjectURL(new Blob([r.data]));
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+  };
+  const stats = [
+    { label: "Files", value: run.input_files_count ?? run.total_files ?? "—" },
+    { label: "Labels", value: run.total_pages ?? "—" },
+    { label: "Orders", value: run.unique_orders ?? "—" },
+    { label: "Unmatched", value: run.unmatched ?? run.unknown_sku ?? 0 },
+  ];
+  const files = ["MASTER_PRINT.pdf", "TIER1_HIGH_VOLUME.pdf", "TIER2_LOW_VOLUME.pdf"]
+    .filter((f) => run.files.includes(f));
+  const labels = {
+    "MASTER_PRINT.pdf": "Master Print",
+    "TIER1_HIGH_VOLUME.pdf": "Tier 1 · High Volume",
+    "TIER2_LOW_VOLUME.pdf": "Tier 2 · Low Volume",
+  };
+  return (
+    <div
+      className="panel p-4"
+      style={{
+        background: "linear-gradient(180deg, rgba(16,185,129,0.06) 0%, var(--bg-surface) 100%)",
+        borderColor: "rgba(16,185,129,0.35)",
+      }}
+      data-testid="pl-last-run"
+    >
+      <div className="flex items-center gap-2 mb-3">
+        <CheckCircleIcon size={16} weight="fill" color="#10B981" />
+        <h3 className="font-display text-sm text-[#6EE7B7]">Latest Run — ready to download</h3>
+        {run.created_at && (
+          <span className="text-[10px] text-[var(--text-muted)] font-mono">
+            {new Date(run.created_at).toLocaleString()}
+          </span>
+        )}
+        <span className="text-[10px] text-[var(--text-muted)] font-mono ml-auto">
+          {run.run_id}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-3 mb-3">
+        {stats.map((s) => (
+          <div key={s.label} className="flex flex-col">
+            <span className="font-display text-lg">{s.value}</span>
+            <span className="section-label">{s.label}</span>
+          </div>
+        ))}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {files.map((f) => (
+          <button
+            key={f}
+            onClick={() => download(f)}
+            className="btn-primary text-xs flex items-center gap-2"
+            data-testid={`pl-latest-dl-${f}`}
+          >
+            <DownloadSimpleIcon size={12} weight="bold" />
+            {labels[f] || f}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ---------------- Downloads history strip ----------------
 function DownloadsPanel({ items, onRefresh }) {
   const download = async (runId, fname) => {
@@ -405,17 +478,34 @@ export default function PrintoutLabelsPage() {
   const [q, setQ] = useState("");
   const [qLive, setQLive] = useState("");
   const [showUnmatched, setShowUnmatched] = useState(false);
+  // Date range filter — default TODAY so the KPIs reflect the latest batch,
+  // not everything ever uploaded.
+  const today = new Date().toISOString().slice(0, 10);
+  const [startDate, setStartDate] = useState(today);
+  const [endDate, setEndDate] = useState(today);
 
   useEffect(() => {
     const t = setTimeout(() => setQ(qLive), 300);
     return () => clearTimeout(t);
   }, [qLive]);
 
+  const setPreset = (kind) => {
+    const d = new Date();
+    const iso = (n) => new Date(d.getTime() - n * 86400000).toISOString().slice(0, 10);
+    if (kind === "today") { setStartDate(iso(0)); setEndDate(iso(0)); }
+    else if (kind === "yesterday") { setStartDate(iso(1)); setEndDate(iso(1)); }
+    else if (kind === "7d") { setStartDate(iso(6)); setEndDate(iso(0)); }
+    else if (kind === "30d") { setStartDate(iso(29)); setEndDate(iso(0)); }
+    else if (kind === "all") { setStartDate(""); setEndDate(""); }
+  };
+
   const loadAll = useCallback(async () => {
     setLoading(true); setErr("");
     try {
       const p = new URLSearchParams();
       if (q) p.append("q", q);
+      if (startDate) p.append("start_date", startDate);
+      if (endDate) p.append("end_date", endDate);
       const [a, r] = await Promise.all([
         api.get(`/pdf-sorter/analytics?${p.toString()}`),
         api.get("/pdf-sorter/recent-runs"),
@@ -427,7 +517,7 @@ export default function PrintoutLabelsPage() {
     } finally {
       setLoading(false);
     }
-  }, [q]);
+  }, [q, startDate, endDate]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
@@ -442,6 +532,9 @@ export default function PrintoutLabelsPage() {
       });
       setRunResult(data);
       clearFiles();
+      // Ensure "today" is in the filter window so the fresh run shows up
+      const t = new Date().toISOString().slice(0, 10);
+      if (endDate && endDate < t) setEndDate(t);
       await loadAll();
     } catch (e) {
       setErr(formatApiError(e));
@@ -450,35 +543,20 @@ export default function PrintoutLabelsPage() {
     }
   };
 
-  // Data for the summary cards uses latest_run when available, else the
-  // cumulative window shown by analytics.
-  const src = runResult || analytics?.latest_run || analytics || {};
-  const total_files = runResult?.total_files ?? analytics?.total_files ?? 0;
-  const total_pages = runResult?.total_pages ?? analytics?.total_pages ?? 0;
-  const unknown = runResult?.unknown_sku ?? analytics?.unknown_sku_total ?? 0;
+  // KPIs and tables ALWAYS reflect the current date window (default: today).
+  // A fresh runResult only exposes download buttons + warnings; it does not
+  // override the window numbers, so cumulative math stays consistent.
+  const total_files = analytics?.total_files ?? 0;
+  const total_pages = analytics?.total_pages ?? 0;
+  const unknown = analytics?.unknown_sku_total ?? 0;
   const sorted = Math.max(0, total_pages - unknown);
   const groups_filled = analytics?.groups_filled ?? 0;
   const groups_total = analytics?.groups_total ?? 0;
-  const unique_orders = runResult?.unique_orders ?? analytics?.unique_orders ?? 0;
+  const unique_orders = analytics?.unique_orders ?? 0;
 
-  // Tables (per current view)
-  const courierRows = useMemo(() => {
-    if (runResult?.courier_totals) {
-      return Object.entries(runResult.courier_totals)
-        .map(([name, count]) => ({ name, count }))
-        .sort((a, b) => b.count - a.count);
-    }
-    return analytics?.courier_totals || [];
-  }, [runResult, analytics]);
-
-  const skuRows = useMemo(() => {
-    if (runResult?.sku_totals) {
-      return Object.entries(runResult.sku_totals)
-        .map(([name, count]) => ({ name, count }))
-        .sort((a, b) => b.count - a.count);
-    }
-    return analytics?.sku_totals || [];
-  }, [runResult, analytics]);
+  // Tables: analytics endpoint aggregates within the window.
+  const courierRows = analytics?.courier_totals || [];
+  const skuRows = analytics?.sku_totals || [];
 
   const courierTotal = courierRows.reduce((s, r) => s + r.count, 0) || 1;
   const skuTotal = skuRows.reduce((s, r) => s + r.count, 0) || 1;
@@ -526,6 +604,59 @@ export default function PrintoutLabelsPage() {
 
       {/* Upload zone — always visible on top */}
       <UploadZone onFilesReady={process} processing={processing} />
+
+      {/* Downloads directly under upload (per user request) — from LATEST run */}
+      {(runResult || analytics?.latest_run) && (
+        <LastRunDownloads
+          run={runResult ? {
+            run_id: runResult.run_id,
+            created_at: null,
+            total_pages: runResult.total_pages,
+            unknown_sku: runResult.unknown_sku,
+            unique_orders: runResult.unique_orders,
+            files: runResult.files,
+          } : analytics.latest_run}
+        />
+      )}
+
+      {/* Date range filter — controls all KPIs and tables below */}
+      <div className="panel p-3 flex flex-wrap items-center gap-2" data-testid="pl-date-filter">
+        <SlidersIcon size={13} weight="bold" color="#10B981" />
+        <span className="section-label">/ date range</span>
+        <input
+          type="date"
+          value={startDate}
+          onChange={(e) => setStartDate(e.target.value)}
+          className="input-shell font-mono text-xs w-40"
+          data-testid="pl-date-start"
+        />
+        <span className="text-[var(--text-muted)] text-xs">→</span>
+        <input
+          type="date"
+          value={endDate}
+          onChange={(e) => setEndDate(e.target.value)}
+          className="input-shell font-mono text-xs w-40"
+          data-testid="pl-date-end"
+        />
+        <div className="flex gap-1 ml-2">
+          {[
+            ["today", "Today"], ["yesterday", "Yesterday"],
+            ["7d", "7d"], ["30d", "30d"], ["all", "All time"],
+          ].map(([k, l]) => (
+            <button
+              key={k}
+              onClick={() => setPreset(k)}
+              className="btn-ghost text-[10px] font-mono uppercase"
+              data-testid={`pl-preset-${k}`}
+            >
+              {l}
+            </button>
+          ))}
+        </div>
+        <div className="ml-auto text-[10px] text-[var(--text-muted)] font-mono">
+          {loading ? "loading…" : `${analytics?.total_runs || 0} run${analytics?.total_runs === 1 ? "" : "s"} in window`}
+        </div>
+      </div>
 
       {/* Sorting stepper (static, always visible after any run exists) */}
       {step > 0 && (

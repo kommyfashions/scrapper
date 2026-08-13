@@ -533,6 +533,30 @@ async def startup():
     except Exception as e:
         logger.warning(f"[pl-migration] sku-cost dedupe failed: {e}")
 
+    # Seed default courier rules for PDF label detection (idempotent upsert).
+    try:
+        default_couriers = [
+            ("Delhivery",     "Delhivery"),
+            ("Ecom Express",  "Ecom Express"),
+            ("Xpressbees",    "Xpressbees"),
+            ("Shadowfax",     "Shadowfax"),
+            ("DTDC",          "DTDC"),
+            ("India Post",    "India Post"),
+            ("Bluedart",      "Bluedart"),
+            ("Ekart",         "Ekart"),
+            ("Valmo",         "Valmo"),
+        ]
+        for name, match in default_couriers:
+            await db.courier_rules.update_one(
+                {"courier_name": name},
+                {"$setOnInsert": {"courier_name": name, "match_text": match,
+                                   "updated_at": datetime.now(timezone.utc),
+                                   "seeded": True}},
+                upsert=True,
+            )
+    except Exception as e:
+        logger.warning(f"[courier-seed] failed: {e}")
+
     # seed admin
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if not existing:
