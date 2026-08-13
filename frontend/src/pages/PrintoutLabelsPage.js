@@ -179,21 +179,38 @@ function UploadZone({ onFilesReady, processing }) {
 function LastRunDownloads({ run }) {
   if (!run || !run.files || !run.files.length) return null;
   const download = async (fname) => {
-    const r = await api.get(`/pdf-sorter/runs/${run.run_id}/files/${fname}`,
-      { responseType: "blob" });
+    const r = await api.get(
+      `/pdf-sorter/runs/${run.run_id}/files/${fname}`,
+      {
+        responseType: "blob",
+        // Force fresh request every click so a re-download always works,
+        // even after the browser cached the first hit.
+        params: { _ts: Date.now() },
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+      }
+    );
     const cd = r.headers?.["content-disposition"] || "";
     const match = /filename="?([^"]+)"?/i.exec(cd);
     const name = (match && match[1]) || fname;
     const url = URL.createObjectURL(new Blob([r.data]));
     const a = document.createElement("a");
-    a.href = url; a.download = name; a.click();
-    URL.revokeObjectURL(url);
+    a.href = url;
+    a.download = name;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    // Delay revoke until the browser had a chance to consume the URL.
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 4000);
   };
   const stats = [
     { label: "Files", value: run.input_files_count ?? run.total_files ?? "—" },
     { label: "Labels", value: run.total_pages ?? "—" },
     { label: "Orders", value: run.unique_orders ?? "—" },
-    { label: "Unmatched", value: run.unmatched ?? run.unknown_sku ?? 0 },
+    { label: "Matched", value: (run.total_pages ?? 0) - (run.unmatched ?? run.unknown_sku ?? 0), color: "text-[#6EE7B7]" },
+    { label: "Unmatched", value: run.unmatched ?? run.unknown_sku ?? 0, color: "text-[#FCD34D]" },
   ];
   const files = ["MASTER_PRINT.pdf", "TIER1_HIGH_VOLUME.pdf", "TIER2_LOW_VOLUME.pdf"]
     .filter((f) => run.files.includes(f));
@@ -226,7 +243,7 @@ function LastRunDownloads({ run }) {
       <div className="flex flex-wrap items-center gap-3 mb-3">
         {stats.map((s) => (
           <div key={s.label} className="flex flex-col">
-            <span className="font-display text-lg">{s.value}</span>
+            <span className={"font-display text-lg " + (s.color || "")}>{s.value}</span>
             <span className="section-label">{s.label}</span>
           </div>
         ))}
@@ -249,10 +266,16 @@ function LastRunDownloads({ run }) {
 }
 
 // ---------------- Downloads history strip ----------------
-function DownloadsPanel({ items, onRefresh }) {
+function DownloadsPanel({ items, onRefresh, onReset }) {
   const download = async (runId, fname) => {
-    const r = await api.get(`/pdf-sorter/runs/${runId}/files/${fname}`,
-      { responseType: "blob" });
+    const r = await api.get(
+      `/pdf-sorter/runs/${runId}/files/${fname}`,
+      {
+        responseType: "blob",
+        params: { _ts: Date.now() },
+        headers: { "Cache-Control": "no-cache", Pragma: "no-cache" },
+      }
+    );
     // Backend already appends timestamp to Content-Disposition. Just use the
     // filename it sends back.
     const cd = r.headers?.["content-disposition"] || "";
@@ -260,17 +283,31 @@ function DownloadsPanel({ items, onRefresh }) {
     const name = (match && match[1]) || fname;
     const url = URL.createObjectURL(new Blob([r.data]));
     const a = document.createElement("a");
-    a.href = url; a.download = name; a.click();
-    URL.revokeObjectURL(url);
+    a.href = url;
+    a.download = name;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
   };
   return (
     <div className="panel p-4" data-testid="pl-downloads-panel">
       <div className="flex items-center gap-2 mb-3">
         <DownloadSimpleIcon size={14} weight="bold" color="#10B981" />
         <h3 className="font-display text-sm">Recent Downloads · Last 7 days</h3>
-        <button onClick={onRefresh} className="btn-ghost text-xs ml-auto flex items-center gap-1">
-          <ArrowsClockwiseIcon size={11} weight="bold" /> Refresh
-        </button>
+        <div className="ml-auto flex items-center gap-2">
+          <button onClick={onRefresh} className="btn-ghost text-xs flex items-center gap-1">
+            <ArrowsClockwiseIcon size={11} weight="bold" /> Refresh
+          </button>
+          <button
+            onClick={onReset}
+            className="btn-danger text-xs flex items-center gap-1"
+            data-testid="pl-reset-btn"
+            title="Wipe all past runs — files and history"
+          >
+            <TrashIcon size={11} weight="bold" /> Reset all runs
+          </button>
+        </div>
       </div>
       {items.length === 0 ? (
         <div className="text-center py-4 text-[var(--text-muted)] text-xs">
@@ -520,6 +557,15 @@ export default function PrintoutLabelsPage() {
   }, [q, startDate, endDate]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
+
+  const resetAll = async () => {
+    if (!window.confirm("Delete ALL past runs, files and history? This cannot be undone.")) return;
+    try {
+      await api.post("/pdf-sorter/admin/reset");
+      setRunResult(null);
+      await loadAll();
+    } catch (e) { setErr(formatApiError(e)); }
+  };
 
   const process = async (files, clearFiles) => {
     setProcessing(true); setErr(""); setRunResult(null);
@@ -810,7 +856,7 @@ export default function PrintoutLabelsPage() {
       )}
 
       {/* Downloads history */}
-      <DownloadsPanel items={recent} onRefresh={loadAll} />
+      <DownloadsPanel items={recent} onRefresh={loadAll} onReset={resetAll} />
 
       {/* Overrides */}
       <OverridesPanel />

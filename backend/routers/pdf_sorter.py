@@ -366,5 +366,31 @@ async def download(run_id: str, filename: str):
     suffix = fp.suffix
     ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
     download_name = f"{stem}__{ts}{suffix}"
-    return FileResponse(fp, filename=download_name,
-                        media_type="application/pdf")
+    return FileResponse(
+        fp,
+        filename=download_name,
+        media_type="application/pdf",
+        headers={
+            # Force browsers to fetch fresh every click so re-downloads work.
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@router.post("/admin/reset")
+async def admin_reset():
+    """Wipe ALL past runs: DB history + uploads/ + outputs/ directories.
+    Idempotent. Danger — intended for pre-production testing only."""
+    import shutil as _sh
+    db = get_db()
+    deleted = await db.pdf_sorter_runs.delete_many({})
+    for base in (UPLOAD_DIR, OUTPUT_DIR):
+        try:
+            for child in base.iterdir():
+                if child.is_dir():
+                    _sh.rmtree(child, ignore_errors=True)
+        except Exception:
+            continue
+    return {"ok": True, "runs_deleted": deleted.deleted_count}

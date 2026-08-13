@@ -1,0 +1,33 @@
+{
+  "summary": "Verified all 4 PDF-sorter fixes on /printout-labels end-to-end. Backend: 9/9 pytest cases pass in /app/backend/tests/test_pdf_sorter_iter6.py — POST /api/pdf-sorter/admin/reset returns {ok:true,runs_deleted:N}, zeroes analytics AND clears /app/backend/pdf_sorter/{uploads,outputs}/; GET /api/pdf-sorter/runs/{id}/files/{name} returns 200 with Content-Disposition filename matching 'TIER1_HIGH_VOLUME__YYYY-MM-DD_HH-MM-SS.pdf' AND Cache-Control 'no-store,no-cache,must-revalidate,max-age=0'; the same URL hit twice returns 200+body twice; analytics.total_pages == run.total_pages and sorted+unmatched==total_pages; MASTER page count == TIER1+TIER2 == total_pages (verified by reading the actual generated PDFs with pypdf); date filter start_date=end_date=today returns exactly the fresh run; and all 9 required default couriers (Delhivery, Ecom Express, Xpressbees, Shadowfax, DTDC, India Post, Bluedart, Ekart, Valmo) are present in /api/pdf-sorter/config. Frontend: /printout-labels renders with all expected testids (pl-upload-zone, pl-latest-dl-{MASTER_PRINT,TIER1_HIGH_VOLUME,TIER2_LOW_VOLUME}.pdf, pl-reset-btn, pl-date-start/end, pl-preset-today, pl-file-input, pl-process-btn, pl-downloads-panel). Uploaded a 3-label reportlab PDF (SKU1 matched via PM, SKUX/SKUY unmatched); Latest Run panel shows Files:1, Labels:3, Orders:3, Matched:1 (green), Unmatched:2 (amber) — Matched math (Labels-Unmatched) verified. Clicking Tier-1 download button TWICE in a row both triggered a real .pdf download (311 bytes each) with distinct timestamped filenames (TIER1_HIGH_VOLUME__2026-08-13_17-36-29.pdf then ..._17-36-31.pdf) — confirming the 'downloads only work once' regression is fixed. Master (2129 bytes) and Tier-2 (2129 bytes) downloads also work. Clicking 'Reset all runs' after confirm zeroes all KPIs and hides the Latest Run panel.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_pdf_sorter_iter6.py",
+    "/app/test_reports/pytest/iter6_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "routers/pdf_sorter.py analytics() uses `Dict[str, Any]` in a runtime annotation but only imports `List, Optional` from typing. It works today only because `from __future__ import annotations` is at the top so annotations are lazily evaluated as strings — but if anyone ever removes that import or converts to a runtime type check (e.g. Pydantic v2 model), it will break with NameError. Low priority nit: add `Dict, Any` to the typing import for safety.",
+    "services/pdf_sorter.py TIER1_MIN_PAGES=10 is hard-coded — the frontend labels the button 'Tier 1 · High Volume' but for small test uploads (<10 pages/SKU) EVERYTHING goes to Tier 2 which is easy to mistake for a bug. Consider making the threshold configurable via the pdf_sorter config collection so QA/users can test tier splits without needing 10+ pages of the same SKU.",
+    "The download route on GET /runs/{run_id}/files/{filename} does not require any run-ownership check — any authenticated dashboard user can download any run_id if they know it. Fine for a single-tenant dashboard, but flagging for future multi-tenant hardening.",
+    "PrintoutLabelsPage.js LastRunDownloads receives `run` from either analytics.latest_run OR the freshly-returned process() payload; the process payload does NOT include `input_files_count` / `total_files`, so immediately after a fresh upload the 'Files' stat renders as '—' until loadAll() finishes and analytics.latest_run takes over. Suggest passing `total_files: runResult.total_files` in the runResult branch (line 656-664) so the number appears immediately."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_pdf_sorter_iter6.py (new)"
+  ],
+  "success_rate": {"backend": "100% (9/9 iter6 tests)", "frontend": "100% of covered flows (reset, upload+process, matched/unmatched math, download-twice, timestamped filename, cache-control)"},
+  "test_credentials": "admin@meesho-dash.local / admin123 (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Generated /tmp/pl_fake.pdf via reportlab with 3 label pages: (SKU1,M,Delhivery), (SKUX,L,Ecom Express), (SKUY,S,Xpressbees). SKU1 is already in PM (Vertis/Blue) from previous iteration so it's the matched one; SKUX/SKUY are unmatched. No other DB writes.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "All 4 user-reported PDF-sorter fixes are green: (1) Latest Run shows Matched (green) + Unmatched (amber) with correct math Labels-Unmatched=Matched, (2) download buttons work on the 2nd/3rd click too (Cache-Control:no-store,no-cache,must-revalidate,max-age=0 + timestamped filename via ?_ts= query + delayed URL.revokeObjectURL), (3) POST /api/pdf-sorter/admin/reset wipes DB rows and both uploads/ and outputs/ directories, exposed via 'Reset all runs' button behind window.confirm, (4) MASTER_PRINT.pdf page count == TIER1_HIGH_VOLUME.pdf + TIER2_LOW_VOLUME.pdf == run.total_pages and analytics.total_pages == run.total_pages (verified by cracking the actual generated PDFs). Default courier rules (Delhivery, Ecom Express, Xpressbees, Shadowfax, DTDC, India Post, Bluedart, Ekart, Valmo) auto-seeded on backend startup. Only nits are the code-review items above — no functional bugs.",
+  "rca of the issue": "Not applicable — all four fixes work as designed and were reproduced/validated end-to-end."
+}
