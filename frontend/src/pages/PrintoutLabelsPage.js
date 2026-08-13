@@ -1,474 +1,285 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowsClockwiseIcon,
+  CheckCircleIcon,
+  ClockIcon,
   DownloadSimpleIcon,
   FileArrowUpIcon,
+  FilePdfIcon,
   MagnifyingGlassIcon,
+  PackageIcon,
   PrinterIcon,
+  SlidersIcon,
   TrashIcon,
+  UploadSimpleIcon,
   WarningCircleIcon,
   XIcon,
-  ChartBarIcon,
 } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 
-const TABS = [
-  { k: "process", label: "Sort & Print" },
-  { k: "analytics", label: "Analytics" },
-  { k: "overrides", label: "Overrides" },
-];
-
-// ============================================================================
-// Sort & Print tab
-// ============================================================================
-function ProcessTab() {
-  const [files, setFiles] = useState([]);
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState(null);
-  const [err, setErr] = useState("");
-
-  const process = async () => {
-    if (!files.length) return;
-    setBusy(true); setErr(""); setResult(null);
-    try {
-      const fd = new FormData();
-      files.forEach((f) => fd.append("files", f));
-      const { data } = await api.post("/pdf-sorter/process", fd, {
-        headers: { "Content-Type": "multipart/form-data" },
-        timeout: 300000,
-      });
-      setResult(data);
-    } catch (e) {
-      setErr(formatApiError(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
+// ---------------- Reusable pieces ----------------
+function KPI({ icon: Icon, label, value, sub, tint = "" }) {
   return (
-    <div className="space-y-4" data-testid="pl-process-tab">
-      <div className="panel p-5 space-y-4">
-        <div className="text-xs text-[var(--text-secondary)]">
-          Upload one or many Meesho label PDFs from <b>any account</b>. Labels
-          are grouped by their SKU using the <span className="code-tag">Product Master</span> mapping so
-          the same product across accounts prints together. High-volume groups
-          (≥10 pages) get an upside-down separator on the last page.
+    <div className="kpi-card">
+      <div className="flex items-start gap-3">
+        <div
+          className={
+            "p-2 rounded-lg " +
+            (tint === "green" ? "bg-[rgba(16,185,129,0.10)] text-[#6EE7B7]"
+             : tint === "amber" ? "bg-[rgba(245,158,11,0.10)] text-[#FCD34D]"
+             : tint === "red" ? "bg-[rgba(239,68,68,0.10)] text-[#FCA5A5]"
+             : tint === "blue" ? "bg-[rgba(56,189,248,0.10)] text-[#7DD3FC]"
+             : tint === "violet" ? "bg-[rgba(139,92,246,0.10)] text-[#C4B5FD]"
+             : "bg-[var(--bg-surface-2)] text-[var(--text-secondary)]")
+          }
+        >
+          {Icon && <Icon size={18} weight="bold" />}
         </div>
-        <div className="flex flex-wrap items-end gap-3">
-          <label className="btn-secondary text-xs flex items-center gap-2 cursor-pointer">
-            <FileArrowUpIcon size={14} weight="bold" />
-            <span>{files.length ? `${files.length} file(s) chosen` : "Choose PDFs"}</span>
-            <input
-              type="file"
-              accept="application/pdf"
-              multiple
-              className="hidden"
-              onChange={(e) => setFiles(Array.from(e.target.files || []))}
-              data-testid="pl-file-input"
-            />
-          </label>
-          <button
-            disabled={!files.length || busy}
-            onClick={process}
-            className="btn-primary text-xs flex items-center gap-1"
-            data-testid="pl-process-btn"
-          >
-            <PrinterIcon size={12} weight="bold" />
-            {busy ? "Processing…" : "Sort & Generate Printouts"}
-          </button>
+        <div className="flex-1 min-w-0">
+          <div className="section-label truncate">{label}</div>
+          <div className="font-display text-3xl mt-1">{value}</div>
+          {sub && <div className="text-[11px] text-[var(--text-muted)] mt-0.5">{sub}</div>}
         </div>
-        {files.length > 0 && (
-          <div className="flex flex-wrap gap-1">
-            {files.map((f, i) => (
-              <span key={i} className="chip">
-                {f.name}{" "}
-                <button
-                  onClick={() =>
-                    setFiles(files.filter((_, idx) => idx !== i))
-                  }
-                >
-                  <XIcon size={10} weight="bold" />
-                </button>
-              </span>
-            ))}
-          </div>
-        )}
-        {err && (
-          <div className="border border-[rgba(239,68,68,0.35)] bg-[rgba(239,68,68,0.1)] px-3 py-2 font-mono text-xs text-[#FCA5A5]">
-            {err}
-          </div>
-        )}
       </div>
-
-      {result && <ResultPanel result={result} />}
     </div>
   );
 }
 
-function ResultPanel({ result }) {
-  const stats = [
-    { label: "Pages", value: result.total_pages },
-    { label: "Unique Orders", value: result.unique_orders },
-    { label: "Duplicates Skipped", value: result.duplicates_skipped },
-    { label: "Unknown SKUs", value: result.unknown_sku },
-    { label: "Unknown Couriers", value: result.unknown_courier },
-  ];
-  const download = async (fname) => {
-    const rr = await api.get(
-      `/pdf-sorter/runs/${result.run_id}/files/${fname}`,
-      { responseType: "blob" }
+function StaticStepper({ steps, current }) {
+  return (
+    <div className="flex items-start justify-between gap-2">
+      {steps.map((s, i) => {
+        const done = i < current;
+        const active = i === current;
+        return (
+          <div key={s.label} className="flex-1 flex flex-col items-center relative">
+            {i > 0 && (
+              <div
+                className="absolute top-3 -left-1/2 w-full h-[2px]"
+                style={{
+                  background: i <= current
+                    ? "var(--accent)"
+                    : "var(--border)",
+                }}
+              />
+            )}
+            <div
+              className={
+                "relative z-10 w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold " +
+                (done ? "bg-[var(--accent)] text-[#052E1F]"
+                 : active ? "bg-[var(--accent)] text-[#052E1F] ring-4 ring-[rgba(16,185,129,0.25)]"
+                 : "bg-[var(--bg-surface-2)] text-[var(--text-muted)] border border-[var(--border)]")
+              }
+            >
+              {done ? <CheckCircleIcon size={12} weight="fill" /> : i + 1}
+            </div>
+            <div className="mt-2 text-[10px] font-mono uppercase tracking-wider text-center text-[var(--text-secondary)]">
+              {s.label}
+            </div>
+            <div className="text-[10px] text-[var(--text-muted)] font-mono">{s.time || ""}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------- Upload zone ----------------
+function UploadZone({ onFilesReady, processing }) {
+  const [files, setFiles] = useState([]);
+  const [drag, setDrag] = useState(false);
+
+  const add = (list) => {
+    const arr = Array.from(list || []).filter(
+      (f) => f && f.name && f.name.toLowerCase().endsWith(".pdf")
     );
-    const url = URL.createObjectURL(new Blob([rr.data]));
+    setFiles((prev) => [...prev, ...arr]);
+  };
+
+  const remove = (i) => setFiles((prev) => prev.filter((_, idx) => idx !== i));
+
+  const submit = () => {
+    if (!files.length || processing) return;
+    onFilesReady(files, () => setFiles([]));
+  };
+
+  return (
+    <div className="panel p-5" data-testid="pl-upload-zone">
+      <div className="flex items-center gap-2 mb-3">
+        <UploadSimpleIcon size={16} weight="bold" color="#10B981" />
+        <h3 className="font-display text-base">Upload Meesho Label PDFs</h3>
+        <div className="text-[11px] text-[var(--text-muted)] ml-auto">
+          Any mix of accounts • Grouped by Product Master SKUs
+        </div>
+      </div>
+      <label
+        onDragEnter={(e) => { e.preventDefault(); setDrag(true); }}
+        onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
+        onDragLeave={() => setDrag(false)}
+        onDrop={(e) => {
+          e.preventDefault(); setDrag(false);
+          add(e.dataTransfer?.files);
+        }}
+        className={
+          "flex flex-col items-center justify-center border-2 border-dashed rounded-lg p-8 cursor-pointer transition-colors " +
+          (drag
+            ? "border-[var(--accent)] bg-[rgba(16,185,129,0.06)]"
+            : "border-[var(--border)] hover:border-[#475569] hover:bg-[var(--bg-surface-2)]")
+        }
+      >
+        <FileArrowUpIcon size={36} weight="light" className="text-[var(--accent)]" />
+        <div className="mt-2 text-sm">
+          <span className="text-[var(--accent)] font-medium">Click to browse</span>
+          <span className="text-[var(--text-secondary)]"> or drag &amp; drop PDF files here</span>
+        </div>
+        <div className="text-[11px] text-[var(--text-muted)] mt-1">
+          Multiple files supported • Only .pdf accepted
+        </div>
+        <input
+          type="file"
+          accept="application/pdf"
+          multiple
+          className="hidden"
+          onChange={(e) => add(e.target.files)}
+          data-testid="pl-file-input"
+        />
+      </label>
+      {files.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-1" data-testid="pl-file-list">
+          {files.map((f, i) => (
+            <span key={`${f.name}-${i}`} className="chip chip-info">
+              <FilePdfIcon size={10} weight="bold" />
+              {f.name}
+              <button onClick={() => remove(i)}>
+                <XIcon size={10} weight="bold" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div className="mt-4 flex items-center justify-between">
+        <div className="text-xs text-[var(--text-muted)] font-mono">
+          {files.length} file{files.length !== 1 ? "s" : ""} selected
+        </div>
+        <button
+          disabled={!files.length || processing}
+          onClick={submit}
+          className="btn-primary text-sm flex items-center gap-2"
+          data-testid="pl-process-btn"
+        >
+          <PrinterIcon size={14} weight="bold" />
+          {processing ? "Processing…" : "Sort & Generate Printouts"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Downloads history strip ----------------
+function DownloadsPanel({ items, onRefresh }) {
+  const download = async (runId, fname) => {
+    const r = await api.get(`/pdf-sorter/runs/${runId}/files/${fname}`,
+      { responseType: "blob" });
+    // Backend already appends timestamp to Content-Disposition. Just use the
+    // filename it sends back.
+    const cd = r.headers?.["content-disposition"] || "";
+    const match = /filename="?([^"]+)"?/i.exec(cd);
+    const name = (match && match[1]) || fname;
+    const url = URL.createObjectURL(new Blob([r.data]));
     const a = document.createElement("a");
-    a.href = url; a.download = fname; a.click();
+    a.href = url; a.download = name; a.click();
     URL.revokeObjectURL(url);
   };
   return (
-    <div className="space-y-4" data-testid="pl-result">
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-        {stats.map((s) => (
-          <div key={s.label} className="kpi-card">
-            <div className="font-display text-2xl">{s.value}</div>
-            <div className="section-label mt-1">{s.label}</div>
-          </div>
-        ))}
-      </div>
-      <div className="panel p-4 space-y-3">
-        <h3 className="font-display text-sm">
-          Downloads — <span className="font-mono text-xs">{result.run_id}</span>
-        </h3>
-        <div className="flex flex-wrap gap-2">
-          {result.files.map((f) => (
-            <button
-              key={f}
-              onClick={() => download(f)}
-              className="btn-primary text-xs flex items-center gap-1"
-              data-testid={`pl-download-${f}`}
-            >
-              <DownloadSimpleIcon size={12} weight="bold" /> {f}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {result.warnings?.length > 0 && (
-        <div className="border border-[rgba(245,158,11,0.35)] bg-[rgba(245,158,11,0.1)] p-3 rounded text-xs">
-          <div className="font-semibold text-[#FCD34D] mb-1 flex items-center gap-1">
-            <WarningCircleIcon size={12} weight="bold" /> Warnings:
-            orders already CANCELLED / RTO in P&amp;L
-          </div>
-          <div className="space-y-0.5 max-h-40 overflow-y-auto">
-            {result.warnings.map((w, i) => (
-              <div key={i} className="font-mono text-[11px]">
-                {w.order_no} — <span className="text-[#FCA5A5]">{w.status}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        <MiniTable
-          title="Courier — this run"
-          rows={Object.entries(result.courier_totals || {})
-            .sort((a, b) => b[1] - a[1])
-            .map(([k, v]) => ({ key: k, count: v }))}
-        />
-        <MiniTable
-          title="Products / SKUs — this run"
-          rows={Object.entries(result.sku_totals || {})
-            .sort((a, b) => b[1] - a[1])
-            .map(([k, v]) => ({ key: k, count: v }))}
-          max={40}
-        />
-      </div>
-    </div>
-  );
-}
-
-function MiniTable({ title, rows, max = 20 }) {
-  return (
-    <div className="panel p-4">
-      <h3 className="font-display text-sm mb-2">{title}</h3>
-      <div className="table-wrap max-h-96">
-        <table className="dense">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th className="num">Count</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.slice(0, max).map((r) => (
-              <tr key={r.key}>
-                <td className="font-mono text-[11px]">{r.key}</td>
-                <td className="num font-mono">{r.count}</td>
-              </tr>
-            ))}
-            {!rows.length && (
-              <tr>
-                <td colSpan={2} className="text-center py-3 text-[var(--text-muted)]">
-                  no data
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// Analytics tab — courier + SKU historical totals with filters
-// ============================================================================
-function AnalyticsTab() {
-  const [start, setStart] = useState("");
-  const [end, setEnd] = useState("");
-  const [q, setQ] = useState("");
-  const [qLive, setQLive] = useState("");
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState("");
-
-  useEffect(() => {
-    const t = setTimeout(() => setQ(qLive), 350);
-    return () => clearTimeout(t);
-  }, [qLive]);
-
-  const load = useCallback(async () => {
-    setLoading(true); setErr("");
-    try {
-      const p = new URLSearchParams();
-      if (start) p.append("start_date", start);
-      if (end) p.append("end_date", end);
-      if (q) p.append("q", q);
-      const { data } = await api.get(`/pdf-sorter/analytics?${p.toString()}`);
-      setData(data);
-    } catch (e) {
-      setErr(formatApiError(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [start, end, q]);
-
-  useEffect(() => { load(); }, [load]);
-
-  const stats = data ? [
-    { label: "Total Runs", value: data.total_runs },
-    { label: "Pages Sorted", value: data.total_pages },
-    { label: "Unique Orders", value: data.unique_orders },
-    { label: "Duplicates Skipped", value: data.duplicates_skipped },
-  ] : [];
-
-  return (
-    <div className="space-y-4" data-testid="pl-analytics-tab">
-      <div className="panel p-4 flex flex-wrap items-end gap-3">
-        <div className="flex-1 min-w-[220px]">
-          <div className="section-label mb-1">/ search</div>
-          <div className="relative">
-            <MagnifyingGlassIcon
-              size={14}
-              weight="bold"
-              className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]"
-            />
-            <input
-              value={qLive}
-              onChange={(e) => setQLive(e.target.value)}
-              placeholder="Filter SKUs or couriers…"
-              className="input-shell font-mono text-sm pl-8"
-              data-testid="pl-analytics-search"
-            />
-          </div>
-        </div>
-        <div>
-          <div className="section-label mb-1">/ from</div>
-          <input
-            type="date"
-            value={start}
-            onChange={(e) => setStart(e.target.value)}
-            className="input-shell font-mono text-xs"
-            data-testid="pl-analytics-start"
-          />
-        </div>
-        <div>
-          <div className="section-label mb-1">/ to</div>
-          <input
-            type="date"
-            value={end}
-            onChange={(e) => setEnd(e.target.value)}
-            className="input-shell font-mono text-xs"
-            data-testid="pl-analytics-end"
-          />
-        </div>
-        <button
-          onClick={() => { setStart(""); setEnd(""); setQLive(""); }}
-          className="btn-ghost text-xs"
-        >
-          Clear
-        </button>
-        <button
-          onClick={load}
-          className="btn-ghost text-xs flex items-center gap-1"
-          data-testid="pl-analytics-refresh"
-        >
-          <ArrowsClockwiseIcon size={12} weight="bold" /> Refresh
+    <div className="panel p-4" data-testid="pl-downloads-panel">
+      <div className="flex items-center gap-2 mb-3">
+        <DownloadSimpleIcon size={14} weight="bold" color="#10B981" />
+        <h3 className="font-display text-sm">Recent Downloads · Last 7 days</h3>
+        <button onClick={onRefresh} className="btn-ghost text-xs ml-auto flex items-center gap-1">
+          <ArrowsClockwiseIcon size={11} weight="bold" /> Refresh
         </button>
       </div>
-
-      {err && (
-        <div className="border border-[rgba(239,68,68,0.35)] bg-[rgba(239,68,68,0.1)] px-3 py-2 font-mono text-xs text-[#FCA5A5]">
-          {err}
-        </div>
-      )}
-
-      {loading ? (
-        <div className="text-center text-[var(--text-muted)] py-8">
-          <span className="cursor-blink">LOADING</span>
-        </div>
-      ) : !data || !data.total_runs ? (
-        <div className="panel p-10 text-center text-[var(--text-muted)] text-sm">
-          No printouts yet in this window. Head to <span className="code-tag">Sort &amp; Print</span> to make one.
+      {items.length === 0 ? (
+        <div className="text-center py-4 text-[var(--text-muted)] text-xs">
+          No printouts in the last 7 days.
         </div>
       ) : (
-        <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-            {stats.map((s) => (
-              <div key={s.label} className="kpi-card">
-                <div className="font-display text-2xl">{s.value}</div>
-                <div className="section-label mt-1">{s.label}</div>
-              </div>
-            ))}
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div className="panel p-4">
-              <h3 className="font-display text-sm mb-2 flex items-center gap-1">
-                <PrinterIcon size={14} weight="bold" /> Courier Partner Orders
-              </h3>
-              <div className="table-wrap max-h-[480px]">
-                <table className="dense">
-                  <thead>
-                    <tr>
-                      <th>Courier</th>
-                      <th className="num">Orders</th>
-                      <th className="num">%</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(data.courier_totals || []).map((c) => {
-                      const totalC = (data.courier_totals || []).reduce((a, b) => a + b.count, 0) || 1;
-                      return (
-                        <tr key={c.name} data-testid={`pl-cr-${c.name}`}>
-                          <td className="font-mono text-[11px]">{c.name}</td>
-                          <td className="num font-mono">{c.count}</td>
-                          <td className="num font-mono text-[var(--text-muted)]">
-                            {((c.count / totalC) * 100).toFixed(1)}%
-                          </td>
-                        </tr>
-                      );
-                    })}
-                    {!data.courier_totals?.length && (
-                      <tr><td colSpan={3} className="text-center py-4 text-[var(--text-muted)]">no data</td></tr>
+        <div className="table-wrap">
+          <table className="dense">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th className="num">Files</th>
+                <th className="num">Labels</th>
+                <th className="num">Orders</th>
+                <th className="num">Unmatched</th>
+                <th>Download</th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((r) => (
+                <tr key={r.run_id} data-testid={`pl-recent-${r.run_id}`}>
+                  <td className="text-xs">
+                    {r.created_at ? new Date(r.created_at).toLocaleString() : "—"}
+                  </td>
+                  <td className="num">{r.total_files || 0}</td>
+                  <td className="num">{r.total_pages || 0}</td>
+                  <td className="num">{r.unique_orders || 0}</td>
+                  <td className="num">
+                    {r.unknown_sku ? (
+                      <span className="chip chip-warn">{r.unknown_sku}</span>
+                    ) : (
+                      <span className="text-[var(--text-muted)]">0</span>
                     )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div className="panel p-4">
-              <h3 className="font-display text-sm mb-2 flex items-center gap-1">
-                <ChartBarIcon size={14} weight="bold" /> Product / SKU Orders
-                <span className="text-[var(--text-muted)] font-mono text-[10px] ml-1">
-                  ({(data.sku_totals || []).length} unique)
-                </span>
-              </h3>
-              <div className="table-wrap max-h-[480px]">
-                <table className="dense">
-                  <thead>
-                    <tr>
-                      <th>SKU / Product</th>
-                      <th className="num">Orders</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(data.sku_totals || []).map((c) => (
-                      <tr key={c.name} data-testid={`pl-sku-${c.name}`}>
-                        <td className="font-mono text-[11px]">{c.name}</td>
-                        <td className="num font-mono">{c.count}</td>
-                      </tr>
-                    ))}
-                    {!data.sku_totals?.length && (
-                      <tr><td colSpan={2} className="text-center py-4 text-[var(--text-muted)]">no data</td></tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-
-          {data.daily_series?.length > 0 && (
-            <div className="panel p-4">
-              <h3 className="font-display text-sm mb-3">Daily Volume</h3>
-              <DailyBars data={data.daily_series} />
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-function DailyBars({ data }) {
-  const max = Math.max(...data.map((d) => d.count), 1);
-  return (
-    <div className="space-y-1">
-      {data.map((d) => (
-        <div key={d.date} className="flex items-center gap-2 text-xs">
-          <div className="w-24 font-mono text-[10px] text-[var(--text-muted)]">{d.date}</div>
-          <div className="flex-1 bar-track">
-            <div
-              className="bar-fill"
-              style={{
-                width: `${(d.count / max) * 100}%`,
-                background: "var(--accent)",
-              }}
-            />
-          </div>
-          <div className="w-16 text-right font-mono">{d.count}</div>
+                  </td>
+                  <td>
+                    <div className="flex gap-1 flex-wrap">
+                      {(r.files || []).map((f) => (
+                        <button
+                          key={f}
+                          onClick={() => download(r.run_id, f)}
+                          className="btn-ghost text-[10px] flex items-center gap-1"
+                          data-testid={`pl-dl-${r.run_id}-${f}`}
+                        >
+                          <DownloadSimpleIcon size={10} weight="bold" />
+                          {f.replace(".pdf", "").replace(/_/g, " ")}
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      ))}
+      )}
+      <div className="text-[10px] text-[var(--text-muted)] mt-2 font-mono">
+        Files older than 7 days are auto-purged. Download filenames include the local timestamp.
+      </div>
     </div>
   );
 }
 
-// ============================================================================
-// Overrides tab — optional SKU normalization + courier rules
-// ============================================================================
-function OverridesTab() {
+// ---------------- Overrides collapsible ----------------
+function OverridesPanel() {
+  const [open, setOpen] = useState(false);
   const [cfg, setCfg] = useState({ sku_normalization: [], courier_rules: [] });
-  const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
   const [skuDraft, setSkuDraft] = useState({ raw_sku: "", normalized_sku: "" });
   const [courierDraft, setCourierDraft] = useState({ courier_name: "", match_text: "" });
 
   const load = useCallback(async () => {
-    setLoading(true); setErr("");
     try {
       const { data } = await api.get("/pdf-sorter/config");
       setCfg(data);
     } catch (e) { setErr(formatApiError(e)); }
-    setLoading(false);
   }, []);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { if (open) load(); }, [open, load]);
 
   const addSku = async () => {
     if (!skuDraft.raw_sku || !skuDraft.normalized_sku) return;
-    try {
-      await api.post("/pdf-sorter/config/sku", skuDraft);
-      setSkuDraft({ raw_sku: "", normalized_sku: "" });
-      await load();
-    } catch (e) { setErr(formatApiError(e)); }
+    try { await api.post("/pdf-sorter/config/sku", skuDraft); setSkuDraft({ raw_sku: "", normalized_sku: "" }); await load(); }
+    catch (e) { setErr(formatApiError(e)); }
   };
   const delSku = async (raw) => {
     if (!window.confirm(`Delete override for ${raw}?`)) return;
@@ -477,157 +288,401 @@ function OverridesTab() {
   };
   const addCourier = async () => {
     if (!courierDraft.courier_name || !courierDraft.match_text) return;
-    try {
-      await api.post("/pdf-sorter/config/courier", courierDraft);
-      setCourierDraft({ courier_name: "", match_text: "" });
-      await load();
-    } catch (e) { setErr(formatApiError(e)); }
+    try { await api.post("/pdf-sorter/config/courier", courierDraft); setCourierDraft({ courier_name: "", match_text: "" }); await load(); }
+    catch (e) { setErr(formatApiError(e)); }
   };
   const delCourier = async (nm) => {
-    if (!window.confirm(`Delete courier rule for ${nm}?`)) return;
+    if (!window.confirm(`Delete rule for ${nm}?`)) return;
     try { await api.delete(`/pdf-sorter/config/courier/${encodeURIComponent(nm)}`); await load(); }
     catch (e) { setErr(formatApiError(e)); }
   };
 
   return (
-    <div className="space-y-4" data-testid="pl-overrides-tab">
-      <div className="text-xs text-[var(--text-secondary)]">
-        Product Master is the primary source for SKU grouping. Add entries here <b>only</b> for
-        raw SKUs that aren&apos;t in Product Master or need a special override, or to teach the
-        app which text on a label identifies each courier partner.
-      </div>
-      {err && <div className="border border-[rgba(239,68,68,0.35)] bg-[rgba(239,68,68,0.1)] px-3 py-2 font-mono text-xs text-[#FCA5A5]">{err}</div>}
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="panel p-4 space-y-3">
-          <h3 className="font-display text-sm">SKU Overrides (optional)</h3>
-          <div className="flex flex-wrap items-end gap-2">
-            <input
-              placeholder="Raw SKU (as printed)"
-              value={skuDraft.raw_sku}
-              onChange={(e) => setSkuDraft({ ...skuDraft, raw_sku: e.target.value })}
-              className="input-shell font-mono text-xs flex-1"
-              data-testid="pl-sku-raw"
-            />
-            <input
-              placeholder="Group label"
-              value={skuDraft.normalized_sku}
-              onChange={(e) => setSkuDraft({ ...skuDraft, normalized_sku: e.target.value })}
-              className="input-shell font-mono text-xs flex-1"
-              data-testid="pl-sku-norm"
-            />
-            <button onClick={addSku} className="btn-primary text-xs" data-testid="pl-sku-add">Add</button>
-          </div>
-          <div className="table-wrap max-h-96">
-            <table className="dense">
-              <thead><tr><th>Raw SKU</th><th>Group</th><th></th></tr></thead>
-              <tbody>
-                {loading && <tr><td colSpan={3} className="text-center py-4 text-[var(--text-muted)]">Loading…</td></tr>}
-                {!loading && cfg.sku_normalization.length === 0 && (
-                  <tr><td colSpan={3} className="text-center py-4 text-[var(--text-muted)]">No overrides.</td></tr>
-                )}
-                {cfg.sku_normalization.map((r) => (
-                  <tr key={r.raw_sku}>
-                    <td className="font-mono text-[11px]">{r.raw_sku}</td>
-                    <td className="font-mono text-[11px] text-[#6EE7B7]">{r.normalized_sku}</td>
-                    <td className="text-right">
-                      <button onClick={() => delSku(r.raw_sku)} className="btn-ghost hover:text-[var(--status-failed)]">
-                        <TrashIcon size={12} weight="bold" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <div className="panel p-4 space-y-3">
-          <h3 className="font-display text-sm">Courier Rules</h3>
-          <div className="flex flex-wrap items-end gap-2">
-            <input
-              placeholder="Courier name"
-              value={courierDraft.courier_name}
-              onChange={(e) => setCourierDraft({ ...courierDraft, courier_name: e.target.value })}
-              className="input-shell font-mono text-xs flex-1"
-              data-testid="pl-courier-name"
-            />
-            <input
-              placeholder="Match text on label"
-              value={courierDraft.match_text}
-              onChange={(e) => setCourierDraft({ ...courierDraft, match_text: e.target.value })}
-              className="input-shell font-mono text-xs flex-1"
-              data-testid="pl-courier-match"
-            />
-            <button onClick={addCourier} className="btn-primary text-xs" data-testid="pl-courier-add">Add</button>
-          </div>
-          <div className="table-wrap max-h-96">
-            <table className="dense">
-              <thead><tr><th>Courier</th><th>Match</th><th></th></tr></thead>
-              <tbody>
-                {loading && <tr><td colSpan={3} className="text-center py-4 text-[var(--text-muted)]">Loading…</td></tr>}
-                {!loading && cfg.courier_rules.length === 0 && (
-                  <tr><td colSpan={3} className="text-center py-4 text-[var(--text-muted)]">No rules.</td></tr>
-                )}
-                {cfg.courier_rules.map((r) => (
-                  <tr key={r.courier_name}>
-                    <td className="font-mono text-[11px]">{r.courier_name}</td>
-                    <td className="font-mono text-[11px]">{r.match_text}</td>
-                    <td className="text-right">
-                      <button onClick={() => delCourier(r.courier_name)} className="btn-ghost hover:text-[var(--status-failed)]">
-                        <TrashIcon size={12} weight="bold" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+    <div className="panel" data-testid="pl-overrides-panel">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center gap-2 p-4 text-left"
+        data-testid="pl-overrides-toggle"
+      >
+        <SlidersIcon size={14} weight="bold" color="#10B981" />
+        <h3 className="font-display text-sm">Overrides &amp; Courier Rules</h3>
+        <span className="text-[11px] text-[var(--text-muted)] ml-2">
+          Optional — for SKUs not in Product Master and courier text matching
+        </span>
+        <span className="ml-auto text-xs text-[var(--text-muted)]">
+          {open ? "Hide" : "Show"}
+        </span>
+      </button>
+      {open && (
+        <div className="p-4 pt-0 space-y-4">
+          {err && (
+            <div className="border border-[rgba(239,68,68,0.35)] bg-[rgba(239,68,68,0.1)] px-3 py-2 font-mono text-xs text-[#FCA5A5]">
+              {err}
+            </div>
+          )}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <div className="section-label">/ sku overrides</div>
+              <div className="flex items-end gap-2">
+                <input placeholder="Raw SKU" value={skuDraft.raw_sku}
+                  onChange={(e) => setSkuDraft({ ...skuDraft, raw_sku: e.target.value })}
+                  className="input-shell font-mono text-xs flex-1" data-testid="pl-ovr-sku-raw" />
+                <input placeholder="Group label" value={skuDraft.normalized_sku}
+                  onChange={(e) => setSkuDraft({ ...skuDraft, normalized_sku: e.target.value })}
+                  className="input-shell font-mono text-xs flex-1" data-testid="pl-ovr-sku-norm" />
+                <button onClick={addSku} className="btn-primary text-xs" data-testid="pl-ovr-sku-add">Add</button>
+              </div>
+              <div className="table-wrap max-h-56">
+                <table className="dense">
+                  <thead><tr><th>Raw</th><th>Group</th><th></th></tr></thead>
+                  <tbody>
+                    {cfg.sku_normalization.length === 0 && (
+                      <tr><td colSpan={3} className="text-center py-3 text-[var(--text-muted)]">None</td></tr>
+                    )}
+                    {cfg.sku_normalization.map((r) => (
+                      <tr key={r.raw_sku}>
+                        <td className="font-mono text-[11px]">{r.raw_sku}</td>
+                        <td className="font-mono text-[11px] text-[#6EE7B7]">{r.normalized_sku}</td>
+                        <td className="text-right">
+                          <button onClick={() => delSku(r.raw_sku)} className="btn-ghost hover:text-[var(--status-failed)]">
+                            <TrashIcon size={11} weight="bold" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <div className="section-label">/ courier rules</div>
+              <div className="flex items-end gap-2">
+                <input placeholder="Courier" value={courierDraft.courier_name}
+                  onChange={(e) => setCourierDraft({ ...courierDraft, courier_name: e.target.value })}
+                  className="input-shell font-mono text-xs flex-1" data-testid="pl-ovr-cr-name" />
+                <input placeholder="Match text" value={courierDraft.match_text}
+                  onChange={(e) => setCourierDraft({ ...courierDraft, match_text: e.target.value })}
+                  className="input-shell font-mono text-xs flex-1" data-testid="pl-ovr-cr-match" />
+                <button onClick={addCourier} className="btn-primary text-xs" data-testid="pl-ovr-cr-add">Add</button>
+              </div>
+              <div className="table-wrap max-h-56">
+                <table className="dense">
+                  <thead><tr><th>Courier</th><th>Match</th><th></th></tr></thead>
+                  <tbody>
+                    {cfg.courier_rules.length === 0 && (
+                      <tr><td colSpan={3} className="text-center py-3 text-[var(--text-muted)]">None</td></tr>
+                    )}
+                    {cfg.courier_rules.map((r) => (
+                      <tr key={r.courier_name}>
+                        <td className="font-mono text-[11px]">{r.courier_name}</td>
+                        <td className="font-mono text-[11px]">{r.match_text}</td>
+                        <td className="text-right">
+                          <button onClick={() => delCourier(r.courier_name)} className="btn-ghost hover:text-[var(--status-failed)]">
+                            <TrashIcon size={11} weight="bold" />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
 
-// ============================================================================
-// Page
-// ============================================================================
+// ---------------- Main page ----------------
 export default function PrintoutLabelsPage() {
-  const [tab, setTab] = useState("process");
+  const [analytics, setAnalytics] = useState(null);
+  const [recent, setRecent] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+  const [processing, setProcessing] = useState(false);
+  const [runResult, setRunResult] = useState(null);
+  const [q, setQ] = useState("");
+  const [qLive, setQLive] = useState("");
+  const [showUnmatched, setShowUnmatched] = useState(false);
+
+  useEffect(() => {
+    const t = setTimeout(() => setQ(qLive), 300);
+    return () => clearTimeout(t);
+  }, [qLive]);
+
+  const loadAll = useCallback(async () => {
+    setLoading(true); setErr("");
+    try {
+      const p = new URLSearchParams();
+      if (q) p.append("q", q);
+      const [a, r] = await Promise.all([
+        api.get(`/pdf-sorter/analytics?${p.toString()}`),
+        api.get("/pdf-sorter/recent-runs"),
+      ]);
+      setAnalytics(a.data);
+      setRecent(r.data.items || []);
+    } catch (e) {
+      setErr(formatApiError(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [q]);
+
+  useEffect(() => { loadAll(); }, [loadAll]);
+
+  const process = async (files, clearFiles) => {
+    setProcessing(true); setErr(""); setRunResult(null);
+    try {
+      const fd = new FormData();
+      files.forEach((f) => fd.append("files", f));
+      const { data } = await api.post("/pdf-sorter/process", fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: 600000,
+      });
+      setRunResult(data);
+      clearFiles();
+      await loadAll();
+    } catch (e) {
+      setErr(formatApiError(e));
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  // Data for the summary cards uses latest_run when available, else the
+  // cumulative window shown by analytics.
+  const src = runResult || analytics?.latest_run || analytics || {};
+  const total_files = runResult?.total_files ?? analytics?.total_files ?? 0;
+  const total_pages = runResult?.total_pages ?? analytics?.total_pages ?? 0;
+  const unknown = runResult?.unknown_sku ?? analytics?.unknown_sku_total ?? 0;
+  const sorted = Math.max(0, total_pages - unknown);
+  const groups_filled = analytics?.groups_filled ?? 0;
+  const groups_total = analytics?.groups_total ?? 0;
+  const unique_orders = runResult?.unique_orders ?? analytics?.unique_orders ?? 0;
+
+  // Tables (per current view)
+  const courierRows = useMemo(() => {
+    if (runResult?.courier_totals) {
+      return Object.entries(runResult.courier_totals)
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count);
+    }
+    return analytics?.courier_totals || [];
+  }, [runResult, analytics]);
+
+  const skuRows = useMemo(() => {
+    if (runResult?.sku_totals) {
+      return Object.entries(runResult.sku_totals)
+        .map(([name, count]) => ({ name, count }))
+        .sort((a, b) => b.count - a.count);
+    }
+    return analytics?.sku_totals || [];
+  }, [runResult, analytics]);
+
+  const courierTotal = courierRows.reduce((s, r) => s + r.count, 0) || 1;
+  const skuTotal = skuRows.reduce((s, r) => s + r.count, 0) || 1;
+
+  const unmatchedRows = runResult?.unmatched_skus
+    || analytics?.latest_run?.unmatched_skus
+    || [];
+
+  const stepper = [
+    { label: "Uploaded" }, { label: "Read" },
+    { label: "Matched" }, { label: "Sorted" }, { label: "Done" },
+  ];
+  const step = runResult ? 5 : (analytics?.latest_run ? 5 : 0);
+
   return (
     <div className="px-8 py-6 space-y-5" data-testid="printout-labels-page">
-      <div className="flex items-center gap-2">
-        <PrinterIcon size={22} weight="bold" color="#10B981" />
-        <div className="flex-1">
-          <h2 className="font-display text-xl">Printout Labels</h2>
-          <div className="text-xs text-[var(--text-muted)]">
-            Upload PDFs from any/multiple accounts. Sorted by Product Master SKUs and delivered
-            as TIER-1 / TIER-2 / MASTER printouts, plus courier and SKU analytics.
+      <div className="flex items-start justify-between gap-4">
+        <div className="flex items-center gap-2">
+          <PrinterIcon size={22} weight="bold" color="#10B981" />
+          <div>
+            <h2 className="font-display text-xl">Printout Labels</h2>
+            <div className="text-xs text-[var(--text-muted)]">
+              Upload Meesho label PDFs, sort by Product Master SKUs, download TIER1 / TIER2 / MASTER printouts.
+            </div>
+          </div>
+        </div>
+        <div className="relative w-72">
+          <MagnifyingGlassIcon size={13} weight="bold"
+            className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
+          <input
+            value={qLive}
+            onChange={(e) => setQLive(e.target.value)}
+            placeholder="Search SKUs or couriers…"
+            className="input-shell font-mono text-xs pl-8"
+            data-testid="pl-search"
+          />
+        </div>
+      </div>
+
+      {err && (
+        <div className="border border-[rgba(239,68,68,0.35)] bg-[rgba(239,68,68,0.1)] px-3 py-2 font-mono text-xs text-[#FCA5A5]">
+          {err}
+        </div>
+      )}
+
+      {/* Upload zone — always visible on top */}
+      <UploadZone onFilesReady={process} processing={processing} />
+
+      {/* Sorting stepper (static, always visible after any run exists) */}
+      {step > 0 && (
+        <div className="panel p-4" data-testid="pl-stepper">
+          <div className="section-label mb-3">/ sorting progress</div>
+          <StaticStepper steps={stepper} current={step} />
+        </div>
+      )}
+
+      {/* KPIs */}
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+        <KPI icon={FilePdfIcon} label="Total Files" value={total_files}
+             sub="Uploaded" tint="blue" />
+        <KPI icon={PrinterIcon} label="Total Labels" value={total_pages}
+             sub="All Files Combined" tint="green" />
+        <KPI icon={CheckCircleIcon} label="Sorted Labels" value={sorted}
+             sub={total_pages > 0 ? `${((sorted / total_pages) * 100).toFixed(1)}% of Total` : "—"}
+             tint="green" />
+        <KPI icon={WarningCircleIcon} label="Unmatched" value={unknown}
+             sub={total_pages > 0 ? `${((unknown / total_pages) * 100).toFixed(1)}% of Total` : "—"}
+             tint="amber" />
+        <KPI icon={PackageIcon} label="Groups Filled" value={`${groups_filled} / ${groups_total}`}
+             sub={groups_total > 0
+               ? `${((groups_filled / groups_total) * 100).toFixed(0)}% Completed`
+               : "No products yet"}
+             tint="violet" />
+        <KPI icon={PackageIcon} label="Total Packages" value={unique_orders}
+             sub="Shippable" tint="blue" />
+      </div>
+
+      {/* Tables */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div className="panel p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <PrinterIcon size={13} weight="bold" color="#10B981" />
+            <h3 className="font-display text-sm">Courier Partner Orders</h3>
+            <span className="text-[10px] text-[var(--text-muted)] font-mono ml-1">
+              ({courierRows.length})
+            </span>
+          </div>
+          <div className="table-wrap max-h-[420px]">
+            <table className="dense">
+              <thead>
+                <tr><th>Courier</th><th className="num">Orders</th><th className="num">%</th></tr>
+              </thead>
+              <tbody>
+                {courierRows.length === 0 && (
+                  <tr><td colSpan={3} className="text-center py-6 text-[var(--text-muted)]">no data</td></tr>
+                )}
+                {courierRows.map((c) => (
+                  <tr key={c.name} data-testid={`pl-cr-${c.name}`}>
+                    <td className="font-mono text-[11px]">{c.name}</td>
+                    <td className="num font-mono">{c.count}</td>
+                    <td className="num font-mono text-[var(--text-muted)]">
+                      {((c.count / courierTotal) * 100).toFixed(1)}%
+                    </td>
+                  </tr>
+                ))}
+                {courierRows.length > 1 && (
+                  <tr>
+                    <td className="font-mono text-[11px] text-[var(--accent)]">Total</td>
+                    <td className="num font-mono text-[var(--accent)]">{courierTotal}</td>
+                    <td className="num font-mono text-[var(--accent)]">100%</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="panel p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <PackageIcon size={13} weight="bold" color="#10B981" />
+            <h3 className="font-display text-sm">Product / SKU Orders</h3>
+            <span className="text-[10px] text-[var(--text-muted)] font-mono ml-1">
+              ({skuRows.length} unique)
+            </span>
+          </div>
+          <div className="table-wrap max-h-[420px]">
+            <table className="dense">
+              <thead>
+                <tr><th>SKU / Product</th><th className="num">Orders</th></tr>
+              </thead>
+              <tbody>
+                {skuRows.length === 0 && (
+                  <tr><td colSpan={2} className="text-center py-6 text-[var(--text-muted)]">no data</td></tr>
+                )}
+                {skuRows.map((c) => (
+                  <tr key={c.name} data-testid={`pl-sku-${c.name}`}>
+                    <td className="font-mono text-[11px]">{c.name}</td>
+                    <td className="num font-mono">{c.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
 
-      <div className="flex gap-1 border-b border-[var(--border)]">
-        {TABS.map((t) => (
-          <button
-            key={t.k}
-            onClick={() => setTab(t.k)}
-            className={
-              "px-4 py-2 font-mono text-[11px] uppercase tracking-wider border-b-2 transition-colors " +
-              (tab === t.k
-                ? "border-[var(--accent)] text-[var(--text-primary)]"
-                : "border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]")
-            }
-            data-testid={`pl-tab-${t.k}`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      {/* Unmatched alert */}
+      {unmatchedRows.length > 0 && (
+        <div
+          className="panel p-4 border-[rgba(245,158,11,0.35)]"
+          style={{ background: "rgba(245,158,11,0.06)" }}
+          data-testid="pl-unmatched"
+        >
+          <div className="flex items-center gap-2">
+            <WarningCircleIcon size={16} weight="bold" color="#FCD34D" />
+            <h3 className="font-display text-sm text-[#FCD34D]">
+              Unmatched Labels ({unmatchedRows.length})
+            </h3>
+            <button
+              onClick={() => setShowUnmatched((o) => !o)}
+              className="btn-secondary text-xs ml-auto"
+              data-testid="pl-unmatched-toggle"
+            >
+              {showUnmatched ? "Hide list" : "View list"}
+            </button>
+          </div>
+          <div className="text-[11px] text-[var(--text-secondary)] mt-1">
+            These raw SKUs could not be matched to any product in Master. Add them in <span className="code-tag">Product Master</span>.
+          </div>
+          {showUnmatched && (
+            <div className="mt-3 flex flex-wrap gap-1 max-h-40 overflow-y-auto">
+              {unmatchedRows.slice(0, 500).map((u) => (
+                <span key={u.sku} className="chip chip-warn">
+                  {u.sku}{u.count > 1 && (
+                    <span className="opacity-70 font-mono text-[9px]">×{u.count}</span>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
-      {tab === "process" && <ProcessTab />}
-      {tab === "analytics" && <AnalyticsTab />}
-      {tab === "overrides" && <OverridesTab />}
+      {/* Warnings — CANCELLED / RTO from most recent run */}
+      {(runResult?.warnings || []).length > 0 && (
+        <div className="border border-[rgba(245,158,11,0.35)] bg-[rgba(245,158,11,0.1)] p-3 rounded text-xs">
+          <div className="font-semibold text-[#FCD34D] mb-1 flex items-center gap-1">
+            <WarningCircleIcon size={12} weight="bold" /> Warnings — orders already CANCELLED / RTO in P&amp;L
+          </div>
+          <div className="space-y-0.5 max-h-40 overflow-y-auto">
+            {runResult.warnings.map((w, i) => (
+              <div key={i} className="font-mono text-[11px]">
+                {w.order_no} — <span className="text-[#FCA5A5]">{w.status}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Downloads history */}
+      <DownloadsPanel items={recent} onRefresh={loadAll} />
+
+      {/* Overrides */}
+      <OverridesPanel />
     </div>
   );
 }

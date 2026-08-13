@@ -51,6 +51,7 @@ class PageMeta:
 @dataclass
 class RunResult:
     run_id: str
+    total_files: int
     total_pages: int
     unique_orders: int
     duplicates_skipped: int
@@ -61,6 +62,8 @@ class RunResult:
     size_totals: Dict[str, int] = field(default_factory=dict)
     warnings: List[Dict[str, Any]] = field(default_factory=list)
     files: List[str] = field(default_factory=list)
+    product_ids: List[str] = field(default_factory=list)
+    unmatched_skus: List[Dict[str, Any]] = field(default_factory=list)
 
 
 # ---- Regex helpers ---------------------------------------------------------
@@ -163,6 +166,9 @@ async def process_pdfs(
     account_id: Optional[str] = None,
     actor_email: str = "upload",
 ) -> RunResult:
+    # Housekeeping: purge outputs older than 7 days on every run.
+    _purge_old_runs(days=7)
+
     sku_map = await load_sku_normalisation(db)   # optional overrides
     pm_map = await load_pm_sku_map(db)            # primary source
     courier_rules = await load_courier_rules(db)
@@ -173,6 +179,8 @@ async def process_pdfs(
     duplicates_skipped = 0
     unknown_sku = 0
     unknown_courier = 0
+    matched_pids: set = set()
+    unmatched_counter: Dict[str, int] = {}
 
     for idx, pdf_path in enumerate(pdf_paths):
         readers.append(PdfReader(str(pdf_path)))
@@ -218,6 +226,11 @@ async def process_pdfs(
                     courier=courier, order_no=order_no,
                     file_name=pdf_path.name,
                 ))
+                # Track matched product ids + unmatched raw SKUs
+                if pm_hit:
+                    matched_pids.add(pm_hit["product_id"])
+                elif not is_known:
+                    unmatched_counter[sku_raw] = unmatched_counter.get(sku_raw, 0) + 1
 
     # Cross-check against pl_orders — RTO / CANCELLED warnings
     warnings: List[Dict[str, Any]] = []
@@ -291,8 +304,14 @@ async def process_pdfs(
         if pg.size:
             size_totals[pg.size] += 1
 
+    unmatched_list = sorted(
+        [{"sku": k, "count": v} for k, v in unmatched_counter.items()],
+        key=lambda x: -x["count"],
+    )
+
     result = RunResult(
         run_id=run_id,
+        total_files=len(pdf_paths),
         total_pages=len(pages),
         unique_orders=len(seen_orders),
         duplicates_skipped=duplicates_skipped,
@@ -303,6 +322,8 @@ async def process_pdfs(
         size_totals=dict(size_totals),
         warnings=warnings,
         files=files,
+        product_ids=list(matched_pids),
+        unmatched_skus=unmatched_list,
     )
 
     # Persist run metadata for history views
@@ -311,6 +332,7 @@ async def process_pdfs(
         "account_id": account_id,
         "created_at": datetime.now(timezone.utc),
         "created_by": actor_email,
+        "total_files": result.total_files,
         "total_pages": result.total_pages,
         "unique_orders": result.unique_orders,
         "duplicates_skipped": result.duplicates_skipped,
@@ -321,6 +343,8 @@ async def process_pdfs(
         "size_totals": result.size_totals,
         "warnings": result.warnings,
         "files": result.files,
+        "product_ids": result.product_ids,
+        "unmatched_skus": result.unmatched_skus,
     })
 
     return result

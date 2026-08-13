@@ -198,6 +198,7 @@ async def process(
                                  actor_email="dashboard")
     return {
         "run_id": result.run_id,
+        "total_files": result.total_files,
         "total_pages": result.total_pages,
         "unique_orders": result.unique_orders,
         "duplicates_skipped": result.duplicates_skipped,
@@ -208,6 +209,7 @@ async def process(
         "size_totals": result.size_totals,
         "warnings": result.warnings,
         "files": result.files,
+        "unmatched_skus": result.unmatched_skus,
     }
 
 
@@ -236,16 +238,21 @@ async def analytics(
 
     total_runs = 0
     total_pages = 0
+    total_files = 0
     unique_orders = 0
     duplicates_skipped = 0
+    unknown_sku_total = 0
     sku_totals: Dict[str, int] = {}
     courier_totals: Dict[str, int] = {}
     daily: Dict[str, int] = {}
-    async for r in db.pdf_sorter_runs.find(match):
+    latest_run: Optional[Dict[str, Any]] = None
+    async for r in db.pdf_sorter_runs.find(match).sort("created_at", -1):
         total_runs += 1
         total_pages += int(r.get("total_pages") or 0)
+        total_files += int(r.get("total_files") or 0)
         unique_orders += int(r.get("unique_orders") or 0)
         duplicates_skipped += int(r.get("duplicates_skipped") or 0)
+        unknown_sku_total += int(r.get("unknown_sku") or 0)
         for k, v in (r.get("sku_totals") or {}).items():
             sku_totals[k] = sku_totals.get(k, 0) + int(v or 0)
         for k, v in (r.get("courier_totals") or {}).items():
@@ -254,6 +261,31 @@ async def analytics(
         if isinstance(d, datetime):
             key = d.strftime("%Y-%m-%d")
             daily[key] = daily.get(key, 0) + int(r.get("total_pages") or 0)
+        if latest_run is None:
+            latest_run = {
+                "run_id": r.get("run_id"),
+                "created_at": r["created_at"].isoformat().replace("+00:00", "Z")
+                    if isinstance(r.get("created_at"), datetime) else None,
+                "files": r.get("files") or [],
+                "total_pages": r.get("total_pages") or 0,
+                "sorted": (r.get("total_pages") or 0) - (r.get("unknown_sku") or 0),
+                "unmatched": r.get("unknown_sku") or 0,
+                "unique_orders": r.get("unique_orders") or 0,
+                "input_files_count": r.get("total_files") or 0,
+                "sku_totals": r.get("sku_totals") or {},
+                "courier_totals": r.get("courier_totals") or {},
+                "unmatched_skus": r.get("unmatched_skus") or [],
+                "warnings": r.get("warnings") or [],
+            }
+
+    # Groups Filled X / Y — Y = distinct products in Product Master.
+    # X = distinct products that had ≥1 label matched (across the window).
+    y_total = await db.pm_products.estimated_document_count()
+    matched_products = set()
+    async for r in db.pdf_sorter_runs.find(match, {"product_ids": 1}):
+        for pid in (r.get("product_ids") or []):
+            matched_products.add(pid)
+    groups_filled = len(matched_products)
 
     if q:
         needle = q.strip().lower()
@@ -271,9 +303,14 @@ async def analytics(
 
     return {
         "total_runs": total_runs,
+        "total_files": total_files,
         "total_pages": total_pages,
         "unique_orders": unique_orders,
         "duplicates_skipped": duplicates_skipped,
+        "unknown_sku_total": unknown_sku_total,
+        "groups_filled": groups_filled,
+        "groups_total": y_total,
+        "latest_run": latest_run,
         "sku_totals": _rows(sku_totals),
         "courier_totals": _rows(courier_totals),
         "daily_series": sorted(
@@ -281,6 +318,25 @@ async def analytics(
             key=lambda x: x["date"],
         ),
     }
+
+
+@router.get("/recent-runs")
+async def recent_runs(days: int = Query(7, ge=1, le=90)):
+    """Runs in the last N days for the downloads history strip."""
+    db = get_db()
+    since = datetime.now(timezone.utc).timestamp() - days * 86400
+    since_dt = datetime.fromtimestamp(since, tz=timezone.utc)
+    rows = []
+    async for r in db.pdf_sorter_runs.find(
+        {"created_at": {"$gte": since_dt}},
+        {"_id": 0, "run_id": 1, "created_at": 1, "total_pages": 1,
+         "total_files": 1, "files": 1, "unknown_sku": 1, "unique_orders": 1},
+    ).sort("created_at", -1):
+        if isinstance(r.get("created_at"), datetime):
+            r["created_at"] = r["created_at"].isoformat().replace(
+                "+00:00", "Z")
+        rows.append(r)
+    return {"items": rows, "window_days": days}
 
 
 @router.get("/runs")
@@ -299,10 +355,16 @@ async def list_runs(limit: int = Query(30, le=200)):
 
 @router.get("/runs/{run_id}/files/{filename}")
 async def download(run_id: str, filename: str):
-    # basic path traversal guard
+    # Basic path traversal guard
     safe = Path(filename).name
     fp = OUTPUT_DIR / run_id / safe
     if not fp.is_file():
         raise HTTPException(status_code=404, detail="file not found")
-    return FileResponse(fp, filename=safe,
+    # Human-readable timestamp suffix — e.g.
+    # TIER1_HIGH_VOLUME__2026-08-03_14-58-12.pdf
+    stem = fp.stem
+    suffix = fp.suffix
+    ts = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+    download_name = f"{stem}__{ts}{suffix}"
+    return FileResponse(fp, filename=download_name,
                         media_type="application/pdf")
