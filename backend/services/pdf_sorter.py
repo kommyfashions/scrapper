@@ -36,6 +36,25 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _purge_old_runs(days: int = 7) -> None:
+    """Delete run directories older than N days from both uploads/ and outputs/.
+    Best-effort; failures are swallowed."""
+    import shutil as _sh
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    for base in (UPLOAD_DIR, OUTPUT_DIR):
+        try:
+            for child in base.iterdir():
+                if not child.is_dir():
+                    continue
+                try:
+                    if child.stat().st_mtime < cutoff:
+                        _sh.rmtree(child, ignore_errors=True)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+
 @dataclass
 class PageMeta:
     reader_idx: int
