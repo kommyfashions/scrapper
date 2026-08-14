@@ -12,7 +12,7 @@ import requests
 
 BASE_URL = os.environ.get(
     "REACT_APP_BACKEND_URL",
-    "https://order-scraper.preview.emergentagent.com",
+    "https://product-master-hub-1.preview.emergentagent.com",
 ).rstrip("/")
 
 ADMIN = "admin@meesho-dash.local"

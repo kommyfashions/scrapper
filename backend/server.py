@@ -27,6 +27,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from routers import product_master as pm_router
 from routers import pdf_sorter as ps_router
+from routers import inventory_actions as ia_router
 from services import product_master as pm_service
 
 # --------------------------------------------------------------------------------------
@@ -3522,6 +3523,14 @@ app.include_router(
 ps_router.configure(db)
 app.include_router(
     ps_router.router,
+    prefix="/api",
+    dependencies=[Depends(get_current_user)],
+)
+
+# Inventory Bulk Pause module
+ia_router.configure(db)
+app.include_router(
+    ia_router.router,
     prefix="/api",
     dependencies=[Depends(get_current_user)],
 )

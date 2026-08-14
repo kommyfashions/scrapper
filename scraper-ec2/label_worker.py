@@ -36,6 +36,7 @@ import labels  # the user's labels.py — we override its globals per-job
 import payments_fetcher  # type=payments_fetch (Excel payments file)
 import gst_report_fetcher  # type=gst_report_fetch
 import tax_invoice_fetcher  # type=tax_invoice_fetch
+import pause_skus_fetcher  # type=pause_skus (bulk pause via Product Master)
 
 MONGO_URI = os.environ.get("MESHO_MONGO_URI", "mongodb://127.0.0.1:27017/")
 DB_NAME = os.environ.get("MESHO_DB_NAME", "meesho")
@@ -46,7 +47,7 @@ db = client[DB_NAME]
 jobs_col = db["jobs"]
 accounts_col = db["accounts"]
 
-JOB_TYPES = ["label_download", "payments_fetch", "gst_report_fetch", "tax_invoice_fetch"]
+JOB_TYPES = ["label_download", "payments_fetch", "gst_report_fetch", "tax_invoice_fetch", "pause_skus"]
 
 
 def chrome_alive(port: int) -> bool:
@@ -157,6 +158,11 @@ def loop():
                 month = int(payload.get("month"))
                 result_doc = tax_invoice_fetcher.run_tax_invoice_fetch_for_account(
                     acc, year, month, str(job["_id"])
+                )
+            elif jtype == "pause_skus":
+                payload = job.get("payload") or {}
+                result_doc = pause_skus_fetcher.run_pause_skus_for_account(
+                    acc, payload
                 )
             else:
                 raise RuntimeError(f"unknown job type: {jtype}")

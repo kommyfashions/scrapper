@@ -16,6 +16,7 @@ import LabelsPage from "@/pages/LabelsPage";
 import PrintoutLabelsPage from "@/pages/PrintoutLabelsPage";
 import AccountsPage from "@/pages/AccountsPage";
 import SettingsPage from "@/pages/SettingsPage";
+import InventoryActionsPage from "@/pages/InventoryActionsPage";
 import PLLayout from "@/pages/pl/PLLayout";
 import PLDashboard from "@/pages/pl/PLDashboard";
 import PLOrders from "@/pages/pl/PLOrders";
@@ -50,6 +51,7 @@ function App() {
               <Route path="/pdf-sorter" element={<PrintoutLabelsPage />} />
               <Route path="/printout-labels" element={<PrintoutLabelsPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
+              <Route path="/inventory-actions" element={<InventoryActionsPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/pl" element={<PLLayout />}>
                 <Route index element={<Navigate to="/pl/dashboard" replace />} />

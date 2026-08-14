@@ -54,6 +54,22 @@ pdf_sorter_runs                    # NEW  (run history)
 - Order-No dedupe within a run + CANCELLED/RTO warnings from `pl_orders`
   remain.
 
+## Bulk Pause via Product Master (Feb 2026)
+- New page **`/inventory-actions`** (sidebar: "Bulk Pause").
+- User picks **Account → Main Category → Color → sizes** (or "whole product").
+- Preview shows Style IDs + estimated Meesho SKUs.
+- **`POST /api/inventory-actions/pause`** queues a `jobs.type=pause_skus` doc.
+- **Multi-account** from day 1 — each `accounts` doc's own `debug_port`
+  Chrome profile is used (same routing as `label_download`).
+- Scraper worker (`/app/scraper-ec2/pause_skus_fetcher.py`) opens supplier
+  panel, searches each Style ID, ticks matching sizes only, clicks
+  **Pause Selected**, waits for the success toast. Records per-Style-ID
+  status: `paused | already_paused | failed`.
+- Endpoints: `/api/inventory-actions/options` (cascade),
+  `/preview`, `/pause`, `/history`, `/{job_id}`.
+- Idempotent: duplicate pause of same product returns `already_queued=true`.
+- Tests: `/app/backend/tests/test_inventory_actions.py` — 5 pass.
+
 ## Theme (Feb 2026)
 Warm Slate palette. Deep indigo-slate background `#0F172A`, cards `#1E293B`,
 accent emerald `#10B981`. Chips/tags for sizes and SKUs.
@@ -68,9 +84,13 @@ accent emerald `#10B981`. Chips/tags for sizes and SKUs.
 - Pagination for Jobs & Products pages.
 - 7-day rating movement card.
 - Resend email → auto-mail CA the 7-day GST/Tax signed links.
+- Bulk Resume (un-pause) — user explicitly said "not now, later".
 
 ## Dev/testing notes
 - Preview env cannot reach EC2 Mongo. Backend/.env `MONGO_URL` switched to
   `mongodb://localhost:27017` for local testing. **User must revert to their
   EC2 IP before deploying.**
-- Backend tests: `cd /app/backend && python -m pytest tests/ -q` — 35 pass.
+- Backend tests: `cd /app/backend && python -m pytest tests/ -q`.
+- EC2 deploy after this change requires the user to `git pull` on both the
+  dashboard box AND the scraper box, then restart `meesho-label-worker`
+  systemd service so the new `pause_skus_fetcher.py` is picked up.
