@@ -2029,7 +2029,7 @@ async def pl_sku_analysis_tree(
         await pl_resolve_account_filter(account_id)
 
     base_q = _pl_date_query(account_id, start_date, end_date,
-                            {"order_status": {"$nin": ["CANCELLED", "EXCHANGE"]}})
+                            {"order_status": {"$in": ["DELIVERED", "RETURNED"]}})
     orders = await db.pl_orders.find(base_q, {"_id": 0}).to_list(None)
     costs = await _pl_load_costs()
 
@@ -2059,7 +2059,7 @@ async def pl_sku_analysis_tree(
                 "account_id": acc, "sku": s,
                 "product_name": o.get("product_name", ""),
                 "units_ordered": 0, "units_delivered": 0, "units_returned": 0,
-                "exposure_units": 0, "profit": 0.0, "loss": 0.0,
+                "profit": 0.0, "loss": 0.0,
                 "ship_out": 0.0, "ship_return": 0.0,
             }
         d = cells[key]
@@ -2074,8 +2074,6 @@ async def pl_sku_analysis_tree(
             d["units_returned"] += 1
             d["ship_return"] += o.get("return_shipping_charge") or 0
             d["loss"] += (o.get("return_shipping_charge") or 0) - (o.get("compensation_amount") or 0)
-        if o["order_status"] == "SHIPPED":
-            d["exposure_units"] += 1
 
     def _classify(rr, contrib):
         if contrib > 0 and rr < 20:
@@ -2100,14 +2098,13 @@ async def pl_sku_analysis_tree(
             "net_realized_profit": round(d["profit"], 2),
             "total_return_loss": round(d["loss"], 2),
             "net_sku_contribution": round(contrib, 2),
-            "exposure_units": d["exposure_units"],
             "profit_per_delivered_unit": round(ppu, 2),
             "classification": _classify(rr, contrib),
         }
 
     def _aggregate(rows: List[dict]) -> dict:
         agg = {"units_ordered": 0, "units_delivered": 0, "units_returned": 0,
-               "exposure_units": 0, "ship_out": 0.0, "ship_return": 0.0,
+               "ship_out": 0.0, "ship_return": 0.0,
                "net_realized_profit": 0.0, "total_return_loss": 0.0,
                "net_sku_contribution": 0.0}
         for r in rows:
@@ -2159,7 +2156,7 @@ async def pl_sku_analysis_tree(
                     "units_returned": 0, "return_rate": 0,
                     "ship_out": 0, "ship_return": 0,
                     "net_realized_profit": 0, "total_return_loss": 0,
-                    "net_sku_contribution": 0, "exposure_units": 0,
+                    "net_sku_contribution": 0,
                     "profit_per_delivered_unit": 0,
                     "classification": "No Data",
                 })
@@ -2256,6 +2253,324 @@ async def pl_sku_analysis_tree(
 
     return {"categories": out_categories,
             "group_by": "product-tree"}
+
+
+# ---------- Analyzer KPIs (with vs-prev-period deltas) ----------
+@api.get("/pl/analyzer/kpis")
+async def pl_analyzer_kpis(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """6 KPIs (Orders / Delivered / Returns / Revenue / Profit / Net Margin)
+    for the current window and the equal-length previous window, so we can
+    show ↑↓ deltas."""
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+
+    async def _bucket(sd: Optional[str], ed: Optional[str]) -> dict:
+        q = _pl_date_query(account_id, sd, ed,
+                           {"order_status": {"$in": ["DELIVERED", "RETURNED"]}})
+        orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+        costs = await _pl_load_costs()
+        d = {"ordered": 0, "delivered": 0, "returned": 0,
+             "revenue": 0.0, "cost": 0.0, "profit": 0.0, "loss": 0.0}
+        for o in orders:
+            d["ordered"] += 1
+            if o["order_status"] == "DELIVERED":
+                d["delivered"] += 1
+                d["revenue"] += o.get("net_settlement_amount") or 0
+                if o["payment_status"] == "PAID":
+                    c = _pl_lookup_cost(costs, _pl_norm_acc(o.get("account_id")),
+                                        o.get("sku"))
+                    d["cost"] += c
+                    d["profit"] += (o.get("net_settlement_amount") or 0) - c
+            if o["order_status"] == "RETURNED":
+                d["returned"] += 1
+                d["loss"] += (o.get("return_shipping_charge") or 0) - (o.get("compensation_amount") or 0)
+        d["net_margin"] = (d["profit"] / d["revenue"] * 100) if d["revenue"] else 0
+        d["return_rate"] = (d["returned"] / d["ordered"] * 100) if d["ordered"] else 0
+        d["net_contribution"] = d["profit"] - d["loss"]
+        return d
+
+    curr = await _bucket(start_date, end_date)
+
+    # Prev period: same length ending the day before start_date
+    from datetime import datetime as _dt, timedelta
+    prev = None
+    if start_date and end_date:
+        try:
+            s = _dt.fromisoformat(start_date)
+            e = _dt.fromisoformat(end_date)
+            span = (e - s).days + 1
+            prev_e = s - timedelta(days=1)
+            prev_s = prev_e - timedelta(days=span - 1)
+            prev = await _bucket(prev_s.strftime("%Y-%m-%d"),
+                                  prev_e.strftime("%Y-%m-%d"))
+        except Exception:
+            prev = None
+
+    def _delta(a, b):
+        if b is None or b == 0:
+            return None
+        return round((a - b) / b * 100, 1)
+
+    kpis = [
+        {"key": "orders", "label": "Total Orders", "value": curr["ordered"],
+         "delta_pct": _delta(curr["ordered"], prev["ordered"]) if prev else None,
+         "prev": prev["ordered"] if prev else None},
+        {"key": "delivered", "label": "Delivered", "value": curr["delivered"],
+         "delta_pct": _delta(curr["delivered"], prev["delivered"]) if prev else None,
+         "prev": prev["delivered"] if prev else None,
+         "sub": f"{round((curr['delivered']/curr['ordered']*100), 1)}% of orders" if curr["ordered"] else "—"},
+        {"key": "returned", "label": "Returns", "value": curr["returned"],
+         "delta_pct": _delta(curr["returned"], prev["returned"]) if prev else None,
+         "prev": prev["returned"] if prev else None,
+         "sub": f"{round(curr['return_rate'], 1)}% return rate"},
+        {"key": "revenue", "label": "Revenue", "value": round(curr["revenue"], 2),
+         "delta_pct": _delta(curr["revenue"], prev["revenue"]) if prev else None,
+         "prev": round(prev["revenue"], 2) if prev else None, "currency": True},
+        {"key": "profit", "label": "Profit", "value": round(curr["profit"], 2),
+         "delta_pct": _delta(curr["profit"], prev["profit"]) if prev else None,
+         "prev": round(prev["profit"], 2) if prev else None, "currency": True},
+        {"key": "net_margin", "label": "Net Margin", "value": round(curr["net_margin"], 2),
+         "delta_pct": _delta(curr["net_margin"], prev["net_margin"]) if prev else None,
+         "prev": round(prev["net_margin"], 2) if prev else None,
+         "sub": "%", "is_percent": True},
+    ]
+    return {"kpis": kpis, "current": curr, "prev": prev}
+
+
+# ---------- Analyzer Profit Trend ----------
+@api.get("/pl/analyzer/trend")
+async def pl_analyzer_trend(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Daily Revenue + Profit + Return Rate % series for a line chart."""
+    if account_id and account_id != "all":
+        await pl_resolve_account_filter(account_id)
+    q = _pl_date_query(account_id, start_date, end_date,
+                       {"order_status": {"$in": ["DELIVERED", "RETURNED"]}})
+    orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+    costs = await _pl_load_costs()
+
+    by_day: Dict[str, dict] = {}
+    for o in orders:
+        dt = o.get("order_date")
+        if not dt:
+            continue
+        key = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)[:10]
+        d = by_day.setdefault(key, {"date": key, "revenue": 0.0, "profit": 0.0,
+                                     "ordered": 0, "delivered": 0, "returned": 0})
+        d["ordered"] += 1
+        if o["order_status"] == "DELIVERED":
+            d["delivered"] += 1
+            d["revenue"] += o.get("net_settlement_amount") or 0
+            if o["payment_status"] == "PAID":
+                c = _pl_lookup_cost(costs, _pl_norm_acc(o.get("account_id")),
+                                    o.get("sku"))
+                d["profit"] += (o.get("net_settlement_amount") or 0) - c
+        if o["order_status"] == "RETURNED":
+            d["returned"] += 1
+
+    series = []
+    for k in sorted(by_day.keys()):
+        r = by_day[k]
+        rr = (r["returned"] / r["ordered"] * 100) if r["ordered"] else 0
+        series.append({
+            "date": k,
+            "revenue": round(r["revenue"], 2),
+            "profit": round(r["profit"], 2),
+            "return_rate": round(rr, 2),
+        })
+    return {"series": series}
+
+
+# ---------- Analyzer Account Performance ----------
+@api.get("/pl/analyzer/accounts")
+async def pl_analyzer_accounts(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Per-account Orders / Revenue / Return% / Profit / Margin."""
+    q = _pl_date_query(None, start_date, end_date,
+                       {"order_status": {"$in": ["DELIVERED", "RETURNED"]}})
+    orders = await db.pl_orders.find(q, {"_id": 0}).to_list(None)
+    costs = await _pl_load_costs()
+
+    per: Dict[str, dict] = {}
+    for o in orders:
+        acc = _pl_norm_acc(o.get("account_id"))
+        if not acc:
+            continue
+        d = per.setdefault(acc, {"account_id": acc, "ordered": 0,
+                                  "delivered": 0, "returned": 0,
+                                  "revenue": 0.0, "profit": 0.0})
+        d["ordered"] += 1
+        if o["order_status"] == "DELIVERED":
+            d["delivered"] += 1
+            d["revenue"] += o.get("net_settlement_amount") or 0
+            if o["payment_status"] == "PAID":
+                c = _pl_lookup_cost(costs, acc, o.get("sku"))
+                d["profit"] += (o.get("net_settlement_amount") or 0) - c
+        if o["order_status"] == "RETURNED":
+            d["returned"] += 1
+
+    acc_lookup: Dict[str, dict] = {}
+    async for a in db.accounts.find({}):
+        acc_lookup[str(a["_id"])] = {"name": a.get("name"),
+                                     "alias": a.get("alias")}
+
+    rows = []
+    for aid, d in per.items():
+        info = acc_lookup.get(aid, {})
+        rr = (d["returned"] / d["ordered"] * 100) if d["ordered"] else 0
+        margin = (d["profit"] / d["revenue"] * 100) if d["revenue"] else 0
+        rows.append({
+            "account_id": aid,
+            "account_name": info.get("name"),
+            "account_alias": info.get("alias"),
+            "ordered": d["ordered"],
+            "delivered": d["delivered"],
+            "returned": d["returned"],
+            "revenue": round(d["revenue"], 2),
+            "profit": round(d["profit"], 2),
+            "return_rate": round(rr, 2),
+            "margin_pct": round(margin, 2),
+        })
+    rows.sort(key=lambda r: -r["revenue"])
+    return {"items": rows}
+
+
+# ---------- Analyzer: last N orders for a SKU (drawer) ----------
+@api.get("/pl/analyzer/sku/{sku}/orders")
+async def pl_analyzer_sku_orders(
+    sku: str,
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 20,
+    user: dict = Depends(get_current_user),
+):
+    """Last N orders for a given SKU (used by SKU drawer)."""
+    q = _pl_date_query(account_id, start_date, end_date, {"sku": sku})
+    cursor = (db.pl_orders.find(q, {"_id": 0})
+              .sort("order_date", -1).limit(int(limit)))
+    items = []
+    async for o in cursor:
+        d = dict(o)
+        if hasattr(d.get("order_date"), "isoformat"):
+            d["order_date"] = d["order_date"].isoformat().replace(
+                "+00:00", "Z")
+        items.append(d)
+    return {"items": items}
+
+
+# ---------- Analyzer Export (Excel workbook) ----------
+@api.get("/pl/analyzer/export")
+async def pl_analyzer_export(
+    account_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    q: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Export the full P&L Analyzer snapshot for the current filter set as an
+    Excel workbook with 3 sheets:
+      1. KPIs               → 6 headline KPIs + prev-period values.
+      2. Account Performance → per-account rollup.
+      3. SKU Details         → flattened tree (category / color / account / sku).
+    """
+    kpi_res = await pl_analyzer_kpis(
+        account_id=account_id, start_date=start_date, end_date=end_date, user=user)
+    acc_res = await pl_analyzer_accounts(
+        start_date=start_date, end_date=end_date, user=user)
+    tree_res = await pl_sku_analysis_tree(
+        account_id=account_id, start_date=start_date, end_date=end_date,
+        q=q, user=user)
+
+    # 1) KPI sheet
+    kpi_rows = []
+    for k in kpi_res.get("kpis", []):
+        kpi_rows.append({
+            "Metric": k.get("label"),
+            "Value": k.get("value"),
+            "Δ % vs Prev": k.get("delta_pct"),
+            "Prev Value": k.get("prev"),
+            "Note": k.get("sub") or "",
+        })
+    df_kpi = pd.DataFrame(kpi_rows)
+
+    # 2) Account Performance sheet
+    df_acc = pd.DataFrame([
+        {
+            "Account": a.get("account_alias") or a.get("account_name") or "—",
+            "Orders": a.get("ordered"),
+            "Delivered": a.get("delivered"),
+            "Returned": a.get("returned"),
+            "Revenue": a.get("revenue"),
+            "Profit": a.get("profit"),
+            "Return %": a.get("return_rate"),
+            "Margin %": a.get("margin_pct"),
+        }
+        for a in acc_res.get("items", [])
+    ])
+
+    # 3) SKU Details (flattened)
+    sku_rows: List[dict] = []
+    for cat in tree_res.get("categories", []):
+        for cn in cat.get("colors", []):
+            for acc in cn.get("accounts", []):
+                if acc.get("no_skus"):
+                    sku_rows.append({
+                        "Category": cat.get("main_category"),
+                        "Color": cn.get("color"),
+                        "Account": (acc.get("account_alias")
+                                    or acc.get("account_name") or "—"),
+                        "SKU": "(no SKU assigned)",
+                        "Ordered": 0, "Delivered": 0, "Returned": 0,
+                        "RR %": 0, "Profit": 0, "Loss": 0,
+                        "Net Contribution": 0, "Class": "—",
+                    })
+                    continue
+                for s in acc.get("skus", []):
+                    sku_rows.append({
+                        "Category": cat.get("main_category"),
+                        "Color": cn.get("color"),
+                        "Account": (acc.get("account_alias")
+                                    or acc.get("account_name") or "—"),
+                        "SKU": s.get("sku"),
+                        "Ordered": s.get("units_ordered"),
+                        "Delivered": s.get("units_delivered"),
+                        "Returned": s.get("units_returned"),
+                        "RR %": s.get("return_rate"),
+                        "Profit": s.get("net_realized_profit"),
+                        "Loss": s.get("total_return_loss"),
+                        "Net Contribution": s.get("net_sku_contribution"),
+                        "Class": s.get("classification"),
+                    })
+    df_sku = pd.DataFrame(sku_rows)
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        (df_kpi if not df_kpi.empty else pd.DataFrame([{"Metric": "(no data)"}])
+         ).to_excel(w, index=False, sheet_name="KPIs")
+        (df_acc if not df_acc.empty else pd.DataFrame([{"Account": "(no data)"}])
+         ).to_excel(w, index=False, sheet_name="Account Performance")
+        (df_sku if not df_sku.empty else pd.DataFrame([{"SKU": "(no data)"}])
+         ).to_excel(w, index=False, sheet_name="SKU Details")
+    out.seek(0)
+    fn = f"pl_analyzer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={fn}"},
+    )
 
 
 # ---------- Exchange Analysis ----------
