@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   PauseCircleIcon,
   ArrowsClockwiseIcon,
@@ -38,20 +38,19 @@ export default function InventoryActionsPage() {
   const [accountId, setAccountId] = useState("");
   const [categories, setCategories] = useState([]);
   const [category, setCategory] = useState("");
-  const [colors, setColors] = useState([]);
-  const [color, setColor] = useState("");
-  const [allSizes, setAllSizes] = useState([]);
-  const [styleIds, setStyleIds] = useState([]);
+  const [colors, setColors] = useState([]);            // available for cat
+  const [selectedColors, setSelectedColors] = useState([]); // multi-select
+  const [colorDetail, setColorDetail] = useState({});  // {color: {sizes, style_ids}}
   const [selectedSizes, setSelectedSizes] = useState([]);
   const [wholeProduct, setWholeProduct] = useState(true);
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [pausing, setPausing] = useState(false);
-  const [lastJobId, setLastJobId] = useState(null);
+  const [lastJobIds, setLastJobIds] = useState([]);
   const [history, setHistory] = useState([]);
 
-  /* --------- load accounts once --------- */
+  /* --------- load accounts once + history --------- */
   useEffect(() => {
     api.get("/inventory-actions/options")
       .then((r) => setAccounts(r.data.accounts || []))
@@ -70,8 +69,8 @@ export default function InventoryActionsPage() {
 
   /* --------- cascade: account → categories --------- */
   useEffect(() => {
-    setCategory(""); setColor(""); setColors([]);
-    setAllSizes([]); setStyleIds([]); setSelectedSizes([]);
+    setCategory(""); setColors([]); setSelectedColors([]);
+    setColorDetail({}); setSelectedSizes([]);
     setCategories([]);
     if (!accountId) return;
     setBusy(true); setErr("");
@@ -83,8 +82,8 @@ export default function InventoryActionsPage() {
 
   /* --------- cascade: category → colors --------- */
   useEffect(() => {
-    setColor(""); setAllSizes([]); setStyleIds([]); setSelectedSizes([]);
-    setColors([]);
+    setSelectedColors([]); setColorDetail({}); setSelectedSizes([]);
+    setWholeProduct(true); setColors([]);
     if (!accountId || !category) return;
     setBusy(true); setErr("");
     api.get("/inventory-actions/options", {
@@ -95,22 +94,76 @@ export default function InventoryActionsPage() {
       .finally(() => setBusy(false));
   }, [accountId, category]);
 
-  /* --------- cascade: color → sizes + style_ids --------- */
+  /* --------- when colors change, fetch details for missing colors --------- */
   useEffect(() => {
-    setAllSizes([]); setStyleIds([]); setSelectedSizes([]); setWholeProduct(true);
-    if (!accountId || !category || !color) return;
-    setBusy(true); setErr("");
-    api.get("/inventory-actions/options", {
-      params: { account_id: accountId, main_category: category, color },
-    })
-      .then((r) => {
-        setAllSizes(r.data.sizes || []);
-        setStyleIds(r.data.style_ids || []);
-      })
-      .catch((e) => setErr(formatApiError(e)))
-      .finally(() => setBusy(false));
-  }, [accountId, category, color]);
+    if (!accountId || !category) return;
+    const missing = selectedColors.filter((c) => !colorDetail[c]);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      setBusy(true); setErr("");
+      try {
+        const results = await Promise.all(
+          missing.map((c) =>
+            api.get("/inventory-actions/options", {
+              params: { account_id: accountId, main_category: category, color: c },
+            })
+          )
+        );
+        if (cancelled) return;
+        setColorDetail((prev) => {
+          const next = { ...prev };
+          missing.forEach((c, i) => {
+            next[c] = {
+              sizes: results[i].data.sizes || [],
+              style_ids: results[i].data.style_ids || [],
+            };
+          });
+          return next;
+        });
+      } catch (e) {
+        if (!cancelled) setErr(formatApiError(e));
+      } finally {
+        if (!cancelled) setBusy(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [accountId, category, selectedColors, colorDetail]);
 
+  /* --------- derived: union sizes + total style ids --------- */
+  const unionSizes = useMemo(() => {
+    const set = new Set();
+    selectedColors.forEach((c) => {
+      (colorDetail[c]?.sizes || []).forEach((s) => set.add(s));
+    });
+    return Array.from(set).sort((a, b) => (a.length - b.length) || a.localeCompare(b));
+  }, [selectedColors, colorDetail]);
+
+  const totalStyleIds = useMemo(
+    () => selectedColors.reduce(
+      (n, c) => n + (colorDetail[c]?.style_ids?.length || 0), 0),
+    [selectedColors, colorDetail]
+  );
+
+  const estimatedSkus = useMemo(() => {
+    if (selectedColors.length === 0) return 0;
+    let est = 0;
+    selectedColors.forEach((c) => {
+      const detail = colorDetail[c];
+      if (!detail) return;
+      const target = wholeProduct
+        ? detail.sizes
+        : selectedSizes.filter((s) => detail.sizes.includes(s));
+      est += detail.style_ids.length * target.length;
+    });
+    return est;
+  }, [selectedColors, colorDetail, selectedSizes, wholeProduct]);
+
+  const toggleColor = (c) => {
+    setSelectedColors((prev) =>
+      prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]
+    );
+  };
   const toggleSize = (s) => {
     setWholeProduct(false);
     setSelectedSizes((prev) =>
@@ -118,52 +171,67 @@ export default function InventoryActionsPage() {
     );
   };
 
-  const targetSizes = wholeProduct ? allSizes : selectedSizes;
-  const estimatedSkus = styleIds.length * targetSizes.length;
-  const canPause = accountId && category && color && styleIds.length > 0 && targetSizes.length > 0 && !pausing;
+  const canPause = accountId && category && selectedColors.length > 0
+    && totalStyleIds > 0 && estimatedSkus > 0 && !pausing;
 
-  /* --------- pause action --------- */
+  /* --------- pause: one job per color --------- */
   const doPause = async () => {
-    setPausing(true); setErr(""); setLastJobId(null);
+    setPausing(true); setErr(""); setLastJobIds([]);
+    const created = [];
     try {
-      const body = {
-        account_id: accountId,
-        main_category: category,
-        color,
-        sizes: wholeProduct ? [] : selectedSizes,
-      };
-      const r = await api.post("/inventory-actions/pause", body);
-      setLastJobId(r.data.job_id);
+      for (const c of selectedColors) {
+        const detail = colorDetail[c];
+        if (!detail || detail.style_ids.length === 0) continue;
+        // sizes applicable to THIS color
+        const targetSizes = wholeProduct
+          ? []                                       // "whole product" = all sizes
+          : selectedSizes.filter((s) => detail.sizes.includes(s));
+        if (!wholeProduct && targetSizes.length === 0) continue;
+        try {
+          const r = await api.post("/inventory-actions/pause", {
+            account_id: accountId,
+            main_category: category,
+            color: c,
+            sizes: targetSizes,
+          });
+          created.push(r.data.job_id);
+        } catch (e) {
+          setErr((prev) => prev
+            ? `${prev} · ${c}: ${formatApiError(e)}`
+            : `${c}: ${formatApiError(e)}`);
+        }
+      }
+      setLastJobIds(created);
       await refreshHistory();
-    } catch (e) {
-      setErr(formatApiError(e));
     } finally {
       setPausing(false);
     }
   };
 
-  /* --------- poll last job until finished --------- */
+  /* --------- poll all pending jobs --------- */
   useEffect(() => {
-    if (!lastJobId) return;
+    if (lastJobIds.length === 0) return;
+    const pending = new Set(lastJobIds);
     const t = setInterval(async () => {
-      try {
-        const r = await api.get(`/inventory-actions/${lastJobId}`);
-        setHistory((prev) => {
-          const idx = prev.findIndex((x) => x.id === r.data.id);
-          if (idx === -1) return [r.data, ...prev];
-          const next = [...prev];
-          next[idx] = r.data;
-          return next;
-        });
-        if (r.data.status === "done" || r.data.status === "failed") {
-          clearInterval(t);
-        }
-      } catch (e) {
-        /* silent */
+      for (const id of Array.from(pending)) {
+        try {
+          const r = await api.get(`/inventory-actions/${id}`);
+          setHistory((prev) => {
+            const idx = prev.findIndex((x) => x.id === r.data.id);
+            if (idx === -1) return [r.data, ...prev];
+            const next = [...prev];
+            next[idx] = r.data;
+            return next;
+          });
+          if (r.data.status === "done" || r.data.status === "failed") {
+            pending.delete(id);
+          }
+        } catch (e) { /* silent */ }
       }
+      if (pending.size === 0) clearInterval(t);
     }, 3000);
     return () => clearInterval(t);
-  }, [lastJobId]);
+  }, [lastJobIds]);
 
   return (
     <div className="min-h-screen" data-testid="inventory-actions-page">
@@ -185,25 +253,21 @@ export default function InventoryActionsPage() {
       <div className="grid gap-6 px-8 py-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         {/* ---------- Left: builder ---------- */}
         <div className="space-y-6">
-          {/* Cascading pickers */}
+          {/* Cascading pickers (account + category are single-select) */}
           <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-6">
-            <div className="section-label mb-4">1 · Choose product</div>
-            <div className="grid gap-4 sm:grid-cols-3">
+            <div className="section-label mb-4">1 · Choose account &amp; category</div>
+            <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Account">
                 <select
                   data-testid="account-select"
-                  className="input"
+                  className="input-shell"
                   value={accountId}
                   onChange={(e) => setAccountId(e.target.value)}
                   disabled={busy}
                 >
                   <option value="">— Select account —</option>
                   {accounts.map((a) => (
-                    <option
-                      key={a.id}
-                      value={a.id}
-                      disabled={!a.enabled}
-                    >
+                    <option key={a.id} value={a.id} disabled={!a.enabled}>
                       {a.alias || a.name}{a.enabled ? "" : " (disabled)"}
                     </option>
                   ))}
@@ -212,7 +276,7 @@ export default function InventoryActionsPage() {
               <Field label="Main Category">
                 <select
                   data-testid="category-select"
-                  className="input"
+                  className="input-shell"
                   value={category}
                   onChange={(e) => setCategory(e.target.value)}
                   disabled={!accountId || busy}
@@ -223,69 +287,125 @@ export default function InventoryActionsPage() {
                   ))}
                 </select>
               </Field>
-              <Field label="Color">
-                <select
-                  data-testid="color-select"
-                  className="input"
-                  value={color}
-                  onChange={(e) => setColor(e.target.value)}
-                  disabled={!category || busy}
-                >
-                  <option value="">— Select color —</option>
-                  {colors.map((c) => (
-                    <option key={c} value={c}>{c}</option>
-                  ))}
-                </select>
-              </Field>
             </div>
           </div>
 
-          {/* Sizes / style IDs */}
+          {/* Colors — MULTI-SELECT chips */}
           <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-6">
-            <div className="section-label mb-4">2 · Choose what to pause</div>
-            {!color ? (
+            <div className="section-label mb-4">
+              2 · Choose one or more colors
+              {selectedColors.length > 0 && (
+                <span className="ml-2 text-[10px] text-emerald-300">
+                  ({selectedColors.length} selected)
+                </span>
+              )}
+            </div>
+            {!category ? (
               <div
-                data-testid="picker-empty"
-                className="rounded-md border border-dashed border-[var(--border)] px-4 py-8 text-center text-sm text-[var(--text-muted)]"
+                data-testid="colors-empty"
+                className="rounded-md border border-dashed border-[var(--border)] px-4 py-6 text-center text-sm text-[var(--text-muted)]"
               >
-                Pick account, category and color to see available sizes.
+                Pick account and category first.
+              </div>
+            ) : colors.length === 0 ? (
+              <div
+                data-testid="colors-none"
+                className="rounded-md border border-dashed border-[var(--border)] px-4 py-6 text-center text-sm text-[var(--text-muted)]"
+              >
+                No colors in Product Master for this category.
               </div>
             ) : (
-              <div className="space-y-5">
-                <div className="flex flex-wrap items-center gap-4">
-                  <label
-                    className="flex cursor-pointer items-center gap-2 text-sm"
-                    data-testid="whole-product-toggle"
+              <div className="space-y-3">
+                <div className="flex flex-wrap gap-2" data-testid="color-checkboxes">
+                  <button
+                    type="button"
+                    data-testid="color-select-all"
+                    onClick={() =>
+                      setSelectedColors(
+                        selectedColors.length === colors.length ? [] : [...colors]
+                      )
+                    }
+                    className="rounded-full border border-[var(--border)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-white/40"
                   >
-                    <input
-                      type="checkbox"
-                      className="h-4 w-4 accent-[var(--accent)]"
-                      checked={wholeProduct}
-                      onChange={(e) => {
-                        setWholeProduct(e.target.checked);
-                        if (e.target.checked) setSelectedSizes([]);
-                      }}
-                    />
-                    <span className="font-medium">Pause whole product</span>
-                    <span className="text-xs text-[var(--text-muted)]">
-                      (all {allSizes.length} sizes)
-                    </span>
-                  </label>
+                    {selectedColors.length === colors.length ? "Clear all" : "Select all"}
+                  </button>
+                  {colors.map((c) => {
+                    const on = selectedColors.includes(c);
+                    return (
+                      <button
+                        key={c}
+                        type="button"
+                        data-testid={`color-chip-${c}`}
+                        onClick={() => toggleColor(c)}
+                        className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                          on
+                            ? "border-sky-400/60 bg-sky-500/15 text-sky-200"
+                            : "border-[var(--border)] bg-transparent text-[var(--text-secondary)] hover:border-white/30"
+                        }`}
+                      >
+                        {c}
+                      </button>
+                    );
+                  })}
                 </div>
+              </div>
+            )}
+          </div>
+
+          {/* Sizes — appears once colors chosen */}
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-6">
+            <div className="section-label mb-4">3 · Choose sizes to pause</div>
+            {selectedColors.length === 0 ? (
+              <div
+                data-testid="sizes-empty"
+                className="rounded-md border border-dashed border-[var(--border)] px-4 py-6 text-center text-sm text-[var(--text-muted)]"
+              >
+                Pick one or more colors above to see available sizes.
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <label
+                  className="flex cursor-pointer items-center gap-2 text-sm"
+                  data-testid="whole-product-toggle"
+                >
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-[var(--accent)]"
+                    checked={wholeProduct}
+                    onChange={(e) => {
+                      setWholeProduct(e.target.checked);
+                      if (e.target.checked) setSelectedSizes([]);
+                    }}
+                  />
+                  <span className="font-medium">Pause whole product</span>
+                  <span className="text-xs text-[var(--text-muted)]">
+                    (all sizes for each selected color)
+                  </span>
+                </label>
 
                 <div>
                   <div className="text-xs uppercase tracking-widest text-[var(--text-muted)] mb-2">
-                    …or pick specific sizes
+                    …or pick specific sizes (across selected colors)
                   </div>
                   <div className="flex flex-wrap gap-2" data-testid="size-checkboxes">
-                    {allSizes.map((s) => {
+                    {unionSizes.length === 0 && (
+                      <span className="text-sm text-[var(--text-muted)]">
+                        Loading sizes…
+                      </span>
+                    )}
+                    {unionSizes.map((s) => {
                       const on = wholeProduct || selectedSizes.includes(s);
+                      // how many of the selected colors have this size?
+                      const colorsWithSize = selectedColors.filter(
+                        (c) => (colorDetail[c]?.sizes || []).includes(s)
+                      );
                       return (
                         <button
                           key={s}
                           data-testid={`size-chip-${s}`}
                           type="button"
                           onClick={() => toggleSize(s)}
+                          title={`In ${colorsWithSize.length} / ${selectedColors.length} selected colors`}
                           className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
                             on
                               ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-200"
@@ -293,29 +413,43 @@ export default function InventoryActionsPage() {
                           }`}
                         >
                           {s}
+                          {colorsWithSize.length < selectedColors.length && (
+                            <span className="ml-1 text-[9px] opacity-60">
+                              ×{colorsWithSize.length}
+                            </span>
+                          )}
                         </button>
                       );
                     })}
-                    {allSizes.length === 0 && (
-                      <span className="text-sm text-[var(--text-muted)]">
-                        No sizes on file for this product.
-                      </span>
-                    )}
                   </div>
                 </div>
 
                 <details className="rounded border border-[var(--border)] px-4 py-3">
                   <summary className="cursor-pointer text-xs uppercase tracking-widest text-[var(--text-muted)]">
-                    Style IDs in this product ({styleIds.length})
+                    Style IDs across selected colors ({totalStyleIds})
                   </summary>
-                  <div className="mt-3 flex flex-wrap gap-1.5" data-testid="style-ids-list">
-                    {styleIds.map((s) => (
-                      <span
-                        key={s}
-                        className="rounded bg-white/5 px-2 py-1 font-mono text-[11px] text-[var(--text-secondary)]"
-                      >
-                        {s}
-                      </span>
+                  <div className="mt-3 space-y-2" data-testid="style-ids-list">
+                    {selectedColors.map((c) => (
+                      <div key={c}>
+                        <div className="text-[10px] uppercase tracking-widest text-sky-300 mb-1">
+                          {c}
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {(colorDetail[c]?.style_ids || []).map((s) => (
+                            <span
+                              key={s}
+                              className="rounded bg-white/5 px-2 py-1 font-mono text-[11px] text-[var(--text-secondary)]"
+                            >
+                              {s}
+                            </span>
+                          ))}
+                          {(colorDetail[c]?.style_ids || []).length === 0 && (
+                            <span className="text-[11px] text-[var(--text-muted)]">
+                              (loading…)
+                            </span>
+                          )}
+                        </div>
+                      </div>
                     ))}
                   </div>
                 </details>
@@ -325,16 +459,13 @@ export default function InventoryActionsPage() {
 
           {/* Summary + execute */}
           <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-6">
-            <div className="section-label mb-4">3 · Execute</div>
+            <div className="section-label mb-4">4 · Execute</div>
             <div className="flex flex-wrap items-center gap-6 mb-5">
-              <SummaryStat
-                label="Style IDs"
-                value={styleIds.length}
-                testid="summary-style-ids"
-              />
+              <SummaryStat label="Colors" value={selectedColors.length} testid="summary-colors" />
+              <SummaryStat label="Style IDs" value={totalStyleIds} testid="summary-style-ids" />
               <SummaryStat
                 label="Sizes"
-                value={targetSizes.length}
+                value={wholeProduct ? unionSizes.length : selectedSizes.length}
                 testid="summary-sizes"
               />
               <SummaryStat
@@ -359,15 +490,14 @@ export default function InventoryActionsPage() {
               className="inline-flex items-center gap-2 rounded-md bg-rose-500 px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-rose-500/20 transition hover:bg-rose-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <PauseCircleIcon size={18} weight="fill" />
-              {pausing ? "Queuing…" : `Pause ${estimatedSkus || ""} SKU${estimatedSkus === 1 ? "" : "s"} now`}
+              {pausing
+                ? "Queuing…"
+                : `Pause ${estimatedSkus || ""} SKU${estimatedSkus === 1 ? "" : "s"} across ${selectedColors.length} color${selectedColors.length === 1 ? "" : "s"}`
+              }
             </button>
-            {lastJobId && (
-              <div
-                data-testid="last-job-hint"
-                className="mt-3 text-xs text-[var(--text-muted)]"
-              >
-                Job queued (id <span className="font-mono">{lastJobId}</span>). Progress
-                appears in the history panel →
+            {lastJobIds.length > 0 && (
+              <div data-testid="last-jobs-hint" className="mt-3 text-xs text-[var(--text-muted)]">
+                {lastJobIds.length} job(s) queued. Watch the history panel →
               </div>
             )}
           </div>
