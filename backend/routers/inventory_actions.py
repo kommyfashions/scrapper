@@ -316,14 +316,28 @@ def _serialize_job(j: dict) -> dict:
 async def history(
     limit: int = Query(50, ge=1, le=200),
     account_id: Optional[str] = None,
+    status: Optional[str] = Query(
+        None, pattern="^(pending|processing|done|failed)$"),
 ):
     db = get_db()
     q: Dict[str, Any] = {"type": "pause_skus"}
     if account_id:
         q["account_id"] = account_id
+    if status:
+        q["status"] = status
     cursor = db.jobs.find(q).sort("created_at", -1).limit(limit)
     items = [_serialize_job(d) async for d in cursor]
-    return {"items": items}
+    # counts by status (ignoring the status filter so the tabs stay accurate)
+    counts_q: Dict[str, Any] = {"type": "pause_skus"}
+    if account_id:
+        counts_q["account_id"] = account_id
+    counts: Dict[str, int] = {"pending": 0, "processing": 0, "done": 0, "failed": 0}
+    async for row in db.jobs.aggregate([
+        {"$match": counts_q},
+        {"$group": {"_id": "$status", "n": {"$sum": 1}}},
+    ]):
+        counts[row["_id"]] = int(row["n"])
+    return {"items": items, "counts": counts}
 
 
 @router.get("/{job_id}")

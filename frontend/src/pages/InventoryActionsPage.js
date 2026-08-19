@@ -49,6 +49,8 @@ export default function InventoryActionsPage() {
   const [pausing, setPausing] = useState(false);
   const [lastJobIds, setLastJobIds] = useState([]);
   const [history, setHistory] = useState([]);
+  const [counts, setCounts] = useState({ pending: 0, processing: 0, done: 0, failed: 0 });
+  const [statusFilter, setStatusFilter] = useState("all");
 
   /* --------- load accounts once + history --------- */
   useEffect(() => {
@@ -58,14 +60,22 @@ export default function InventoryActionsPage() {
     refreshHistory();
   }, []);
 
-  const refreshHistory = useCallback(async () => {
+  const refreshHistory = useCallback(async (filter) => {
     try {
-      const r = await api.get("/inventory-actions/history", { params: { limit: 30 } });
+      const params = { limit: 50 };
+      const s = filter ?? statusFilter;
+      if (s && s !== "all") params.status = s;
+      const r = await api.get("/inventory-actions/history", { params });
       setHistory(r.data.items || []);
+      setCounts(r.data.counts || { pending: 0, processing: 0, done: 0, failed: 0 });
     } catch (e) {
       /* silent */
     }
-  }, []);
+  }, [statusFilter]);
+
+  useEffect(() => {
+    refreshHistory(statusFilter);
+  }, [statusFilter, refreshHistory]);
 
   /* --------- cascade: account → categories --------- */
   useEffect(() => {
@@ -511,10 +521,41 @@ export default function InventoryActionsPage() {
               {history.length}
             </span>
           </div>
+          <div
+            className="mb-3 flex flex-wrap gap-1"
+            data-testid="history-filter-tabs"
+          >
+            {[
+              { k: "all",        label: "All",       n: counts.pending + counts.processing + counts.done + counts.failed },
+              { k: "pending",    label: "Pending",   n: counts.pending },
+              { k: "processing", label: "Running",   n: counts.processing },
+              { k: "done",       label: "Done",      n: counts.done },
+              { k: "failed",     label: "Failed",    n: counts.failed },
+            ].map(({ k, label, n }) => {
+              const on = statusFilter === k;
+              return (
+                <button
+                  key={k}
+                  type="button"
+                  data-testid={`history-filter-${k}`}
+                  onClick={() => setStatusFilter(k)}
+                  className={`rounded-full border px-2.5 py-1 text-[10px] uppercase tracking-widest transition ${
+                    on
+                      ? "border-emerald-400/60 bg-emerald-500/15 text-emerald-200"
+                      : "border-[var(--border)] bg-transparent text-[var(--text-muted)] hover:border-white/30"
+                  }`}
+                >
+                  {label} <span className="ml-1 font-mono">{n}</span>
+                </button>
+              );
+            })}
+          </div>
           <div className="max-h-[70vh] space-y-2 overflow-auto pr-1" data-testid="history-list">
             {history.length === 0 && (
               <div className="rounded border border-dashed border-[var(--border)] p-6 text-center text-xs text-[var(--text-muted)]">
-                No pause actions yet.
+                {statusFilter === "all"
+                  ? "No pause actions yet."
+                  : `No ${statusFilter} actions.`}
               </div>
             )}
             {history.map((j) => (

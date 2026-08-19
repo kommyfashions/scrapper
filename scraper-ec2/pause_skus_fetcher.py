@@ -21,8 +21,9 @@ For each Style ID we:
      Meesho's flow removes the row after pause, so if no rows match at all
      (all already paused/blocked) we record "already_paused" for those.
 
-Returns a `result` dict merged into the job doc:
-    {"paused_count", "already_paused_count", "failed_count", "per_sku": [...]}
+IMPORTANT: never call browser.close() — this is a CDP-attached shared Chrome
+that other workers (labels, gst, payments) also use. Only close the page
+we opened and stop the playwright driver.
 """
 from __future__ import annotations
 
@@ -52,17 +53,26 @@ def _inventory_search_url(suffix: str, style_id: str) -> str:
     )
 
 
+def _safe_is_checked(cb) -> bool:
+    """Playwright's is_checked() raises TargetClosedError if the locator's
+    target is gone. We swallow and treat as not-checked so click() below
+    can try; if click also fails it will be caught in _select_rows."""
+    try:
+        return cb.is_checked(timeout=1_500)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _select_rows_matching_sizes(page: Page, target_sizes: List[str]) -> int:
     """Return count of ticked checkboxes.
 
-    Meesho renders one <tr>-like row per size variation. Each row contains
-    the variation label (e.g. "IND-6") and a checkbox on the left. We use
-    an XPath ancestor climb from the size text to the row, then click the
+    Meesho renders one row per size variation. Each row contains the
+    variation label (e.g. "IND-6") and a checkbox on the left. We use an
+    XPath ancestor climb from the size text to the row, then click the
     first checkbox within.
     """
     ticked = 0
     for size in target_sizes:
-        # exact-text match on the size label
         try:
             size_cell = page.locator(
                 f'xpath=//*[normalize-space(text())="{size}"]'
@@ -72,16 +82,17 @@ def _select_rows_matching_sizes(page: Page, target_sizes: List[str]) -> int:
             # Size not on the page — likely already paused/blocked or the
             # Style ID doesn't have this size. Skip silently.
             continue
-        # Climb to the containing row and tick its checkbox.
+        except Exception:  # noqa: BLE001
+            continue
         try:
             row = size_cell.locator(
                 'xpath=ancestor::*[self::tr or self::div][.//input[@type="checkbox"]][1]'
             ).first
             cb = row.locator('input[type="checkbox"]').first
-            # Only click if not already checked
-            if not cb.is_checked():
-                cb.click()
+            if not _safe_is_checked(cb):
+                cb.click(timeout=3_000)
                 ticked += 1
+                page.wait_for_timeout(200)
         except Exception:  # noqa: BLE001
             continue
     return ticked
@@ -91,21 +102,21 @@ def _click_pause_selected(page: Page) -> bool:
     try:
         btn = page.locator('button:has-text("Pause Selected")').first
         btn.wait_for(state="visible", timeout=5_000)
-        btn.click()
+        btn.click(timeout=3_000)
         return True
-    except PWTimeout:
+    except Exception:  # noqa: BLE001
         return False
 
 
 def _wait_for_success_toast(page: Page) -> bool:
-    """Wait for 'Product paused and moved to \"Paused\" tab'."""
+    """Wait for 'Product paused and moved to \"Paused\" tab' toast."""
     try:
         page.locator(
             'xpath=//*[contains(normalize-space(.), "paused") '
             'and contains(normalize-space(.), "Paused")]'
         ).first.wait_for(state="visible", timeout=TOAST_WAIT_MS)
         return True
-    except PWTimeout:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -123,25 +134,25 @@ def _pause_one_style_id(
     print(f"[pause_skus]   → {style_id}")
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
-    except PWTimeout as e:
+    except Exception as e:  # noqa: BLE001
         result["status"] = "failed"
-        result["error"] = f"page load timeout: {e}"
+        result["error"] = f"page load: {type(e).__name__}: {e}"
         return result
 
-    # Wait for either results or "no results"
     try:
         page.wait_for_load_state("networkidle", timeout=ROW_WAIT_MS)
     except PWTimeout:
         pass
-    page.wait_for_timeout(1500)
-
-    # If the search returns nothing on the "Active" tab, the SKU is already
-    # in Paused or Blocked. Treat as "already_paused".
-    body_text = ""
-    try:
-        body_text = (page.locator("body").first.inner_text(timeout=2_000) or "")
     except Exception:  # noqa: BLE001
         pass
+    page.wait_for_timeout(1500)
+
+    # If the search returns nothing on the "Active" tab, treat as
+    # "already_paused" — the Style ID is already in Paused or Blocked.
+    try:
+        body_text = page.locator("body").first.inner_text(timeout=3_000) or ""
+    except Exception:  # noqa: BLE001
+        body_text = ""
     if "Showing Results (0)" in body_text or "No results found" in body_text:
         result["status"] = "already_paused"
         return result
@@ -149,13 +160,12 @@ def _pause_one_style_id(
     ticked = _select_rows_matching_sizes(page, target_sizes)
     result["ticked"] = ticked
     if ticked == 0:
-        # Nothing selectable on Active tab → all already paused/blocked
         result["status"] = "already_paused"
         return result
 
     if not _click_pause_selected(page):
         result["status"] = "failed"
-        result["error"] = "Pause Selected button not visible"
+        result["error"] = "Pause Selected button not visible / not clickable"
         screenshot_on_fail(page, DEBUG_DIR / safe_dirname(suffix), f"pause_{style_id}")
         return result
 
@@ -186,10 +196,11 @@ def run_pause_skus_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
     per_sku: List[Dict[str, Any]] = []
     paused = already = failed = 0
 
-    p = browser = page = None
+    # NOTE: never call browser.close() — it disconnects the shared Chrome
+    # that labels/gst/payments workers also use. Only close our page +
+    # stop playwright, matching gst_report_fetcher's pattern.
+    p, browser, _ctx, page = cdp_context_page(port)
     try:
-        p, browser, _ctx, page = cdp_context_page(port)
-        page.set_default_timeout(15_000)
         for sid in style_ids:
             try:
                 r = _pause_one_style_id(page, suffix, sid, target_sizes)
@@ -207,22 +218,15 @@ def run_pause_skus_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
                 already += 1
             else:
                 failed += 1
-            # Brief cool-down between Style IDs to avoid tripping rate limits
+            # Brief cool-down between Style IDs to avoid rate-limits
             time.sleep(1.0)
     finally:
         try:
-            if page is not None:
-                page.close()
+            page.close()
         except Exception:  # noqa: BLE001
             pass
         try:
-            if browser is not None:
-                browser.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            if p is not None:
-                p.stop()
+            p.stop()
         except Exception:  # noqa: BLE001
             pass
 
