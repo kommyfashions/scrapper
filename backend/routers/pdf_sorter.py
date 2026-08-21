@@ -9,7 +9,7 @@ import io
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
@@ -210,6 +210,10 @@ async def process(
         "warnings": result.warnings,
         "files": result.files,
         "unmatched_skus": result.unmatched_skus,
+        "tier1_pages": result.tier1_pages,
+        "tier2_pages": result.tier2_pages,
+        "tier1_categories": result.tier1_categories,
+        "tier2_categories": result.tier2_categories,
     }
 
 
@@ -276,6 +280,10 @@ async def analytics(
                 "courier_totals": r.get("courier_totals") or {},
                 "unmatched_skus": r.get("unmatched_skus") or [],
                 "warnings": r.get("warnings") or [],
+                "tier1_pages": int(r.get("tier1_pages") or 0),
+                "tier2_pages": int(r.get("tier2_pages") or 0),
+                "tier1_categories": r.get("tier1_categories") or [],
+                "tier2_categories": r.get("tier2_categories") or [],
             }
 
     # Groups Filled X / Y — Y = distinct products in Product Master.
@@ -330,13 +338,47 @@ async def recent_runs(days: int = Query(7, ge=1, le=90)):
     async for r in db.pdf_sorter_runs.find(
         {"created_at": {"$gte": since_dt}},
         {"_id": 0, "run_id": 1, "created_at": 1, "total_pages": 1,
-         "total_files": 1, "files": 1, "unknown_sku": 1, "unique_orders": 1},
+         "total_files": 1, "files": 1, "unknown_sku": 1, "unique_orders": 1,
+         "tier1_pages": 1, "tier2_pages": 1},
     ).sort("created_at", -1):
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat().replace(
                 "+00:00", "Z")
         rows.append(r)
     return {"items": rows, "window_days": days}
+
+
+@router.get("/runs/{run_id}/unmatched.xlsx")
+async def download_unmatched(run_id: str):
+    """Excel export of unmatched SKUs for a run.
+    Columns: SKU, Count, Suggested Main Category (blank), Notes."""
+    db = get_db()
+    run = await db.pdf_sorter_runs.find_one({"run_id": run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    rows = run.get("unmatched_skus") or []
+    if not rows:
+        rows = [{"sku": "", "count": 0}]
+    df = pd.DataFrame(
+        [{"SKU": r.get("sku", ""),
+          "Label Count": int(r.get("count", 0)),
+          "Main Category": "",
+          "Color": "",
+          "Notes": ""} for r in rows]
+    )
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Unmatched SKUs")
+    out.seek(0)
+    fn = f"unmatched_skus_{run_id}.xlsx"
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={fn}",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/runs")
@@ -349,6 +391,11 @@ async def list_runs(limit: int = Query(30, le=200)):
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat().replace(
                 "+00:00", "Z")
+        # ensure new tier fields exist on older run docs
+        r.setdefault("tier1_pages", 0)
+        r.setdefault("tier2_pages", 0)
+        r.setdefault("tier1_categories", [])
+        r.setdefault("tier2_categories", [])
         rows.append(r)
     return {"items": rows}
 

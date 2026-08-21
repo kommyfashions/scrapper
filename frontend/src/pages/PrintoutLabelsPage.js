@@ -219,6 +219,28 @@ function LastRunDownloads({ run }) {
     "TIER1_HIGH_VOLUME.pdf": "Tier 1 · High Volume",
     "TIER2_LOW_VOLUME.pdf": "Tier 2 · Low Volume",
   };
+  const tierCounts = {
+    "MASTER_PRINT.pdf": run.total_pages ?? 0,
+    "TIER1_HIGH_VOLUME.pdf": run.tier1_pages ?? 0,
+    "TIER2_LOW_VOLUME.pdf": run.tier2_pages ?? 0,
+  };
+  const exportUnmatched = async () => {
+    const r = await api.get(
+      `/pdf-sorter/runs/${run.run_id}/unmatched.xlsx`,
+      { responseType: "blob", params: { _ts: Date.now() } },
+    );
+    const cd = r.headers?.["content-disposition"] || "";
+    const match = /filename="?([^"]+)"?/i.exec(cd);
+    const name = (match && match[1]) || `unmatched_skus_${run.run_id}.xlsx`;
+    const url = URL.createObjectURL(new Blob([r.data]));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
+  };
+  const unmatchedCount = run.unmatched ?? run.unknown_sku ?? 0;
   return (
     <div
       className="panel p-4"
@@ -258,8 +280,26 @@ function LastRunDownloads({ run }) {
           >
             <DownloadSimpleIcon size={12} weight="bold" />
             {labels[f] || f}
+            {tierCounts[f] > 0 && (
+              <span className="ml-1 rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px]">
+                {tierCounts[f]}
+              </span>
+            )}
           </button>
         ))}
+        {unmatchedCount > 0 && (
+          <button
+            onClick={exportUnmatched}
+            className="btn-secondary text-xs flex items-center gap-2"
+            data-testid="pl-latest-export-unmatched"
+          >
+            <DownloadSimpleIcon size={12} weight="bold" />
+            Export Unmatched (.xlsx)
+            <span className="ml-1 rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px]">
+              {unmatchedCount}
+            </span>
+          </button>
+        )}
       </div>
     </div>
   );
@@ -661,6 +701,11 @@ export default function PrintoutLabelsPage() {
             unknown_sku: runResult.unknown_sku,
             unique_orders: runResult.unique_orders,
             files: runResult.files,
+            tier1_pages: runResult.tier1_pages,
+            tier2_pages: runResult.tier2_pages,
+            tier1_categories: runResult.tier1_categories,
+            tier2_categories: runResult.tier2_categories,
+            input_files_count: runResult.input_files_count ?? runResult.total_files,
           } : analytics.latest_run}
         />
       )}

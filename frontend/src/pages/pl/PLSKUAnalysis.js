@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowsClockwiseIcon,
   CaretDownIcon,
@@ -148,12 +148,13 @@ function AggBadges({ agg }) {
       <span className="chip">DEL {agg.units_delivered}</span>
       <span className="chip">RET {agg.units_returned}</span>
       <span className="chip">RR {agg.return_rate}%</span>
-      <span className={"chip " + (agg.net_realized_profit >= 0 ? "chip-accent" : "chip-danger")}>
-        PROFIT {inr(agg.net_realized_profit)}
+      <span className="chip" title="Revenue Profit before return loss">
+        REV·PROFIT {inr(agg.net_realized_profit)}
       </span>
       <span className="chip">LOSS {inr(agg.total_return_loss)}</span>
-      <span className={"chip " + (agg.net_sku_contribution >= 0 ? "chip-accent" : "chip-danger")}>
-        NET {inr(agg.net_sku_contribution)}
+      <span className={"chip " + (agg.net_sku_contribution >= 0 ? "chip-accent" : "chip-danger")}
+        title="Net Profit = Revenue Profit − Return Loss (matches P&L Dashboard's Net Contribution)">
+        NET PROFIT {inr(agg.net_sku_contribution)}
       </span>
       <span className={cls}>{agg.classification}</span>
     </div>
@@ -199,13 +200,13 @@ function SkuTable({ rows, onSkuClick }) {
   );
 }
 
-function AccountNode({ node, onSkuClick }) {
-  const [open, setOpen] = useState(false);
+function AccountNode({ node, onSkuClick, pathKey, openMap, setOpen }) {
+  const open = openMap[pathKey] ?? false;
   return (
     <div className="tree-guide">
       <div
         className="flex items-center gap-2 py-1.5 cursor-pointer hover:bg-[var(--bg-surface-2)] rounded px-2"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => setOpen(pathKey, !open)}
         data-testid={`ana-acc-node-${node.account_id}`}
       >
         {open ? <CaretDownIcon size={12} weight="bold" /> : <CaretRightIcon size={12} weight="bold" />}
@@ -233,12 +234,12 @@ function AccountNode({ node, onSkuClick }) {
   );
 }
 
-function ColorNode({ node, onSkuClick }) {
-  const [open, setOpen] = useState(false);
+function ColorNode({ node, onSkuClick, pathKey, openMap, setOpen }) {
+  const open = openMap[pathKey] ?? false;
   return (
     <div className="tree-guide">
       <div className="flex items-center gap-2 py-1.5 cursor-pointer hover:bg-[var(--bg-surface-2)] rounded px-2"
-           onClick={() => setOpen((o) => !o)}>
+           onClick={() => setOpen(pathKey, !open)}>
         {open ? <CaretDownIcon size={14} weight="bold" /> : <CaretRightIcon size={14} weight="bold" />}
         <span className="font-mono text-sm">{node.color}</span>
         <span className="text-[var(--text-muted)] text-xs">
@@ -249,7 +250,14 @@ function ColorNode({ node, onSkuClick }) {
       {open && (
         <div className="ml-6 space-y-1">
           {node.accounts.map((a) => (
-            <AccountNode key={a.account_id + (a.product_id || "")} node={a} onSkuClick={onSkuClick} />
+            <AccountNode
+              key={a.account_id + (a.product_id || "")}
+              node={a}
+              onSkuClick={onSkuClick}
+              pathKey={`${pathKey}::acc:${a.account_id}:${a.product_id || "x"}`}
+              openMap={openMap}
+              setOpen={setOpen}
+            />
           ))}
         </div>
       )}
@@ -257,11 +265,11 @@ function ColorNode({ node, onSkuClick }) {
   );
 }
 
-function CategoryNode({ node, onSkuClick }) {
-  const [open, setOpen] = useState(true);
+function CategoryNode({ node, onSkuClick, pathKey, openMap, setOpen }) {
+  const open = openMap[pathKey] ?? true;   // categories default open
   return (
     <div className="panel p-3">
-      <div className="flex items-center gap-2 cursor-pointer" onClick={() => setOpen((o) => !o)}
+      <div className="flex items-center gap-2 cursor-pointer" onClick={() => setOpen(pathKey, !open)}
            data-testid={`ana-cat-${node.main_category}`}>
         {open ? <CaretDownIcon size={16} weight="bold" /> : <CaretRightIcon size={16} weight="bold" />}
         <ChartBarIcon size={16} weight="bold" color="#10B981" />
@@ -271,7 +279,16 @@ function CategoryNode({ node, onSkuClick }) {
       </div>
       {open && (
         <div className="mt-2 ml-2 space-y-1">
-          {node.colors.map((c) => <ColorNode key={c.color} node={c} onSkuClick={onSkuClick} />)}
+          {node.colors.map((c) => (
+            <ColorNode
+              key={c.color}
+              node={c}
+              onSkuClick={onSkuClick}
+              pathKey={`${pathKey}::color:${c.color}`}
+              openMap={openMap}
+              setOpen={setOpen}
+            />
+          ))}
         </div>
       )}
     </div>
@@ -395,6 +412,34 @@ export default function PLSKUAnalysis() {
   const [selectedSku, setSelectedSku] = useState(null);
   const [exporting, setExporting] = useState(false);
 
+  // Tree open/close map — pathKey → bool. Categories default open.
+  const [openMap, setOpenMap] = useState({});
+  const setOpen = useCallback((key, val) => {
+    setOpenMap((prev) => ({ ...prev, [key]: val }));
+  }, []);
+  const expandAll = useCallback(() => {
+    const next = {};
+    filteredTreeRef.current.forEach((cat) => {
+      const ck = `cat:${cat.main_category}`;
+      next[ck] = true;
+      cat.colors.forEach((col) => {
+        const cok = `${ck}::color:${col.color}`;
+        next[cok] = true;
+        col.accounts.forEach((a) => {
+          next[`${cok}::acc:${a.account_id}:${a.product_id || "x"}`] = true;
+        });
+      });
+    });
+    setOpenMap(next);
+  }, []);
+  const collapseAll = useCallback(() => {
+    const next = {};
+    filteredTreeRef.current.forEach((cat) => {
+      next[`cat:${cat.main_category}`] = false;
+    });
+    setOpenMap(next);
+  }, []);
+
   useEffect(() => {
     const t = setTimeout(() => setQ(qLive), 350);
     return () => clearTimeout(t);
@@ -444,6 +489,10 @@ export default function PLSKUAnalysis() {
       })).filter((cat) => cat.colors.length);
   }, [tree, category, color, rrMin, rrMax]);
 
+  // ref so expandAll/collapseAll can always see the latest filtered tree
+  const filteredTreeRef = useRef(filteredTree);
+  useEffect(() => { filteredTreeRef.current = filteredTree; }, [filteredTree]);
+
   const categories = useMemo(() => tree.map((c) => c.main_category), [tree]);
   const colors = useMemo(() => {
     const set = new Set();
@@ -491,6 +540,20 @@ export default function PLSKUAnalysis() {
             Analyze profit &amp; loss by SKU, Product, Color and Account
           </div>
         </div>
+        <button
+          onClick={expandAll}
+          className="btn-ghost text-xs flex items-center gap-1"
+          data-testid="ana-expand-all"
+        >
+          <CaretDownIcon size={12} weight="bold" /> Expand All
+        </button>
+        <button
+          onClick={collapseAll}
+          className="btn-ghost text-xs flex items-center gap-1"
+          data-testid="ana-collapse-all"
+        >
+          <CaretRightIcon size={12} weight="bold" /> Collapse All
+        </button>
         <button
           onClick={exportSummary}
           disabled={exporting || loading}
@@ -593,7 +656,14 @@ export default function PLSKUAnalysis() {
       ) : (
         <div className="space-y-3" data-testid="ana-tree">
           {filteredTree.map((c) => (
-            <CategoryNode key={c.main_category} node={c} onSkuClick={setSelectedSku} />
+            <CategoryNode
+              key={c.main_category}
+              node={c}
+              onSkuClick={setSelectedSku}
+              pathKey={`cat:${c.main_category}`}
+              openMap={openMap}
+              setOpen={setOpen}
+            />
           ))}
         </div>
       )}

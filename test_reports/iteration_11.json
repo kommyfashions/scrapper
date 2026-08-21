@@ -1,0 +1,33 @@
+{
+  "summary": "Re-verified FIX 4d (tier page-count badges on /printout-labels). Backend + Frontend both patched correctly. /api/pdf-sorter/analytics latest_run now returns tier1_pages, tier2_pages, tier1_categories, tier2_categories (verified live: latest run RUN_20260821_150557 → tier1_pages=0, tier2_pages=3, tier2_categories populated). Frontend inline runResult→run transform propagates the new fields. On /printout-labels Latest Run panel: Master Print button shows badge '3'; Tier 1 · High Volume shows NO badge (tier1_pages=0, correct — badge only renders when count>0); Tier 2 · Low Volume shows badge '3' (previously missing — now fixed). Export Unmatched (.xlsx) shows 2. Regression pytest: 16/17 passing — 1 pre-existing failure in test_pdf_sorter_iter6.py::test_download_headers_and_filename asserting 'max-age=0' in Cache-Control; server code sets 'no-store, no-cache, must-revalidate, max-age=0' but response arrives without 'max-age=0' (Starlette FileResponse / proxy strips it). Unrelated to FIX 4d.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/pdf-sorter/runs/{run_id}/files/{filename}", "issue": "Response Cache-Control header returns 'no-store, no-cache, must-revalidate' — 'max-age=0' set in code (routers/pdf_sorter.py:422) is stripped in transit (likely Starlette FileResponse or ingress). test_pdf_sorter_iter6.py::test_download_headers_and_filename fails on this. Pre-existing; not introduced by FIX 4d."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration10.py",
+    "/app/backend/tests/test_pdf_sorter_iter6.py"
+  ],
+  "action_items": [
+    "Investigate why 'max-age=0' token is stripped from Cache-Control on /runs/{run_id}/files/{filename} response — either adjust header value (e.g., replace 'max-age=0' with something not merged, or set via Response object explicitly) or relax the test assertion. Low priority."
+  ],
+  "critical_code_review_comments": [
+    "PrintoutLabelsPage.js is likely large; the inline runResult→run transform at ~L697 duplicates the shape mapping used elsewhere — extract to a small helper to avoid future drift (this was the exact source of FIX 4d bug).",
+    "routers/pdf_sorter.py analytics endpoint builds latest_run dict inline with tier fields — same shape is also assembled in /runs (with setdefault). Consider a single serializer for run docs so new fields propagate everywhere automatically."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "94% (16/17 pytest; FIX 4d analytics 100%)", "frontend": "100% (FIX 4d UI verified)"},
+  "test_credentials": "admin@meesho-dash.local / admin123",
+  "seed_data_creation": "None. Existing seed + fresh run RUN_20260821_150557 (created by pytest fresh_run fixture) already in db.pdf_sorter_runs with tier2_pages=3.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "FIX 4d fully resolved. If revisiting: latest_run in DB is now RUN_20260821_150557 (not RUN_20260821_145949) but both share tier2_pages=3. The only outstanding issue is unrelated Cache-Control 'max-age=0' stripping on FileResponse — likely Starlette merges/normalizes header values. Verify with `curl -I <backend>/api/pdf-sorter/runs/<id>/files/TIER1_HIGH_VOLUME.pdf`.",
+  "rca of the issue": "FIX 4d RCA (already patched by E1): /api/pdf-sorter/analytics built latest_run dict manually and omitted tier1_pages/tier2_pages/tier1_categories/tier2_categories, so PrintoutLabelsPage LastRunDownloads.tierCounts saw undefined→0 and hid the badge. Additionally the inline runResult→run transform in PrintoutLabelsPage.js (~L697) dropped those fields after upload. Both spots now propagate the 4 tier fields; badge condition (count>0) works — Tier 2 shows '3', Tier 1 correctly hidden with 0."
+}

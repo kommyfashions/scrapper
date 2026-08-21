@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
-import { TrendUpIcon, TrendDownIcon, CurrencyInrIcon, PackageIcon, WarningIcon, MegaphoneIcon } from "@phosphor-icons/react";
+import { TrendUpIcon, TrendDownIcon, CurrencyInrIcon, PackageIcon, WarningIcon, MegaphoneIcon, DownloadSimpleIcon, CaretDownIcon, CaretRightIcon } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import { usePL, DateRangeFilter, buildQuery, inr } from "./PLLayout";
 
@@ -23,8 +23,34 @@ export default function PLDashboard() {
   const { accountId, dateRange } = usePL();
   const [data, setData] = useState(null);
   const [missing, setMissing] = useState(null);
+  const [showMissing, setShowMissing] = useState(false);
+  const [exportingMissing, setExportingMissing] = useState(false);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
+
+  const exportMissing = useCallback(async () => {
+    setExportingMissing(true);
+    try {
+      const qs = accountId && accountId !== "all" ? `?account_id=${accountId}` : "";
+      const r = await api.get(`/pl/missing-sku-costs/export${qs}`, {
+        responseType: "blob",
+      });
+      const cd = r.headers?.["content-disposition"] || "";
+      const match = /filename="?([^"]+)"?/i.exec(cd);
+      const name = (match && match[1]) || `missing_sku_costs.xlsx`;
+      const blobUrl = URL.createObjectURL(new Blob([r.data]));
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(blobUrl); a.remove(); }, 4000);
+    } catch (e) {
+      setErr(formatApiError(e));
+    } finally {
+      setExportingMissing(false);
+    }
+  }, [accountId]);
 
   const load = useCallback(async () => {
     setLoading(true); setErr("");
@@ -54,19 +80,76 @@ export default function PLDashboard() {
       )}
 
       {missing && missing.total_missing > 0 && (
-        <div className="border border-[#F5A623]/40 bg-[#F5A623]/10 px-4 py-3 flex items-start gap-3"
+        <div className="border border-[#F5A623]/40 bg-[#F5A623]/10 px-4 py-3"
           data-testid="pl-missing-skus">
-          <WarningIcon size={18} weight="bold" color="#F5A623" />
-          <div className="flex-1">
-            <div className="font-mono text-xs uppercase tracking-wider text-[#F5A623] mb-1">
-              {missing.total_missing} SKU{missing.total_missing > 1 ? "s" : ""} missing cost price
+          <div className="flex items-start gap-3">
+            <WarningIcon size={18} weight="bold" color="#F5A623" />
+            <div className="flex-1">
+              <div className="font-mono text-xs uppercase tracking-wider text-[#F5A623] mb-1">
+                {missing.total_missing} SKU{missing.total_missing > 1 ? "s" : ""} missing cost price
+              </div>
+              <div className="text-[11px] text-[#A1A1AA] mb-2">
+                Profit calculations treat missing-cost SKUs as ₹0 cost. Add cost prices to get accurate profit numbers.
+              </div>
+              {missing.by_account && missing.by_account.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mb-2" data-testid="pl-missing-by-account">
+                  {missing.by_account.map((a) => (
+                    <span key={a.account} className="chip">
+                      {a.account} · {a.count}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="flex flex-wrap gap-2 items-center">
+                <button
+                  onClick={() => setShowMissing((v) => !v)}
+                  className="btn-ghost text-xs flex items-center gap-1"
+                  data-testid="pl-toggle-missing"
+                >
+                  {showMissing ? <CaretDownIcon size={12} weight="bold" /> : <CaretRightIcon size={12} weight="bold" />}
+                  {showMissing ? "Hide" : "View"} full list ({missing.total_missing})
+                </button>
+                <button
+                  onClick={exportMissing}
+                  disabled={exportingMissing}
+                  className="btn-ghost text-xs flex items-center gap-1 disabled:opacity-50"
+                  data-testid="pl-export-missing"
+                >
+                  <DownloadSimpleIcon size={12} weight="bold" />
+                  {exportingMissing ? "Exporting…" : "Export missing SKUs (.xlsx)"}
+                </button>
+                <Link to="/pl/product-master" className="btn-secondary text-xs inline-flex" data-testid="pl-link-sku-costs">
+                  Manage SKU Costs
+                </Link>
+              </div>
+              {showMissing && (
+                <div className="mt-3 border-t border-[#F5A623]/30 pt-3" data-testid="pl-missing-full">
+                  <div className="max-h-64 overflow-auto">
+                    <table className="dense w-full">
+                      <thead>
+                        <tr>
+                          <th>Account</th>
+                          <th>SKU</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {(missing.items || []).slice(0, 500).map((it, i) => (
+                          <tr key={i}>
+                            <td className="text-xs">{it.account_alias || it.account_name || "—"}</td>
+                            <td className="font-mono text-[11px]">{it.sku}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {missing.items && missing.items.length > 500 && (
+                      <div className="text-[11px] text-[#A1A1AA] px-2 py-2">
+                        …showing first 500. Use Export for the full list.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
-            <div className="text-[11px] text-[#A1A1AA] mb-2">
-              Profit calculations treat missing-cost SKUs as ₹0 cost. Add cost prices to get accurate profit numbers.
-            </div>
-            <Link to="/pl/sku-costs" className="btn-secondary text-xs inline-flex" data-testid="pl-link-sku-costs">
-              Manage SKU Costs
-            </Link>
           </div>
         </div>
       )}

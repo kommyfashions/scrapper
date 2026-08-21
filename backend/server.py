@@ -2290,9 +2290,28 @@ async def pl_analyzer_kpis(
             if o["order_status"] == "RETURNED":
                 d["returned"] += 1
                 d["loss"] += (o.get("return_shipping_charge") or 0) - (o.get("compensation_amount") or 0)
-        d["net_margin"] = (d["profit"] / d["revenue"] * 100) if d["revenue"] else 0
-        d["return_rate"] = (d["returned"] / d["ordered"] * 100) if d["ordered"] else 0
+        # Ads cost in the same window — matches /pl/dashboard math
+        ads = 0.0
+        ads_q: Dict[str, Any] = {}
+        if account_id and account_id != "all":
+            ads_q["account_id"] = account_id
+        if sd or ed:
+            df: Dict[str, Any] = {}
+            if sd:
+                df["$gte"] = sd
+            if ed:
+                df["$lte"] = ed
+            if df:
+                ads_q["deduction_date"] = df
+        async for a in db.pl_ads_cost.find(ads_q, {"_id": 0, "total_ads_cost": 1}):
+            ads += abs(a.get("total_ads_cost") or 0)
+        d["ads_cost"] = ads
         d["net_contribution"] = d["profit"] - d["loss"]
+        d["net_after_ads"] = d["net_contribution"] - ads
+        # Net margin now reflects the "final" number so it agrees with the
+        # Dashboard's headline Net Margin.
+        d["net_margin"] = (d["net_after_ads"] / d["revenue"] * 100) if d["revenue"] else 0
+        d["return_rate"] = (d["returned"] / d["ordered"] * 100) if d["ordered"] else 0
         return d
 
     curr = await _bucket(start_date, end_date)
@@ -2332,9 +2351,10 @@ async def pl_analyzer_kpis(
         {"key": "revenue", "label": "Revenue", "value": round(curr["revenue"], 2),
          "delta_pct": _delta(curr["revenue"], prev["revenue"]) if prev else None,
          "prev": round(prev["revenue"], 2) if prev else None, "currency": True},
-        {"key": "profit", "label": "Profit", "value": round(curr["profit"], 2),
-         "delta_pct": _delta(curr["profit"], prev["profit"]) if prev else None,
-         "prev": round(prev["profit"], 2) if prev else None, "currency": True},
+        {"key": "profit", "label": "Net Profit", "value": round(curr["net_after_ads"], 2),
+         "delta_pct": _delta(curr["net_after_ads"], prev["net_after_ads"]) if prev else None,
+         "prev": round(prev["net_after_ads"], 2) if prev else None, "currency": True,
+         "sub": "after returns & ads"},
         {"key": "net_margin", "label": "Net Margin", "value": round(curr["net_margin"], 2),
          "delta_pct": _delta(curr["net_margin"], prev["net_margin"]) if prev else None,
          "prev": round(prev["net_margin"], 2) if prev else None,
@@ -2783,20 +2803,102 @@ async def pl_sku_costs_upload(
 
 @api.get("/pl/missing-sku-costs")
 async def pl_missing_sku_costs(account_id: Optional[str] = None, user: dict = Depends(get_current_user)):
-    """Now delegates to /pl/articles/missing-skus for consistency — every SKU
-    seen in orders that doesn't yet have an article mapping is 'missing'."""
+    """SKUs seen in orders that don't have a positive cost_price in Product
+    Master. This is the authoritative source since the migration to
+    pm_products/pm_skus. Legacy article_sku_map is ignored."""
     if account_id and account_id != "all":
         await pl_resolve_account_filter(account_id)
     order_q = {} if not account_id or account_id == "all" else {"account_id": account_id}
-    order_skus = await db.pl_orders.distinct("sku", order_q)
-    # build mapped set from article_sku_map
-    map_q = {} if not account_id or account_id == "all" else {"account_id": account_id}
-    mapped = set()
-    async for m in db.article_sku_map.find(map_q, {"_id": 0, "sku": 1}):
-        mapped.add(m.get("sku"))
-    missing = sorted([s for s in order_skus if s and s not in mapped])
-    return {"missing_skus": missing, "total_missing": len(missing),
-            "total_order_skus": len(order_skus), "total_with_costs": len(mapped)}
+
+    # Distinct (account_id, sku) pairs from orders. distinct() gives us just
+    # SKUs — we need per-account so aggregate instead.
+    seen_pairs: set = set()
+    async for row in db.pl_orders.aggregate([
+        {"$match": {**order_q, "sku": {"$nin": [None, ""]}}},
+        {"$group": {"_id": {"account_id": "$account_id", "sku": "$sku"}}},
+    ]):
+        k = row["_id"]
+        seen_pairs.add((k.get("account_id"), k.get("sku")))
+
+    # Load Product Master SKUs with positive cost
+    prod_cost: Dict[Any, float] = {}
+    async for p in db.pm_products.find({}, {"_id": 1, "cost_price": 1}):
+        prod_cost[p["_id"]] = float(p.get("cost_price") or 0)
+    mapped: set = set()
+    async for m in db.pm_skus.find({}, {"_id": 0}):
+        pid = m.get("product_id")
+        if prod_cost.get(pid, 0) > 0:
+            mapped.add((m.get("account_id"), m.get("sku")))
+
+    # Account name lookup
+    acc_lookup: Dict[str, dict] = {}
+    async for a in db.accounts.find({}, {"_id": 1, "name": 1, "alias": 1}):
+        acc_lookup[str(a["_id"])] = {"name": a.get("name"), "alias": a.get("alias")}
+
+    missing_pairs = sorted(
+        [(aid, s) for (aid, s) in seen_pairs if (aid, s) not in mapped],
+        key=lambda x: (x[0] or "", x[1] or ""),
+    )
+    items = [
+        {
+            "account_id": aid,
+            "account_name": acc_lookup.get(aid, {}).get("name"),
+            "account_alias": acc_lookup.get(aid, {}).get("alias"),
+            "sku": s,
+        }
+        for (aid, s) in missing_pairs
+    ]
+
+    by_account: Dict[str, int] = {}
+    for it in items:
+        key = it["account_alias"] or it["account_name"] or it["account_id"] or "—"
+        by_account[key] = by_account.get(key, 0) + 1
+
+    # Legacy shape kept for older callers (missing_skus, total_missing).
+    missing_skus_only = sorted({s for (_a, s) in missing_pairs})
+    return {
+        "missing_skus": missing_skus_only,
+        "total_missing": len(items),
+        "total_order_pairs": len(seen_pairs),
+        "total_with_costs": len(mapped),
+        "items": items,
+        "by_account": [{"account": k, "count": v}
+                       for k, v in sorted(by_account.items(), key=lambda kv: -kv[1])],
+    }
+
+
+@api.get("/pl/missing-sku-costs/export")
+async def pl_missing_sku_costs_export(
+    account_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """Excel export of missing-cost SKUs, one row per (account, sku)."""
+    import io as _io
+    payload = await pl_missing_sku_costs(account_id=account_id, user=user)
+    items = payload["items"] or [{"account_alias": "", "account_name": "",
+                                   "account_id": "", "sku": ""}]
+    import pandas as _pd
+    df = _pd.DataFrame([{
+        "Account": (r.get("account_alias") or r.get("account_name") or ""),
+        "Account ID": r.get("account_id") or "",
+        "SKU": r.get("sku") or "",
+        "Cost Price (fill in)": "",
+        "Main Category": "",
+        "Color": "",
+    } for r in items])
+    out = _io.BytesIO()
+    with _pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Missing SKUs")
+    out.seek(0)
+    fn = f"missing_sku_costs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        out,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={fn}",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # --------------------------------------------------------------------------------------

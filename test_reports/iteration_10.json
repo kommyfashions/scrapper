@@ -1,0 +1,48 @@
+{
+  "summary": "Verified all 4 fixes in iteration 10. Backend: 8/8 new tests pass (KPIs Net Profit=net_after_ads, missing-sku-costs response shape + xlsx export, TIER1_MIN_PAGES=5, /runs & /recent-runs expose tier1_pages/tier2_pages, /runs/{id}/unmatched.xlsx works). Existing pdf_sorter_iter6 tier1+tier2==master test still passes. Frontend: FIX 1 (Expand/Collapse All on /pl/sku-analysis) works — Collapse hides all account nodes (0), Expand reveals all 5. FIX 2 (Net Profit label + 'after returns & ads' sub) rendered on SKU Analysis top strip. FIX 2b chips (REV·PROFIT / NET PROFIT) exist in code but only render when agg.units_ordered>0 (preview has no orders → shows 'no data'). FIX 3 backend endpoints validated; UI banner not rendered in preview since total_missing=0. FIX 4d: Master Print button shows count badge but Tier 1/Tier 2 buttons DO NOT render badges even though DB has tier2_pages=3 — bug is that /analytics `latest_run` payload and the inline `runResult`→run transform in PrintoutLabelsPage.js (line 697-704) both drop the tier1_pages/tier2_pages fields.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "PrintoutLabelsPage LastRunDownloads (tier badges)", "issue": "Tier 1 · High Volume and Tier 2 · Low Volume buttons never show a page-count badge. Confirmed via DB: run RUN_20260821_145949 has tier2_pages=3, yet the UI shows only 'Tier 2 · Low Volume' with no [3] badge. Two root causes: (1) /api/pdf-sorter/analytics `latest_run` construction (routers/pdf_sorter.py ~lines 268-283) does not include tier1_pages/tier2_pages, (2) in PrintoutLabelsPage.js the inline transform at lines 697-704 (when runResult exists) also omits tier1_pages/tier2_pages when building the `run` prop passed to LastRunDownloads. Master Print badge works because it uses run.total_pages.", "selector": "[data-testid='pl-latest-dl-TIER1_HIGH_VOLUME.pdf'], [data-testid='pl-latest-dl-TIER2_LOW_VOLUME.pdf']", "priority": "HIGH"}
+    ],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration10.py",
+    "/app/test_reports/pytest/iter10.xml"
+  ],
+  "action_items": [
+    "Fix FIX 4d: In /app/backend/routers/pdf_sorter.py `analytics()` (around line 268), add tier1_pages / tier2_pages (and ideally tier1_categories/tier2_categories) to the latest_run dict. Also in /app/frontend/src/pages/pl/../PrintoutLabelsPage.js line 697-704, propagate runResult.tier1_pages / runResult.tier2_pages when constructing the run prop. After the fix, tier2_pages=3 for the existing seeded run should surface a '3' badge next to 'Tier 2 · Low Volume'."
+  ],
+  "critical_code_review_comments": [
+    "PrintoutLabelsPage.js LastRunDownloads.tierCounts uses run.tier1_pages ?? 0 — silently falls back to 0 when field missing; would benefit from a console.warn or a visual indicator if missing to catch the current bug earlier.",
+    "REV·PROFIT / NET PROFIT chips in AggBadges only render when agg.units_ordered>0; consider showing them with ₹0 in preview/empty state so E1 users can visually confirm renaming took effect (currently every row shows 'no data' → renaming is invisible to non-devs).",
+    "/api/pl/analyzer/kpis correctly implements Net Profit=profit-loss-ads_cost and Net Margin recomputed on that. Data assertion confirmed value==(curr.profit-curr.loss-curr.ads_cost).",
+    "/api/pl/missing-sku-costs/export returns correct XLSX headers; response filename prefix `missing_sku_costs_` verified.",
+    "pdf_sorter TIER1_MIN_PAGES=5 confirmed; main_category grouping in place; tier1_pages/tier2_pages persisted correctly (verified via mongo on RUN_20260821_145949)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration10.py (created)"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "83% (5/6 checks — FIX 4d badge bug)"},
+  "test_credentials": "admin@meesho-dash.local / admin123",
+  "seed_data_creation": "test_unmatched_export creates+deletes a TEST_iter10_unmatched pdf_sorter_runs doc; existing RUN_20260821_145949 was left untouched.",
+  "retest_needed": true,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Only remaining fix for iteration 10 is FIX 4d tier badges on PrintoutLabelsPage. Once E1 patches routers/pdf_sorter.py analytics.latest_run + PrintoutLabelsPage line 697-704 to pass tier1_pages/tier2_pages, verify by visiting /printout-labels — Tier 2 · Low Volume button should show a '3' badge (from existing RUN_20260821_145949) and Master Print should still show '3'. Also run: cd /app/backend && python -m pytest tests/test_iteration10.py tests/test_pdf_sorter_iter6.py -q → should stay 17/17 green.",
+  "verifications_performed": {
+    "pytest_iter10": "8/8 passed (backend)",
+    "pytest_pdf_sorter_iter6": "9/9 passed (tier1+tier2==master test still passes)",
+    "fix1_expand_all": "PASS: collapse=0 acc-nodes, expand=5 acc-nodes",
+    "fix2_kpi_label": "PASS: profit KPI label='Net Profit', sub='after returns & ads', value==curr.profit-curr.loss-curr.ads_cost",
+    "fix2b_chips": "code verified (line 152/157 in PLSKUAnalysis.js) — visual render blocked by empty preview orders (agg.units_ordered==0 → 'no data')",
+    "fix3_api": "response includes items[], by_account[], total_with_costs, total_order_pairs, missing_skus[], total_missing",
+    "fix3_export": "200, content-type spreadsheetml.sheet, filename starts missing_sku_costs_, blob>0",
+    "fix3_ui": "not visible in preview (total_missing=0) — code path exists at PLDashboard.js",
+    "fix4_tier_const": "TIER1_MIN_PAGES=5 verified via import",
+    "fix4b_unmatched_xlsx": "PASS after seeding TEST_iter10_unmatched",
+    "fix4c_tier_fields_exposed": "recent-runs items have tier1_pages/tier2_pages; /runs setdefaults them",
+    "fix4d_ui_badges": "FAIL — Master Print shows '3', but Tier 1/Tier 2 buttons render without a badge despite tier2_pages=3 in DB. See ui_bugs above."
+  }
+}
