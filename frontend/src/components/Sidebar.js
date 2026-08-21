@@ -12,6 +12,8 @@ import {
   UserCircleIcon,
   CurrencyInrIcon,
   PauseCircleIcon,
+  StorefrontIcon,
+  LightningIcon,
 } from "@phosphor-icons/react";
 import { useAuth } from "@/auth/AuthContext";
 
@@ -38,6 +40,8 @@ const NAV_SECTIONS = [
       { to: "/labels", label: "Label Download", Icon: PrinterIcon, testid: "nav-labels" },
       { to: "/printout-labels", label: "Printout Labels", Icon: PrinterIcon, testid: "nav-printout-labels" },
       { to: "/inventory-actions", label: "Bulk Pause", Icon: PauseCircleIcon, testid: "nav-inventory-actions" },
+      { to: "/live-inventory", label: "Live Inventory", Icon: StorefrontIcon, testid: "nav-live-inventory" },
+      { to: "/auto-accept", label: "Auto-Accept", Icon: LightningIcon, testid: "nav-auto-accept" },
       { to: "/settings", label: "Settings", Icon: GearIcon, testid: "nav-settings" },
     ],
   },

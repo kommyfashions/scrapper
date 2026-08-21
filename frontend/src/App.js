@@ -17,6 +17,8 @@ import PrintoutLabelsPage from "@/pages/PrintoutLabelsPage";
 import AccountsPage from "@/pages/AccountsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import InventoryActionsPage from "@/pages/InventoryActionsPage";
+import LiveInventoryPage from "@/pages/LiveInventoryPage";
+import AutoAcceptPage from "@/pages/AutoAcceptPage";
 import PLLayout from "@/pages/pl/PLLayout";
 import PLDashboard from "@/pages/pl/PLDashboard";
 import PLOrders from "@/pages/pl/PLOrders";
@@ -52,6 +54,8 @@ function App() {
               <Route path="/printout-labels" element={<PrintoutLabelsPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/inventory-actions" element={<InventoryActionsPage />} />
+              <Route path="/live-inventory" element={<LiveInventoryPage />} />
+              <Route path="/auto-accept" element={<AutoAcceptPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/pl" element={<PLLayout />}>
                 <Route index element={<Navigate to="/pl/dashboard" replace />} />

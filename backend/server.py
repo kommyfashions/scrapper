@@ -28,6 +28,8 @@ from apscheduler.triggers.cron import CronTrigger
 from routers import product_master as pm_router
 from routers import pdf_sorter as ps_router
 from routers import inventory_actions as ia_router
+from routers import inventory_sync as isync_router
+from routers import auto_accept as aa_router
 from services import product_master as pm_service
 
 # --------------------------------------------------------------------------------------
@@ -362,6 +364,16 @@ async def snapshot_all_products():
         logger.exception(f"[scheduler] snapshot failed: {e}")
 
 
+async def _run_auto_accept_tick():
+    """Wrapper so the auto_accept router can be scheduled from server.py."""
+    try:
+        enq = await aa_router.scheduler_tick(db)
+        if enq:
+            logger.info(f"[scheduler] auto_accept enqueued for accounts: {enq}")
+    except Exception as e:
+        logger.exception(f"[scheduler] auto_accept tick failed: {e}")
+
+
 async def enqueue_daily_label_job():
     try:
         if await is_skipped_today():
@@ -458,6 +470,13 @@ async def reconfigure_scheduler():
         enqueue_gst_and_tax_jobs,
         CronTrigger(hour=2, minute=0, timezone=SCHED_TZ),
         id="daily_gst_tax_fetch", replace_existing=True,
+    )
+    # Auto-accept polling — every 5 minutes. The tick itself respects each
+    # account's individual interval, so a coarse cron is fine.
+    scheduler.add_job(
+        _run_auto_accept_tick,
+        CronTrigger(minute="*/5", timezone=SCHED_TZ),
+        id="auto_accept_poll", replace_existing=True,
     )
     logger.info(f"[scheduler] reconfigured: jobs={[j.id for j in scheduler.get_jobs()]}")
 
@@ -3633,6 +3652,22 @@ app.include_router(
 ia_router.configure(db)
 app.include_router(
     ia_router.router,
+    prefix="/api",
+    dependencies=[Depends(get_current_user)],
+)
+
+# Live Inventory Sync module
+isync_router.configure(db)
+app.include_router(
+    isync_router.router,
+    prefix="/api",
+    dependencies=[Depends(get_current_user)],
+)
+
+# Auto-accept labels module
+aa_router.configure(db)
+app.include_router(
+    aa_router.router,
     prefix="/api",
     dependencies=[Depends(get_current_user)],
 )

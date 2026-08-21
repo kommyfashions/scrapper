@@ -1,0 +1,41 @@
+{
+  "summary": "Tested Iteration 12: Live Inventory Sync (/live-inventory) and Auto-Accept Labels (/auto-accept). Wrote /app/backend/tests/test_iteration12.py (17 tests) — all 17 PASS covering: inventory-sync history/last-sync/live/missing/live-export/missing-export/run-dedupe/run-rejects-'all'; auto-accept settings list/PUT toggle/interval validation (422 for <5)/interval update/run-now dedupe/history; missing-with-seeded data (inserted 2 TEST_ONLY_MEESHO_* rows into meesho_live_skus, verified they appear in only_on_meesho and /live search, then cleaned up); scheduler contains 'auto_accept_poll' (confirmed via backend log line 'reconfigured: jobs=[...auto_accept_poll...]'); label_worker.py JOB_TYPES contains both 'inventory_sync' and 'accept_labels'. Regression: pytest on test_inventory_actions.py + test_iteration10.py + test_pdf_sorter_iter6.py → 21/22 pass; the single failure (test_download_headers_and_filename 'max-age=0' Cache-Control) is pre-existing and documented in iteration_11.json. Frontend Playwright: login OK, sidebar shows nav-live-inventory + nav-auto-accept, /live-inventory renders live-inventory-page, account-select populates 2 accounts (Account1/Account2), run-sync-btn enqueues job (POST /api/inventory-sync/run returned 200) and it appears in Sync History (history-item-*); tab-missing shows missing-tab-meesho + missing-tab-pm sub-tabs; export-live-btn + export-missing-btn visible. /auto-accept renders settings-table with 2 settings-row-<id> rows; toggle-<id> flips (PUT settings 200, checkbox reflects new state), interval-<id> select persists (PUT settings 200 with interval_minutes=60, value 60 read back), run-now-<id> POSTs /run-now (200) and history-item-* appears in recent runs. All new UI interactions integrate with backend correctly.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/inventory-sync/run", "issue": "Rejects account_id='all' via 400 'invalid id: all' from ObjectId parsing (works, but the error message is generic — spec asked for explicit reject). Non-blocking."},
+      {"endpoint": "/api/pdf-sorter/runs/{run_id}/files/{filename}", "issue": "Pre-existing (from iteration_11): Cache-Control 'max-age=0' token stripped in transit. Unrelated to iteration 12."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "/auto-accept", "issues": ["Console shows a React hydration warning: '<span> cannot be a child of <option>' — appears to be introduced by the Emergent inline source-tracker inspector wrapping option children with a <span data-ve-dynamic>. Cosmetic warning only; select functions correctly (interval PUTs persist)."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iteration12.py",
+    "/app/test_reports/pytest/iter12.xml"
+  ],
+  "action_items": [
+    "(Optional) Return an explicit 400 in /api/inventory-sync/run when account_id=='all' with a clearer message instead of falling through the ObjectId validator.",
+    "(Cosmetic) Investigate span-inside-option hydration warning on /auto-accept — likely inspector overlay only; safe to ignore in prod builds.",
+    "Playwright is not installed in preview container so `python -c 'import inventory_sync_fetcher, accept_labels_fetcher'` fails inside preview (ModuleNotFoundError: playwright). This is expected — scrapers only run on the EC2 host. The label_worker.py JOB_TYPES check passes via grep (verified in test_iteration12.py TestWorkerSanity)."
+  ],
+  "critical_code_review_comments": [
+    "auto_accept.scheduler_tick: elapsed calc `now - last['finished_at'].replace(tzinfo=... if last['finished_at'].tzinfo is None else last['finished_at'].tzinfo)` is convoluted — simplify to a single `_ensure_utc()` helper. Low priority.",
+    "inventory_sync/live builds facets by running an aggregate for by_account and another for by_category — both share the same $match. Could combine via $facet for a single round-trip. Perf micro-opt.",
+    "server.py already >1000 lines; consider extracting scheduler configuration into routers/scheduler.py to keep server.py manageable (>700 lines guideline)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration12.py"
+  ],
+  "success_rate": {"backend": "100% (17/17 new + 21/22 regression, 1 pre-existing unrelated)", "frontend": "100% (all Iteration-12 flows verified)"},
+  "test_credentials": "admin@meesho-dash.local / admin123",
+  "seed_data_creation": "Test-only: TestMissingSeeded inserts 2 rows into meesho_live_skus with style_id prefix 'TEST_ONLY_MEESHO_' and deletes them in a finally block. No residual seed data. Test-created pending jobs (dashboard-submitted inventory_sync + accept_labels) were cleaned via db.jobs.delete_many after the run.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 12 fully green. New pytest file: test_iteration12.py (17 tests). Scheduler jobs currently registered: alerts_check, auto_accept_poll, daily_gst_tax_fetch, daily_scrape, daily_snapshot, weekly_payments_fetch, monthly_payments_fetch. Preview env has 2 accounts (Account1 6a6b75d4db9b40c2c3df67a5, Account2 6a6b75d4db9b40c2c3df67a6). meesho_live_skus is empty by default in preview; scrapers cannot run here so any /api/inventory-sync/run or /api/auto-accept/run-now leaves jobs in status='pending' — that is expected. Only outstanding issue is the pre-existing pdf-sorter Cache-Control max-age=0 stripping from iteration_11.",
+  "rca of the issue": "N/A — no functional issues found in iteration 12."
+}
