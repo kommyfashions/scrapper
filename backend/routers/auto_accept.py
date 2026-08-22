@@ -142,6 +142,8 @@ def _serialize_job(j: dict) -> dict:
             "accepted_count": int(r.get("accepted_count") or 0),
             "already_accepted_count": int(r.get("already_accepted_count") or 0),
             "failed_count": int(r.get("failed_count") or 0),
+            "orders_seen": int(r.get("orders_seen") or 0),
+            "note": r.get("note") or "",
         },
     }
 

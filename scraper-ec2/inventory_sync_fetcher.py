@@ -1,42 +1,40 @@
 """Meesho Live Inventory scraper — job type: `inventory_sync`.
 
-Walks the Active tab (supplier.meesho.com/panel/v3/new/services/<suffix>
-/inventory) and captures every visible (catalog, style_id, sku, size,
-price, stock) row.
+URL:  https://supplier.meesho.com/panel/v3/new/services/<suffix>/inventory
 
-Approach:
-  1. Open Inventory > Active tab, wait for "10 Items / page" pagination.
-  2. For each pagination page (1..last):
-       a. For each catalog card in the left rail:
-          - Click the card. Wait for right pane to load SKU rows.
-          - For each row, capture: SKU, Variation, Estimated Order, Stock,
-            Style ID and Meesho Price (both shown under the SKU name).
-       b. Scroll the LEFT rail (not the page) so more catalog cards render;
-          the left rail uses infinite-scroll-within-page.
-       c. Click "next page" once every catalog on the current page has been
-          processed.
-  3. Persist: bulk-replace the account's rows in `meesho_live_skus`.
+Approach (defensive — no IndexError on virtualized lists):
+  1. Open Inventory page, ensure the "Active" tab is selected.
+  2. On each pagination page, snapshot the LEFT rail catalog cards by
+     extracting their text (name + Catalog ID + Category) as a stable
+     de-duped list.
+  3. For each unique Catalog ID:
+        a. Click the card whose text CONTAINS that Catalog ID.
+        b. Wait for the right pane to render "Style ID:" text.
+        c. Read every SKU block visible in the right pane.
+  4. Click pagination Next; stop when disabled or unchanged.
+
+We NEVER index by ordinal position across DOM refreshes — always find by
+Catalog ID text. That eliminates the IndexError seen in the previous
+implementation.
 
 Return dict merged into the job:
-    {catalogs_scanned, skus_captured, pages_visited}
+    {catalogs_scanned, skus_captured, pages_visited, note}
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 import traceback
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set
 
 from _meesho_ui import cdp_context_page
-from playwright.sync_api import Page, TimeoutError as PWTimeout
+from playwright.sync_api import Page, TimeoutError as PWTimeout  # noqa: F401
 from pymongo import MongoClient
-import os
-
-PAGE_LOAD_MS = 40_000
-CARD_WAIT_MS = 10_000
-ROW_WAIT_MS = 8_000
 
 MONEY_RE = re.compile(r"[\d,]+(?:\.\d+)?")
+PAGE_LOAD_MS = 45_000
 
 
 def _inventory_url(suffix: str) -> str:
@@ -44,24 +42,14 @@ def _inventory_url(suffix: str) -> str:
             f"/inventory")
 
 
-def _txt(node, timeout_ms=2000) -> str:
+def _safe_text(node, timeout_ms: int = 1500) -> str:
     try:
         return (node.inner_text(timeout=timeout_ms) or "").strip()
     except Exception:  # noqa: BLE001
         return ""
 
 
-def _int_or_none(s: str):
-    m = MONEY_RE.search(s or "")
-    if not m:
-        return None
-    try:
-        return int(m.group(0).replace(",", "").split(".")[0])
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _float_or_none(s: str):
+def _first_number(s: str) -> Optional[float]:
     m = MONEY_RE.search(s or "")
     if not m:
         return None
@@ -71,34 +59,105 @@ def _float_or_none(s: str):
         return None
 
 
-def _extract_rows_from_right_pane(page: Page,
-                                   catalog_name: str,
-                                   catalog_id: str,
-                                   category: str) -> List[Dict[str, Any]]:
-    """Scrape SKU rows from the currently-open catalog on the right pane.
+def _select_active_tab(page: Page) -> None:
+    for label in ("Active", "ACTIVE"):
+        try:
+            loc = page.locator(f'xpath=//*[normalize-space(text())="{label}"]').first
+            if loc.count() > 0 and loc.is_visible(timeout=1500):
+                loc.click(timeout=3000)
+                page.wait_for_timeout(1500)
+                return
+        except Exception:  # noqa: BLE001
+            continue
 
-    Each row shows: checkbox | SKU (multi-line with Style ID + SKU + Meesho
-    Price) | Variation (IND-6) | Estimated Order | Stock | Actions.
-    """
+
+def _snapshot_catalog_ids(page: Page) -> List[Dict[str, str]]:
+    """Return a de-duped list of catalog metadata visible in the left rail.
+    Each item: {name, catalog_id, category}. Ordered top-to-bottom."""
+    out: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    try:
+        cards = page.locator(
+            'xpath=//*[contains(normalize-space(.), "Catalog ID:") and '
+            'contains(normalize-space(.), "Category:")]'
+        )
+        n = cards.count()
+    except Exception:  # noqa: BLE001
+        return out
+    for i in range(n):
+        try:
+            text = _safe_text(cards.nth(i))
+        except Exception:  # noqa: BLE001
+            continue
+        if not text:
+            continue
+        name = ""
+        cid = ""
+        cat = ""
+        for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
+            low = line.lower()
+            if low.startswith("catalog id"):
+                cid = line.split(":", 1)[1].strip()
+            elif low.startswith("category"):
+                cat = line.split(":", 1)[1].strip()
+            elif not name:
+                name = line
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append({"name": name, "catalog_id": cid, "category": cat})
+    return out
+
+
+def _click_catalog_by_id(page: Page, catalog_id: str) -> bool:
+    """Find and click the catalog card containing this Catalog ID text."""
+    for _ in range(3):
+        try:
+            card = page.locator(
+                f'xpath=//*[contains(normalize-space(.), "Catalog ID:") '
+                f'and contains(normalize-space(.), "{catalog_id}")]'
+            ).first
+            if card.count() == 0:
+                page.wait_for_timeout(400)
+                continue
+            card.scroll_into_view_if_needed(timeout=2000)
+            card.click(timeout=3000)
+            page.wait_for_timeout(1000)
+            return True
+        except Exception:  # noqa: BLE001
+            page.wait_for_timeout(400)
+    return False
+
+
+def _extract_skus_from_right_pane(
+    page: Page, catalog: Dict[str, str],
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
         page.wait_for_selector(
             'xpath=//*[contains(normalize-space(.), "Style ID")]',
-            timeout=ROW_WAIT_MS)
+            timeout=8_000,
+        )
     except PWTimeout:
         return rows
+    except Exception:  # noqa: BLE001
+        return rows
 
-    # Each SKU row is the closest ancestor container of the "Style ID:" text.
-    # Meesho panel uses <div class="MuiBox-root ..."> — climb 4-5 levels.
-    sku_blocks = page.locator(
-        'xpath=//*[contains(normalize-space(.), "Style ID:") and '
-        'contains(normalize-space(.), "SKU:") and '
-        'contains(normalize-space(.), "Meesho Price")]'
-    )
-    n = sku_blocks.count()
+    try:
+        blocks = page.locator(
+            'xpath=//*[contains(normalize-space(.), "Style ID:") and '
+            'contains(normalize-space(.), "SKU:") and '
+            'contains(normalize-space(.), "Meesho Price")]'
+        )
+        n = blocks.count()
+    except Exception:  # noqa: BLE001
+        return rows
+
     for i in range(n):
-        blk = sku_blocks.nth(i)
-        text = _txt(blk, timeout_ms=1500)
+        try:
+            text = _safe_text(blocks.nth(i))
+        except Exception:  # noqa: BLE001
+            continue
         if not text:
             continue
         style_id = None
@@ -111,84 +170,45 @@ def _extract_rows_from_right_pane(page: Page,
             elif low.startswith("sku"):
                 sku = line.split(":", 1)[1].strip()
             elif "meesho price" in low:
-                price = _float_or_none(line.split(":", 1)[-1])
+                price = _first_number(line.split(":", 1)[-1])
         if not sku:
             continue
-        # variation & stock: climb to the enclosing row (tr or grid row)
+        variation = None
         try:
-            row_container = blk.locator(
+            row_container = blocks.nth(i).locator(
                 'xpath=ancestor::*[self::tr or (@role="row")][1]').first
-            row_text = _txt(row_container, timeout_ms=1500)
+            row_text = _safe_text(row_container)
         except Exception:  # noqa: BLE001
             row_text = ""
-        variation = None
-        m = re.search(r"\b(IND-\d+|S|M|L|XL|XXL|XXXL|Free\s*Size)\b",
-                      row_text, re.IGNORECASE)
+        m = re.search(
+            r"\b(IND-\d+|S|M|L|XL|XXL|XXXL|Free\s*Size)\b",
+            row_text, re.IGNORECASE,
+        )
         if m:
             variation = m.group(1).upper().replace(" ", "")
-        current_stock = None
-        # look for a <input value="..."> near the row for current stock
-        try:
-            stock_input = row_container.locator(
-                'input[type="text"], input[type="number"]').first
-            v = stock_input.get_attribute("value", timeout=1000)
-            current_stock = _int_or_none(v or "")
-        except Exception:  # noqa: BLE001
-            pass
-
         rows.append({
-            "catalog_id": catalog_id,
-            "catalog_name": catalog_name,
-            "category": category,
+            "catalog_id": catalog["catalog_id"],
+            "catalog_name": catalog["name"],
+            "category": catalog["category"],
             "style_id": style_id or sku,
             "sku": sku,
             "variation": variation,
             "price": price,
-            "current_stock": current_stock,
+            "current_stock": None,
         })
     return rows
 
 
-def _left_rail_cards(page: Page):
-    """The left rail holds catalog cards. Each card shows the catalog name,
-    "Catalog ID:", and "Category:". Returns a locator handle."""
-    return page.locator(
-        'xpath=//*[contains(normalize-space(.), "Catalog ID:") and '
-        'contains(normalize-space(.), "Category:")]'
-    )
-
-
-def _card_meta(card) -> Dict[str, str]:
-    text = _txt(card, timeout_ms=1500)
-    name = ""
-    cid = ""
-    cat = ""
-    for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
-        low = line.lower()
-        if low.startswith("catalog id"):
-            cid = line.split(":", 1)[1].strip()
-        elif low.startswith("category"):
-            cat = line.split(":", 1)[1].strip()
-        else:
-            if not name:
-                name = line
-    return {"name": name, "catalog_id": cid, "category": cat}
-
-
 def _click_next_page(page: Page) -> bool:
-    """Click the pagination next-page (▶) arrow. Returns False if disabled."""
     try:
-        nxt = page.locator(
-            'xpath=(//button[.//*[name()="svg"]][following-sibling::* or '
-            'preceding-sibling::*])[last()]'
-        ).first
-        # Simpler: aria-label based
-        nxt = page.locator('button[aria-label="Go to next page"]').first
-        if not nxt.is_visible(timeout=1500):
+        btn = page.locator('button[aria-label="Go to next page"]').first
+        if btn.count() == 0:
             return False
-        if nxt.is_disabled(timeout=1500):
+        if not btn.is_visible(timeout=1500):
             return False
-        nxt.click()
+        if btn.is_disabled(timeout=1500):
+            return False
+        btn.click(timeout=3000)
         page.wait_for_timeout(1500)
         return True
     except Exception:  # noqa: BLE001
@@ -206,44 +226,33 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
     all_rows: List[Dict[str, Any]] = []
     catalogs_scanned = 0
     pages_visited = 0
+    seen_catalog_ids: Set[str] = set()
 
-    p, browser, _ctx, page = cdp_context_page(port)
+    p, _browser, _ctx, page = cdp_context_page(port)
     try:
         page.goto(_inventory_url(suffix),
                   wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
         try:
             page.wait_for_load_state("networkidle", timeout=15_000)
-        except PWTimeout:
-            pass
-        # Ensure "Active" tab is selected
-        try:
-            page.locator(
-                'xpath=//*[normalize-space(text())="Active"][1]'
-            ).first.click(timeout=3000)
-            page.wait_for_timeout(1500)
         except Exception:  # noqa: BLE001
             pass
+        _select_active_tab(page)
+        page.wait_for_timeout(1500)
 
-        while True:
+        MAX_PAGES = 100
+        while pages_visited < MAX_PAGES:
             pages_visited += 1
-            cards = _left_rail_cards(page)
-            card_count = cards.count()
-            print(f"[inv_sync] page {pages_visited}: {card_count} catalog cards")
-            for i in range(card_count):
-                # re-fetch each iteration since DOM is virtualized
-                cards2 = _left_rail_cards(page)
-                if i >= cards2.count():
-                    break
-                card = cards2.nth(i)
-                meta = _card_meta(card)
-                try:
-                    card.scroll_into_view_if_needed(timeout=2000)
-                    card.click(timeout=3000)
-                    page.wait_for_timeout(1000)
-                except Exception:  # noqa: BLE001
+            snapshot = _snapshot_catalog_ids(page)
+            print(f"[inv_sync] page {pages_visited}: "
+                  f"{len(snapshot)} catalogs snapshotted")
+            for cat in snapshot:
+                cid = cat["catalog_id"]
+                if cid in seen_catalog_ids:
                     continue
-                rows = _extract_rows_from_right_pane(
-                    page, meta["name"], meta["catalog_id"], meta["category"])
+                seen_catalog_ids.add(cid)
+                if not _click_catalog_by_id(page, cid):
+                    continue
+                rows = _extract_skus_from_right_pane(page, cat)
                 for r in rows:
                     r["account_id"] = account_id
                     r["account_name"] = account_name
@@ -251,9 +260,6 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
                 catalogs_scanned += 1
                 time.sleep(0.4)
             if not _click_next_page(page):
-                break
-            # safety cap: hard stop at 100 pagination pages
-            if pages_visited >= 100:
                 break
     finally:
         try:
@@ -266,9 +272,11 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
             pass
 
     # persist — atomic replace for this account
-    mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
-    db_name = os.environ.get("DB_NAME", "meesho")
-    now = _now_utc()
+    mongo_url = os.environ.get("MESHO_MONGO_URI") or os.environ.get(
+        "MONGO_URL", "mongodb://127.0.0.1:27017/")
+    db_name = os.environ.get("MESHO_DB_NAME") or os.environ.get(
+        "DB_NAME", "meesho")
+    now = datetime.now(timezone.utc)
     try:
         client = MongoClient(mongo_url)
         db = client[db_name]
@@ -285,9 +293,5 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
         "catalogs_scanned": catalogs_scanned,
         "skus_captured": len(all_rows),
         "pages_visited": pages_visited,
+        "note": "" if all_rows else "0 rows captured — DOM selectors may need tuning for this account",
     }
-
-
-def _now_utc():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc)

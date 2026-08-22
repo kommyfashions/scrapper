@@ -211,8 +211,14 @@ export default function AutoAcceptPage() {
                       <div className="text-[11px] text-[var(--text-muted)] mt-0.5">
                         {fmtRelative(j.created_at)} · accepted{" "}
                         <span className="text-emerald-300">{j.result.accepted_count}</span>
+                        {j.result.orders_seen > 0 && (
+                          <span className="ml-2 text-[var(--text-muted)]">of {j.result.orders_seen} pending</span>
+                        )}
                         {j.result.failed_count > 0 && (
                           <span className="ml-2 text-rose-300">failed {j.result.failed_count}</span>
+                        )}
+                        {j.result.note && (
+                          <span className="ml-2 text-amber-300" title={j.result.note}>· {j.result.note}</span>
                         )}
                       </div>
                       {j.error && <div className="text-[11px] text-rose-300 truncate mt-0.5" title={j.error}>{j.error}</div>}
