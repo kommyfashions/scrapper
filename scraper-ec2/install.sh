@@ -28,8 +28,12 @@ pip3 install --user pymongo playwright requests --break-system-packages
 echo "==> Copying files to ${INSTALL_DIR}…"
 mkdir -p "${INSTALL_DIR}"
 mkdir -p /home/ubuntu/meesho-downloads
-cp -v label_worker.py labels.py payments_fetcher.py start_chromes.sh "${INSTALL_DIR}/"
-chmod +x "${INSTALL_DIR}/start_chromes.sh"
+# Copy EVERY worker asset — not just the four originals — so new fetchers
+# (pause_skus_fetcher.py, inventory_sync_fetcher.py, accept_labels_fetcher.py,
+# gst_report_fetcher.py, tax_invoice_fetcher.py, _meesho_ui.py, ...) all
+# land in the install dir automatically. See also update.sh for re-sync.
+cp -v *.py *.sh "${INSTALL_DIR}/"
+chmod +x "${INSTALL_DIR}/"*.sh
 
 echo "==> Installing systemd unit…"
 ${SUDO} cp -v meesho-label-worker.service /etc/systemd/system/meesho-label-worker.service

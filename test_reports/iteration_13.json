@@ -1,0 +1,29 @@
+{
+  "summary": "Verified deploy-drift detection end-to-end. Backend /api/worker-health: 401 without JWT, returns full shape with correct dashboard_known_types (7 types incl inventory_sync + accept_labels), missing_from_workers = full set when empty, stuck_pending_by_type correctly increments for pending>15min jobs whose type is unadvertised. Pytest: test_worker_health.py + test_inventory_actions.py + test_iteration10.py = 16/16 pass. Frontend WorkerDriftBanner: appears on /live-inventory, /auto-accept, /inventory-actions when no workers registered (contains update.sh copy-paste block); disappears on all 3 pages after seeding a healthy worker advertising all 7 types. Scraper files verified: install.sh line 35 uses `cp -v *.py *.sh`, update.sh present and well-formed, label_worker.py _publish_capabilities upserts into worker_capabilities on startup.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "/auto-accept", "issues": ["React hydration warning: <span> inside <option> in interval selector (pre-existing Emergent instrumentation artifact, unrelated to this feature)"]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_worker_health.py",
+    "/app/backend/tests/test_inventory_actions.py",
+    "/app/backend/tests/test_iteration10.py"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py file is 3730 lines — should be split into routers per domain for maintainability.",
+    "WorkerDriftBanner has no loading/error UI states — silent catch. Acceptable for optional diagnostic banner but worth logging in dev."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "admin@meesho-dash.local / admin123",
+  "seed_data_creation": "Temporary worker_capabilities docs (test-healthy, test-old-worker) and a fake stuck job — all cleaned up after tests.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "worker_capabilities collection is left EMPTY in preview (matches reality of preview env with 0 scraper workers). Banner logic is fully working. Real deploy fix is up to end user running update.sh on EC2.",
+  "rca of the issue": "N/A — this iteration was verifying the fix, not diagnosing a new bug. Original RCA (deploy-drift because install.sh copied only 4 hardcoded filenames) is addressed by install.sh glob copy + new update.sh + worker_capabilities publish + drift banner."
+}

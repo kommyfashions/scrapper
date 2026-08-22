@@ -52,6 +52,27 @@ accounts_col = db["accounts"]
 JOB_TYPES = ["label_download", "payments_fetch", "gst_report_fetch", "tax_invoice_fetch", "pause_skus", "inventory_sync", "accept_labels"]
 
 
+def _publish_capabilities():
+    """Write JOB_TYPES to a well-known `worker_capabilities` collection so the
+    dashboard can detect deploy drift (e.g. new job types queued but old
+    worker running). Idempotent — replaces the doc for this host on each
+    startup."""
+    import socket
+    try:
+        db["worker_capabilities"].update_one(
+            {"host": socket.gethostname()},
+            {"$set": {
+                "host": socket.gethostname(),
+                "job_types": JOB_TYPES,
+                "updated_at": datetime.now(timezone.utc),
+                "worker_file": os.path.abspath(__file__),
+            }},
+            upsert=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[label_worker] could not publish capabilities: {e}")
+
+
 def chrome_alive(port: int) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=3):
@@ -115,6 +136,7 @@ def run_label_for_account(acc: dict):
 
 def loop():
     print(f"🚀 Worker (EC2) — Mongo: {MONGO_URI} db={DB_NAME} types={JOB_TYPES}")
+    _publish_capabilities()
     while True:
         job = jobs_col.find_one_and_update(
             {"status": "pending", "type": {"$in": JOB_TYPES}},

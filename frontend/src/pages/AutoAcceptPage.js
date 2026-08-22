@@ -8,6 +8,7 @@ import {
 } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import PageHeader from "@/components/PageHeader";
+import WorkerDriftBanner from "@/components/WorkerDriftBanner";
 import { fmtRelative } from "@/lib/format";
 
 const STATUS_COLORS = {
@@ -88,6 +89,7 @@ export default function AutoAcceptPage() {
       />
 
       <div className="px-8 py-6 space-y-6">
+        <WorkerDriftBanner neededTypes={["accept_labels"]} />
         <div className="rounded border border-[var(--border)] bg-[var(--bg-card)] p-4 text-xs text-[var(--text-muted)]" data-testid="how-it-works">
           <div className="mb-1 text-white text-sm">How it works</div>
           Every 5 minutes the dashboard&apos;s scheduler checks each account you&apos;ve enabled below. If the last successful accept-run

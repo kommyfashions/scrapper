@@ -10,6 +10,7 @@ import {
 } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import PageHeader from "@/components/PageHeader";
+import WorkerDriftBanner from "@/components/WorkerDriftBanner";
 import { fmtRelative } from "@/lib/format";
 
 const STATUS_COLORS = {
@@ -178,6 +179,7 @@ export default function LiveInventoryPage() {
       />
 
       <div className="px-8 py-6 space-y-6">
+        <WorkerDriftBanner neededTypes={["inventory_sync"]} />
         {/* controls */}
         <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-4 flex flex-wrap items-end gap-3">
           <label className="block">

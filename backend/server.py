@@ -3672,6 +3672,55 @@ app.include_router(
     dependencies=[Depends(get_current_user)],
 )
 
+
+# ------------------------------------------------------------------ #
+# Worker deploy-drift health check
+# ------------------------------------------------------------------ #
+# Dashboard-side knowledge of every job type it may enqueue. Kept in
+# sync with scraper-ec2/label_worker.py:JOB_TYPES. If the deployed worker
+# doesn't advertise all of these, the frontend banner tells the user
+# what to redeploy.
+DASHBOARD_KNOWN_JOB_TYPES = [
+    "label_download", "payments_fetch", "gst_report_fetch",
+    "tax_invoice_fetch", "pause_skus", "inventory_sync", "accept_labels",
+]
+
+
+@app.get("/api/worker-health")
+async def worker_health(user: dict = Depends(get_current_user)):
+    """Returns the worker's advertised JOB_TYPES + any drift vs. dashboard.
+    Also reports the count of long-pending jobs whose type isn't
+    supported by any live worker — that's the classic "we deployed the
+    dashboard but forgot to redeploy the scraper" symptom."""
+    caps = []
+    all_advertised: set = set()
+    async for c in db.worker_capabilities.find({}, {"_id": 0}):
+        if isinstance(c.get("updated_at"), datetime):
+            c["updated_at"] = c["updated_at"].isoformat().replace(
+                "+00:00", "Z")
+        caps.append(c)
+        for t in c.get("job_types") or []:
+            all_advertised.add(t)
+    missing_from_workers = [t for t in DASHBOARD_KNOWN_JOB_TYPES
+                            if t not in all_advertised]
+    # Stuck jobs whose type is not advertised by any worker (root cause = deploy drift)
+    stuck_by_type: Dict[str, int] = {}
+    now = datetime.now(timezone.utc)
+    threshold = now - timedelta(minutes=15)
+    async for j in db.jobs.find(
+        {"status": "pending", "created_at": {"$lte": threshold}},
+        {"_id": 0, "type": 1},
+    ):
+        t = j.get("type") or "unknown"
+        if t not in all_advertised:
+            stuck_by_type[t] = stuck_by_type.get(t, 0) + 1
+    return {
+        "workers": caps,
+        "dashboard_known_types": DASHBOARD_KNOWN_JOB_TYPES,
+        "missing_from_workers": missing_from_workers,
+        "stuck_pending_by_type": stuck_by_type,
+    }
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,

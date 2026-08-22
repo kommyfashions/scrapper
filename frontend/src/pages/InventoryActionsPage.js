@@ -10,6 +10,7 @@ import {
 } from "@phosphor-icons/react";
 import api, { formatApiError } from "@/lib/api";
 import PageHeader from "@/components/PageHeader";
+import WorkerDriftBanner from "@/components/WorkerDriftBanner";
 import { fmtRelative } from "@/lib/format";
 
 /* -------------- helpers -------------- */
@@ -263,6 +264,7 @@ export default function InventoryActionsPage() {
       <div className="grid gap-6 px-8 py-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         {/* ---------- Left: builder ---------- */}
         <div className="space-y-6">
+          <WorkerDriftBanner neededTypes={["pause_skus"]} />
           {/* Cascading pickers (account + category are single-select) */}
           <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-6">
             <div className="section-label mb-4">1 · Choose account &amp; category</div>
