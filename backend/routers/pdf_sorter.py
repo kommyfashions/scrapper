@@ -348,6 +348,31 @@ async def recent_runs(days: int = Query(7, ge=1, le=90)):
     return {"items": rows, "window_days": days}
 
 
+@router.delete("/runs/{run_id}")
+async def delete_run(run_id: str):
+    """Delete a single sorter run + its files from disk."""
+    import os
+    db = get_db()
+    run = await db.pdf_sorter_runs.find_one({"run_id": run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    storage_root = os.environ.get(
+        "PDF_SORTER_STORAGE", "/home/ubuntu/pdf-sorter-outputs")
+    run_dir = os.path.join(storage_root, run_id)
+    deleted_files = 0
+    if os.path.isdir(run_dir):
+        try:
+            for name in os.listdir(run_dir):
+                os.remove(os.path.join(run_dir, name))
+                deleted_files += 1
+            os.rmdir(run_dir)
+        except Exception as e:  # noqa: BLE001
+            print(f"[pdf-sorter delete] {e}")
+    await db.pdf_sorter_runs.delete_one({"run_id": run_id})
+    return {"ok": True, "run_id": run_id, "files_removed": deleted_files}
+
+
+
 @router.get("/runs/{run_id}/unmatched.xlsx")
 async def download_unmatched(run_id: str):
     """Excel export of unmatched SKUs for a run.

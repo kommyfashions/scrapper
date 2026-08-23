@@ -105,6 +105,8 @@ def _serialize_job(j: dict) -> dict:
             "catalogs_scanned": int(r.get("catalogs_scanned") or 0),
             "skus_captured": int(r.get("skus_captured") or 0),
             "pages_visited": int(r.get("pages_visited") or 0),
+            "note": r.get("note") or "",
+            "debug_dir": r.get("debug_dir") or "",
         },
     }
 

@@ -32,6 +32,7 @@ export default function AutoAcceptPage() {
   const [err, setErr] = useState("");
   const [savingId, setSavingId] = useState(null);
   const [runningId, setRunningId] = useState(null);
+  const [scheduler, setScheduler] = useState(null);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -45,8 +46,23 @@ export default function AutoAcceptPage() {
       setHistory(r.data.items || []);
     } catch (e) { /* silent */ }
   }, []);
+  const loadScheduler = useCallback(async () => {
+    try {
+      const r = await api.get("/scheduler-status");
+      setScheduler(r.data);
+    } catch (e) { /* silent */ }
+  }, []);
 
-  useEffect(() => { loadSettings(); loadHistory(); }, [loadSettings, loadHistory]);
+  useEffect(() => { loadSettings(); loadHistory(); loadScheduler(); }, [loadSettings, loadHistory, loadScheduler]);
+
+  const cancelStuck = async () => {
+    setErr("");
+    try {
+      const r = await api.post("/jobs/cancel-stuck?job_type=accept_labels&older_than_minutes=15");
+      alert(`Cancelled ${r.data.cancelled} stuck accept_labels jobs.`);
+      loadHistory();
+    } catch (e) { setErr(formatApiError(e)); }
+  };
 
   const toggle = async (row, enabled) => {
     setSavingId(row.account_id); setErr("");
@@ -81,10 +97,15 @@ export default function AutoAcceptPage() {
         title="AUTOMATION / AUTO-ACCEPT ORDERS"
         subtitle="Polling picks up new orders on Meesho and clicks Accept — no PDF download"
         right={
-          <button data-testid="refresh-btn" className="btn-ghost text-xs" onClick={() => { loadSettings(); loadHistory(); }}>
-            <ArrowsClockwiseIcon size={12} weight="bold" />
-            <span className="ml-1">Refresh</span>
-          </button>
+          <div className="flex gap-2">
+            <button data-testid="cancel-stuck-btn" className="btn-ghost text-xs" onClick={cancelStuck}>
+              Clear stuck jobs
+            </button>
+            <button data-testid="refresh-btn" className="btn-ghost text-xs" onClick={() => { loadSettings(); loadHistory(); loadScheduler(); }}>
+              <ArrowsClockwiseIcon size={12} weight="bold" />
+              <span className="ml-1">Refresh</span>
+            </button>
+          </div>
         }
       />
 
@@ -103,6 +124,18 @@ export default function AutoAcceptPage() {
             <span className="ml-2 rounded bg-white/5 text-[var(--text-muted)] px-2 py-0.5 text-[10px] uppercase tracking-widest border border-[var(--border)]">
               off — no accounts enabled
             </span>
+          )}
+          {scheduler && (
+            <div className="mt-2 text-[11px] text-[var(--text-muted)]" data-testid="scheduler-info">
+              Scheduler: {scheduler.scheduler_running ? "running" : "STOPPED"}.{" "}
+              {(() => {
+                const j = (scheduler.jobs || []).find((x) => x.id === "auto_accept_poll");
+                if (!j) return "Poll job NOT REGISTERED — backend needs a redeploy.";
+                if (!j.next_run_time) return "Next tick: unknown";
+                const s = j.seconds_until_next;
+                return `Next auto-accept tick ${s > 0 ? `in ${Math.max(1, Math.round(s / 60))} min` : "shortly"}.`;
+              })()}
+            </div>
           )}
         </div>
 

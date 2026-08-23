@@ -167,6 +167,19 @@ export default function LiveInventoryPage() {
         right={
           <div className="flex items-center gap-2">
             <button
+              data-testid="cancel-stuck-btn"
+              onClick={async () => {
+                try {
+                  const r = await api.post("/jobs/cancel-stuck?job_type=inventory_sync&older_than_minutes=15");
+                  alert(`Cancelled ${r.data.cancelled} stuck inventory_sync jobs.`);
+                  loadHistory();
+                } catch (e) { setErr(formatApiError(e)); }
+              }}
+              className="btn-ghost text-xs"
+            >
+              Clear stuck jobs
+            </button>
+            <button
               onClick={loadHistory}
               className="btn-ghost text-xs"
               data-testid="refresh-history-btn"
@@ -426,6 +439,16 @@ function HistoryList({ items }) {
                 {fmtRelative(j.created_at)} · captured <span className="text-emerald-300">{j.result.skus_captured}</span> SKUs across <span className="text-emerald-300">{j.result.catalogs_scanned}</span> catalogs
               </div>
               {j.error && <div className="mt-1 text-[11px] text-rose-300 truncate" title={j.error}>{j.error}</div>}
+              {j.result.note && (
+                <div className="mt-1 text-[11px] text-amber-300 whitespace-pre-wrap break-all" data-testid={`sync-note-${j.id}`}>
+                  {j.result.note}
+                </div>
+              )}
+              {j.result.debug_dir && (
+                <div className="mt-1 text-[10px] text-[var(--text-muted)]" data-testid={`sync-debug-${j.id}`}>
+                  Screenshots on scraper box: <code className="font-mono">{j.result.debug_dir}</code>
+                </div>
+              )}
             </div>
           </div>
         );

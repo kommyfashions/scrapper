@@ -736,6 +736,70 @@ async def reset_stuck(user: dict = Depends(get_current_user)):
     )
     return {"reset": res.modified_count + res2.modified_count}
 
+
+@api.post("/jobs/cancel-stuck")
+async def cancel_stuck(
+    older_than_minutes: int = 30,
+    job_type: Optional[str] = None,
+    delete: bool = False,
+    user: dict = Depends(get_current_user),
+):
+    """Mark long-pending jobs as failed so they don't clog the queue.
+    If delete=true, remove them from the collection entirely.
+
+    Query params:
+      older_than_minutes: age gate (default 30)
+      job_type:          optional restrict to a single type
+      delete:            true → drop docs; false → mark 'failed'
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        minutes=max(1, int(older_than_minutes)))
+    q: Dict[str, Any] = {
+        "status": "pending",
+        "created_at": {"$lt": cutoff},
+    }
+    if job_type:
+        q["type"] = job_type
+    if delete:
+        res = await db.jobs.delete_many(q)
+        return {"cancelled": res.deleted_count, "deleted": True}
+    res = await db.jobs.update_many(
+        q,
+        {"$set": {
+            "status": "failed",
+            "error": f"cancelled after {older_than_minutes} min pending",
+            "finished_at": datetime.now(timezone.utc),
+        }},
+    )
+    return {"cancelled": res.modified_count, "deleted": False}
+
+
+@app.get("/api/scheduler-status")
+async def scheduler_status(user: dict = Depends(get_current_user)):
+    """Report every APScheduler job + its next run time. Helps debug
+    'auto-accept isn't ticking' concerns."""
+    jobs = []
+    now = datetime.now(timezone.utc)
+    try:
+        for j in scheduler.get_jobs():
+            nxt = j.next_run_time
+            if nxt is not None and nxt.tzinfo is not None:
+                nxt = nxt.astimezone(timezone.utc)
+            jobs.append({
+                "id": j.id,
+                "name": j.name,
+                "trigger": str(j.trigger),
+                "next_run_time": nxt.isoformat().replace("+00:00", "Z")
+                    if nxt else None,
+                "seconds_until_next": (
+                    int((nxt - now).total_seconds()) if nxt else None
+                ),
+            })
+    except Exception as e:  # noqa: BLE001
+        return {"scheduler_running": False, "error": str(e), "jobs": []}
+    return {"scheduler_running": bool(scheduler.running),
+            "jobs": jobs, "server_time": now.isoformat().replace("+00:00", "Z")}
+
 @api.delete("/jobs/{job_id}")
 async def delete_job(job_id: str, user: dict = Depends(get_current_user)):
     try:

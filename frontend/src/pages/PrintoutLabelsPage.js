@@ -306,7 +306,7 @@ function LastRunDownloads({ run }) {
 }
 
 // ---------------- Downloads history strip ----------------
-function DownloadsPanel({ items, onRefresh, onReset }) {
+function DownloadsPanel({ items, onRefresh, onReset, onDeleteRun }) {
   const download = async (runId, fname) => {
     const r = await api.get(
       `/pdf-sorter/runs/${runId}/files/${fname}`,
@@ -364,6 +364,7 @@ function DownloadsPanel({ items, onRefresh, onReset }) {
                 <th className="num">Orders</th>
                 <th className="num">Unmatched</th>
                 <th>Download</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -396,6 +397,16 @@ function DownloadsPanel({ items, onRefresh, onReset }) {
                         </button>
                       ))}
                     </div>
+                  </td>
+                  <td>
+                    <button
+                      onClick={() => onDeleteRun && onDeleteRun(r.run_id)}
+                      className="btn-ghost text-[10px] text-rose-300 hover:text-rose-200"
+                      title="Delete this upload"
+                      data-testid={`pl-delete-${r.run_id}`}
+                    >
+                      <TrashIcon size={11} weight="bold" />
+                    </button>
                   </td>
                 </tr>
               ))}
@@ -603,6 +614,14 @@ export default function PrintoutLabelsPage() {
     try {
       await api.post("/pdf-sorter/admin/reset");
       setRunResult(null);
+      await loadAll();
+    } catch (e) { setErr(formatApiError(e)); }
+  };
+
+  const deleteRun = async (runId) => {
+    if (!window.confirm("Delete this upload and its output files?")) return;
+    try {
+      await api.delete(`/pdf-sorter/runs/${runId}`);
       await loadAll();
     } catch (e) { setErr(formatApiError(e)); }
   };
@@ -901,7 +920,7 @@ export default function PrintoutLabelsPage() {
       )}
 
       {/* Downloads history */}
-      <DownloadsPanel items={recent} onRefresh={loadAll} onReset={resetAll} />
+      <DownloadsPanel items={recent} onRefresh={loadAll} onReset={resetAll} onDeleteRun={deleteRun} />
 
       {/* Overrides */}
       <OverridesPanel />
