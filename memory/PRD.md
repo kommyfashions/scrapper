@@ -54,6 +54,34 @@ pdf_sorter_runs                    # NEW  (run history)
 - Order-No dedupe within a run + CANCELLED/RTO warnings from `pl_orders`
   remain.
 
+## Live Inventory Sync — finalised (Feb 24, 2026)
+- **Scraper** (`/app/scraper-ec2/inventory_sync_fetcher.py`, EC2, job type
+  `inventory_sync`): Rewritten with real DOM knowledge from operator's flow doc.
+  Loads `https://supplier.meesho.com/panel/v3/new/services/{account.name}/inventory`,
+  forces `Active > All Stock`, opens `Sort catalogs by` dropdown → picks
+  `Newest First`, iterates catalog cards (via `Catalog ID` text), clicks each,
+  extracts the **first** `Style ID:` value from the right panel (one
+  representative Style ID per catalog), scrolls the left panel via
+  `scroll_into_view_if_needed` to reveal more cards, and paginates via next-
+  page button. Screenshots saved to `/tmp/meesho-inv-debug/<suffix>_<ts>/`.
+- **Configurable pages** — job payload `pages` (default 20, cap 200) — driven
+  from the UI's `Pages to scrape` input.
+- **`POST /api/inventory-sync/run`** now accepts `{account_id, pages}` where
+  `account_id` may be `"all"` (fan-out one job per enabled account, worker
+  processes sequentially).
+- **Backend enrichment at read-time**: each scraped `style_id` is looked up
+  in `pm_skus` → linked `pm_products` → `main_category` shown on the
+  dashboard. Unmatched Style IDs go to the Missing tab with
+  `Main Category = "Unmapped"`, tagged with the account we scraped from.
+- Dashboard table columns: `Account | Main Category | Style ID | Last Synced`.
+- Two Excel exports: `GET /inventory-sync/live/export`, `/missing/export`
+  (same 4 columns).
+- Fresh snapshot each run (`meesho_live_skus.delete_many({account_id: aid})`
+  before insert). SYNC HISTORY tab shows job-run metadata only.
+- **`WorkerDriftBanner`** now has a **`Clear all stuck jobs`** button that
+  purges every pending job older than 15 min (any type) — solves the
+  recurring 254 stuck `product_scrape` legacy leftovers.
+
 ## Bulk Pause via Product Master (Feb 2026)
 - New page **`/inventory-actions`** (sidebar: "Bulk Pause").
 - User picks **Account → Main Category → Color → sizes** (or "whole product").

@@ -1,12 +1,23 @@
 """Meesho Live Inventory scraper — job type: `inventory_sync`.
 
-STATUS: still tuning against real Meesho DOM. This build dumps heavy
-diagnostics into the job.result so the operator can share back what the
-scraper actually saw.
+FLOW (finalised with operator, Feb 2026):
+  1. Load `https://supplier.meesho.com/panel/v3/new/services/{suffix}/inventory`
+  2. Ensure top tab = Active, sub-tab = All Stock.
+  3. Open `Sort catalogs by` dropdown → click `Newest First`.
+  4. Iterate catalogs in the left panel. Each catalog card shows a
+     `Catalog ID: <n>` line. Click each catalog, wait for the right panel,
+     extract the first `Style ID:` (that catalog's representative Style ID).
+     Scroll the left panel via `scroll_into_view_if_needed` on the last
+     card to reveal more. Each page holds 10 catalogs.
+  5. After all 10 catalogs on the current page are processed, click the
+     paginator's "next page" arrow / next number button.
+  6. Repeat until `pages_to_scrape` reached (default 20) or last page.
 
-Landing URL candidates tried in order:
-  1. https://supplier.meesho.com/panel/v3/new/services/<suffix>/inventory
-  2. https://supplier.meesho.com/panel/v3/new/services/<suffix>/inventory/product
+STORED FIELDS (raw, no enrichment on scraper side):
+    {account_id, account_name, style_id, catalog_id, scraped_at}
+
+Enrichment (account + main category from Product Master) is done by the
+backend at read time.
 """
 from __future__ import annotations
 
@@ -24,31 +35,12 @@ from pymongo import MongoClient
 
 DEBUG_DIR = Path("/tmp/meesho-inv-debug")
 PAGE_LOAD_MS = 45_000
-MONEY_RE = re.compile(r"[\d,]+(?:\.\d+)?")
+DEFAULT_PAGES = 20
+CATALOGS_PER_PAGE = 10
 
 
-def _urls(suffix: str) -> List[str]:
-    return [
-        f"https://supplier.meesho.com/panel/v3/new/services/{suffix}/inventory",
-        f"https://supplier.meesho.com/panel/v3/new/services/{suffix}/inventory/product",
-    ]
-
-
-def _safe_text(node, timeout_ms: int = 1500) -> str:
-    try:
-        return (node.inner_text(timeout=timeout_ms) or "").strip()
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _first_number(s: str) -> Optional[float]:
-    m = MONEY_RE.search(s or "")
-    if not m:
-        return None
-    try:
-        return float(m.group(0).replace(",", ""))
-    except Exception:  # noqa: BLE001
-        return None
+def _inventory_url(suffix: str) -> str:
+    return f"https://supplier.meesho.com/panel/v3/new/services/{suffix}/inventory"
 
 
 def _screenshot(page: Page, out_dir: Path, name: str) -> str:
@@ -61,171 +53,87 @@ def _screenshot(page: Page, out_dir: Path, name: str) -> str:
         return ""
 
 
-def _select_active_tab(page: Page) -> None:
-    for label in ("Active", "ACTIVE"):
+def _safe_text(node, timeout_ms: int = 1500) -> str:
+    try:
+        return (node.inner_text(timeout=timeout_ms) or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _ensure_active_all_stock(page: Page) -> None:
+    """Meesho defaults land on Active > All Stock, but a session may
+    remember the last-used sub-tab. Force it."""
+    for label in ("Active", "All Stock"):
         try:
-            loc = page.locator(f'xpath=//*[normalize-space(text())="{label}"]').first
-            if loc.count() > 0:
-                loc.click(timeout=3000)
-                page.wait_for_timeout(1500)
-                return
+            btn = page.locator(
+                f'xpath=//*[normalize-space(text())="{label}"]'
+            ).first
+            if btn.count() > 0 and btn.is_visible(timeout=1500):
+                btn.click(timeout=3000)
+                page.wait_for_timeout(800)
         except Exception:  # noqa: BLE001
             continue
 
 
-def _diagnose(page: Page) -> Dict[str, Any]:
-    """Return a snapshot of page state — useful when scraping fails to find
-    the expected cards."""
-    d: Dict[str, Any] = {
-        "url": None,
-        "title": None,
-        "body_preview": "",
-        "has_catalog_id_text": False,
-        "has_style_id_text": False,
-        "has_search_input": False,
-        "has_pagination_next": False,
-        "row_count": 0,
-    }
+def _select_newest_first(page: Page) -> bool:
+    """Open `Sort catalogs by` dropdown and pick `Newest First`."""
     try:
-        d["url"] = page.url
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d["title"] = page.title()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d["body_preview"] = (
-            (page.locator("body").first.inner_text(timeout=3000) or "")[:600]
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d["has_catalog_id_text"] = (
-            page.locator('text=Catalog ID').count() > 0
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d["has_style_id_text"] = (
-            page.locator('text=Style ID').count() > 0
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d["has_search_input"] = (
-            page.locator('input[placeholder*="Search"]').count() > 0
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d["has_pagination_next"] = (
-            page.locator('button[aria-label="Go to next page"]').count() > 0
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        d["row_count"] = page.locator("tbody tr").count()
-    except Exception:  # noqa: BLE001
-        pass
-    return d
-
-
-def _try_land_on_inventory(page: Page, suffix: str,
-                            debug_dir: Path) -> Dict[str, Any]:
-    """Navigate through URL candidates and return diagnostics for the one
-    that actually shows inventory content."""
-    for i, url in enumerate(_urls(suffix), 1):
-        try:
-            page.goto(url, wait_until="domcontentloaded",
-                      timeout=PAGE_LOAD_MS)
-            try:
-                page.wait_for_load_state("networkidle", timeout=12_000)
-            except Exception:  # noqa: BLE001
-                pass
-            page.wait_for_timeout(2500)
-            _select_active_tab(page)
-            page.wait_for_timeout(1500)
-            d = _diagnose(page)
-            d["tried_url"] = url
-            d["screenshot"] = _screenshot(
-                page, debug_dir, f"land_{i}")
-            if d["has_catalog_id_text"] or d["has_style_id_text"] or d["row_count"] > 0:
-                return d
-        except Exception as e:  # noqa: BLE001
-            d = {"tried_url": url, "error": f"{type(e).__name__}: {e}"}
-            continue
-    return d
-
-
-def _extract_catalog_cards(page: Page) -> List[Dict[str, str]]:
-    """Try multiple selector strategies to find the catalog list."""
-    seen: Set[str] = set()
-    out: List[Dict[str, str]] = []
-    # Strategy A: XPath contains "Catalog ID:" — earliest hypothesis
-    try:
-        cards = page.locator(
-            'xpath=//div[.//*[contains(normalize-space(text()), '
-            '"Catalog ID")] and .//*[contains(normalize-space(text()), '
-            '"Category")]]'
-        )
-        n = cards.count()
-        for i in range(n):
-            text = _safe_text(cards.nth(i))
-            if not text:
-                continue
-            cid = None
-            cat = None
-            name = None
-            for line in [ln.strip() for ln in text.splitlines()
-                         if ln.strip()]:
-                low = line.lower()
-                if low.startswith("catalog id"):
-                    cid = line.split(":", 1)[1].strip()
-                elif low.startswith("category"):
-                    cat = line.split(":", 1)[1].strip()
-                elif name is None and ":" not in line and len(line) < 120:
-                    name = line
-            if cid and cid not in seen:
-                seen.add(cid)
-                out.append({"name": name or "", "catalog_id": cid,
-                            "category": cat or ""})
-    except Exception:  # noqa: BLE001
-        pass
-    # Strategy B: tbody tr rows on catalog list — some tenants use tables
-    if not out:
-        try:
-            rows = page.locator("tbody tr")
-            n = rows.count()
-            for i in range(n):
-                text = _safe_text(rows.nth(i))
-                m = re.search(r"Catalog ID[:\s]*(\S+)", text)
-                if not m:
+        # The dropdown label sits next to the value. Robust approach:
+        # click the visible current value ("Highest Estimated Orders"
+        # or whichever) which acts as the dropdown trigger.
+        trigger_candidates = [
+            'xpath=//*[contains(normalize-space(text()), "Sort catalogs by")]/following::*[self::div or self::button][1]',
+            'xpath=//*[text()="Highest Estimated Orders"]',
+            'xpath=//*[text()="Newest First"]',
+        ]
+        for sel in trigger_candidates:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=1500):
+                try:
+                    loc.click(timeout=2500)
+                    break
+                except Exception:  # noqa: BLE001
                     continue
-                cid = m.group(1).strip().rstrip(",")
-                if cid in seen:
-                    continue
-                seen.add(cid)
-                catm = re.search(r"Category[:\s]*([^\n]+)", text)
-                out.append({
-                    "name": text.split("\n", 1)[0].strip(),
-                    "catalog_id": cid,
-                    "category": (catm.group(1).strip() if catm else ""),
-                })
-        except Exception:  # noqa: BLE001
-            pass
-    return out
+        page.wait_for_timeout(600)
+        # Pick "Newest First" from the opened menu
+        newest = page.locator(
+            'xpath=//*[normalize-space(text())="Newest First"]'
+        ).first
+        if newest.count() > 0:
+            newest.click(timeout=3000)
+            page.wait_for_timeout(1500)  # let list re-sort
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
 
 
-def _click_catalog_by_id(page: Page, cid: str) -> bool:
-    for _ in range(3):
+CATALOG_CARD_XPATH = (
+    '//div[.//*[contains(normalize-space(text()), "Catalog ID")]'
+    ' and .//*[contains(normalize-space(text()), "Category")]]'
+)
+
+
+def _list_catalog_cards(page: Page):
+    """Locator collection of the catalog cards currently rendered in the
+    left panel."""
+    return page.locator(f"xpath={CATALOG_CARD_XPATH}")
+
+
+def _catalog_id_from_card(card) -> Optional[str]:
+    text = _safe_text(card)
+    if not text:
+        return None
+    m = re.search(r"Catalog ID[:\s]*(\S+)", text)
+    if not m:
+        return None
+    return m.group(1).strip().rstrip(",")
+
+
+def _click_catalog_card(page: Page, card) -> bool:
+    for _ in range(2):
         try:
-            card = page.locator(
-                f'xpath=//*[contains(normalize-space(.), "{cid}")]').first
-            if card.count() == 0:
-                page.wait_for_timeout(400)
-                continue
-            card.scroll_into_view_if_needed(timeout=2000)
+            card.scroll_into_view_if_needed(timeout=2500)
             card.click(timeout=3000)
             page.wait_for_timeout(1200)
             return True
@@ -234,85 +142,72 @@ def _click_catalog_by_id(page: Page, cid: str) -> bool:
     return False
 
 
-def _extract_skus(page: Page, cat: Dict[str, str]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    try:
-        page.wait_for_selector(
-            'xpath=//*[contains(normalize-space(.), "Style ID")]',
-            timeout=6_000,
-        )
-    except Exception:  # noqa: BLE001
-        return rows
-    try:
-        blocks = page.locator(
-            'xpath=//*[contains(normalize-space(.), "Style ID:") and '
-            'contains(normalize-space(.), "SKU:")]'
-        )
-        n = blocks.count()
-    except Exception:  # noqa: BLE001
-        return rows
-    for i in range(n):
-        try:
-            text = _safe_text(blocks.nth(i))
-        except Exception:  # noqa: BLE001
-            continue
-        if not text:
-            continue
-        style_id = None
-        sku = None
-        price = None
-        for line in [ln.strip() for ln in text.splitlines() if ln.strip()]:
-            low = line.lower()
-            if low.startswith("style id"):
-                style_id = line.split(":", 1)[1].strip()
-            elif low.startswith("sku"):
-                sku = line.split(":", 1)[1].strip()
-            elif "meesho price" in low or "₹" in line:
-                p = _first_number(line)
-                if p is not None:
-                    price = p
-        if not sku:
-            continue
-        variation = None
-        try:
-            row_container = blocks.nth(i).locator(
-                'xpath=ancestor::*[self::tr or (@role="row")][1]').first
-            row_text = _safe_text(row_container)
-        except Exception:  # noqa: BLE001
-            row_text = ""
-        m = re.search(
-            r"\b(IND-\d+|S|M|L|XL|XXL|XXXL|Free\s*Size)\b",
-            row_text, re.IGNORECASE,
-        )
-        if m:
-            variation = m.group(1).upper().replace(" ", "")
-        rows.append({
-            "catalog_id": cat.get("catalog_id"),
-            "catalog_name": cat.get("name"),
-            "category": cat.get("category"),
-            "style_id": style_id or sku,
-            "sku": sku,
-            "variation": variation,
-            "price": price,
-            "current_stock": None,
-        })
-    return rows
+STYLE_ID_XPATH = (
+    '//*[starts-with(normalize-space(text()), "Style ID")]'
+)
 
 
-def _click_next_page(page: Page) -> bool:
+def _extract_first_style_id(page: Page) -> Optional[str]:
+    """Return the first `Style ID:` value visible in the right panel."""
     try:
-        btn = page.locator('button[aria-label="Go to next page"]').first
-        if btn.count() == 0:
-            return False
-        if not btn.is_visible(timeout=1500):
-            return False
-        if btn.is_disabled(timeout=1500):
-            return False
-        btn.click(timeout=3000)
-        page.wait_for_timeout(1500)
-        return True
+        page.wait_for_selector(f"xpath={STYLE_ID_XPATH}", timeout=6_000)
     except Exception:  # noqa: BLE001
-        return False
+        return None
+    try:
+        node = page.locator(f"xpath={STYLE_ID_XPATH}").first
+        line = _safe_text(node)
+    except Exception:  # noqa: BLE001
+        return None
+    if not line:
+        return None
+    # line looks like: "Style ID: RM-LEOO-5-NAVY BLUE-123"
+    m = re.search(r"Style ID[:\s]*(.+)", line)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _click_next_page(page: Page, next_page_num: int) -> bool:
+    """Advance the left-panel paginator to `next_page_num`.
+
+    Strategy: try `button:text-is("<n>")` first (visible page number);
+    fallback to a next-arrow button (aria-label / › character)."""
+    # exact page number
+    try:
+        btn = page.locator(
+            f'xpath=(//button[normalize-space(text())="{next_page_num}"])[last()]'
+        ).first
+        if btn.count() > 0:
+            btn.scroll_into_view_if_needed(timeout=2000)
+            btn.click(timeout=3000)
+            page.wait_for_timeout(1500)
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # aria-label
+    try:
+        btn = page.locator(
+            'button[aria-label="Go to next page"], '
+            'button[aria-label="next page"], '
+            'button[aria-label="Next page"], '
+            'li.ant-pagination-next button'
+        ).first
+        if btn.count() > 0 and btn.is_visible(timeout=1500):
+            btn.click(timeout=3000)
+            page.wait_for_timeout(1500)
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    # unicode chevron
+    try:
+        btn = page.locator('xpath=//button[normalize-space(text())="›"]').first
+        if btn.count() > 0 and btn.is_visible(timeout=1500):
+            btn.click(timeout=3000)
+            page.wait_for_timeout(1500)
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
@@ -320,6 +215,9 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
     suffix = (acc.get("name") or "").strip()
     if not suffix:
         raise RuntimeError("account has no `name` — cannot derive URL suffix")
+
+    pages_to_scrape = int((payload or {}).get("pages") or DEFAULT_PAGES)
+    pages_to_scrape = max(1, min(200, pages_to_scrape))
 
     account_id = str(acc["_id"])
     account_name = acc.get("name")
@@ -330,68 +228,132 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
     catalogs_scanned = 0
     pages_visited = 0
     diagnostics: List[Dict[str, Any]] = []
+    processed_ids: Set[str] = set()
 
     p, _browser, _ctx, page = cdp_context_page(port)
     try:
-        landing = _try_land_on_inventory(page, suffix, debug_dir)
-        diagnostics.append({"stage": "landing", **landing})
+        page.goto(_inventory_url(suffix), wait_until="domcontentloaded",
+                  timeout=PAGE_LOAD_MS)
+        try:
+            page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:  # noqa: BLE001
+            pass
+        page.wait_for_timeout(2500)
 
-        # Bail out early with diagnostics if we didn't find anything
-        if not (landing.get("has_catalog_id_text")
-                or landing.get("has_style_id_text")
-                or (landing.get("row_count") or 0) > 0):
+        _ensure_active_all_stock(page)
+        page.wait_for_timeout(1200)
+        sorted_ok = _select_newest_first(page)
+        diagnostics.append({"stage": "sort_newest_first", "ok": sorted_ok})
+        _screenshot(page, debug_dir, "01_after_sort")
+
+        # early-exit if the inventory page didn't actually load
+        try:
+            has_catalog = page.locator("text=Catalog ID").count() > 0
+        except Exception:  # noqa: BLE001
+            has_catalog = False
+        if not has_catalog:
+            _screenshot(page, debug_dir, "01_no_catalog_id")
             return {
                 "catalogs_scanned": 0,
                 "skus_captured": 0,
                 "pages_visited": 0,
-                "note": (
-                    f"Inventory page loaded but no expected markers found. "
-                    f"landed_url={landing.get('url')}  "
-                    f"title={landing.get('title')}  "
-                    f"body_preview={(landing.get('body_preview') or '')[:200]!r}  "
-                    f"Screenshot: {landing.get('screenshot')}"
-                ),
+                "pages_requested": pages_to_scrape,
+                "note": ("Inventory page loaded but no 'Catalog ID' text "
+                         "found — likely not logged in or wrong URL. "
+                         f"Screenshots: {debug_dir}"),
                 "diagnostics": diagnostics,
                 "debug_dir": str(debug_dir),
             }
 
-        MAX_PAGES = 100
-        seen: Set[str] = set()
-        while pages_visited < MAX_PAGES:
+        current_page = 1
+        while pages_visited < pages_to_scrape:
             pages_visited += 1
-            cards = _extract_catalog_cards(page)
-            _screenshot(page, debug_dir, f"page_{pages_visited}")
-            diagnostics.append({
-                "stage": f"list_page_{pages_visited}",
-                "cards_seen": len(cards),
-            })
-            new_before = catalogs_scanned
-            for cat in cards:
-                cid = cat["catalog_id"]
-                if cid in seen:
+            _screenshot(page, debug_dir, f"page_{current_page}_start")
+
+            # iterate catalogs on this page — scroll the left panel via
+            # scroll_into_view_if_needed on newly-appearing cards
+            last_new_at_iter = 0
+            no_new_streak = 0
+            iterations = 0
+            page_ids_before = len(processed_ids)
+            while iterations < 60:  # safety cap
+                iterations += 1
+                cards = _list_catalog_cards(page)
+                n = cards.count()
+                new_cards = []
+                for i in range(n):
+                    cid = _catalog_id_from_card(cards.nth(i))
+                    if cid and cid not in processed_ids:
+                        new_cards.append((i, cid))
+                if not new_cards:
+                    no_new_streak += 1
+                    if no_new_streak >= 3:
+                        break
+                    # try scrolling the last card into view to prompt
+                    # virtualisation to render more
+                    try:
+                        cards.nth(n - 1).scroll_into_view_if_needed(
+                            timeout=1500)
+                        page.wait_for_timeout(600)
+                    except Exception:  # noqa: BLE001
+                        pass
                     continue
-                seen.add(cid)
-                if not _click_catalog_by_id(page, cid):
-                    diagnostics.append({
-                        "stage": "click_failed", "catalog_id": cid,
-                    })
-                    continue
-                _screenshot(page, debug_dir, f"catalog_{cid[:24]}")
-                rows = _extract_skus(page, cat)
-                for r in rows:
-                    r["account_id"] = account_id
-                    r["account_name"] = account_name
-                all_rows.extend(rows)
-                catalogs_scanned += 1
-                time.sleep(0.4)
-            if catalogs_scanned == new_before and not _click_next_page(page):
+                no_new_streak = 0
+                for i, cid in new_cards:
+                    card = cards.nth(i)
+                    if not _click_catalog_card(page, card):
+                        diagnostics.append({
+                            "stage": "click_failed",
+                            "page": current_page,
+                            "catalog_id": cid,
+                        })
+                        processed_ids.add(cid)  # skip permanently
+                        continue
+                    style_id = _extract_first_style_id(page)
+                    processed_ids.add(cid)
+                    if style_id:
+                        all_rows.append({
+                            "account_id": account_id,
+                            "account_name": account_name,
+                            "style_id": style_id,
+                            "catalog_id": cid,
+                            "page_no": current_page,
+                        })
+                        catalogs_scanned += 1
+                    else:
+                        diagnostics.append({
+                            "stage": "no_style_id",
+                            "page": current_page,
+                            "catalog_id": cid,
+                        })
+                    time.sleep(0.35)
+                # after processing this batch, keep looping to find more
+                # (virtualisation may reveal new cards below)
+                if len(processed_ids) - last_new_at_iter == 0:
+                    no_new_streak += 1
+                last_new_at_iter = len(processed_ids)
+                # stop early once we've gathered ~CATALOGS_PER_PAGE
+                page_ids_now = len(processed_ids) - page_ids_before
+                if page_ids_now >= CATALOGS_PER_PAGE:
+                    break
+
+            _screenshot(page, debug_dir, f"page_{current_page}_end")
+
+            # advance to next page if there's more to scrape
+            if pages_visited >= pages_to_scrape:
                 break
-            if not _click_next_page(page):
+            current_page += 1
+            if not _click_next_page(page, current_page):
+                diagnostics.append({
+                    "stage": "pagination_exhausted",
+                    "reached_page": current_page - 1,
+                })
                 break
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
         diagnostics.append({"stage": "fatal",
                             "error": f"{type(e).__name__}: {e}"})
+        _screenshot(page, debug_dir, "fatal")
     finally:
         try:
             page.close()
@@ -402,7 +364,7 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
 
-    # persist — atomic replace for this account (only if we captured something)
+    # persist — replace this account's snapshot atomically
     mongo_url = os.environ.get("MESHO_MONGO_URI") or os.environ.get(
         "MONGO_URL", "mongodb://127.0.0.1:27017/")
     db_name = os.environ.get("MESHO_DB_NAME") or os.environ.get(
@@ -411,10 +373,10 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
     try:
         client = MongoClient(mongo_url)
         db = client[db_name]
+        db.meesho_live_skus.delete_many({"account_id": account_id})
         if all_rows:
-            db.meesho_live_skus.delete_many({"account_id": account_id})
             for r in all_rows:
-                r["synced_at"] = now
+                r["scraped_at"] = now
             db.meesho_live_skus.insert_many(all_rows, ordered=False)
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
@@ -422,12 +384,13 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
 
     note = ""
     if not all_rows:
-        note = (f"0 rows captured. Check screenshots in {debug_dir}. "
-                f"Diagnostics: {diagnostics}")
+        note = (f"0 rows captured across {pages_visited} page(s). "
+                f"Screenshots: {debug_dir}")
     return {
         "catalogs_scanned": catalogs_scanned,
         "skus_captured": len(all_rows),
         "pages_visited": pages_visited,
+        "pages_requested": pages_to_scrape,
         "note": note,
         "diagnostics": diagnostics,
         "debug_dir": str(debug_dir),

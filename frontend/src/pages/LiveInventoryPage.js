@@ -29,21 +29,21 @@ function StatusPill({ status }) {
   );
 }
 
-const inr = (v) => v == null ? "—" : `₹${Number(v).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
-
 export default function LiveInventoryPage() {
   const [accounts, setAccounts] = useState([]);
   const [accountId, setAccountId] = useState("all");
+  const [pages, setPages] = useState(20);
   const [tab, setTab] = useState("live");
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("");
   const [live, setLive] = useState({ items: [], total: 0, facets: {} });
-  const [missing, setMissing] = useState(null);
+  const [missing, setMissing] = useState({ items: [], total: 0, facets: {} });
   const [history, setHistory] = useState([]);
   const [lastSync, setLastSync] = useState({});
   const [loading, setLoading] = useState(false);
-  const [runningJob, setRunningJob] = useState(null);
+  const [runningJobs, setRunningJobs] = useState([]); // job ids
   const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
 
   const loadAccounts = useCallback(async () => {
     try {
@@ -55,7 +55,7 @@ export default function LiveInventoryPage() {
   const loadLive = useCallback(async () => {
     setLoading(true); setErr("");
     try {
-      const params = { limit: 500 };
+      const params = { limit: 1000 };
       if (accountId && accountId !== "all") params.account_id = accountId;
       if (category) params.category = category;
       if (search.trim()) params.search = search.trim();
@@ -68,13 +68,14 @@ export default function LiveInventoryPage() {
   const loadMissing = useCallback(async () => {
     setLoading(true); setErr("");
     try {
-      const params = {};
+      const params = { limit: 1000 };
       if (accountId && accountId !== "all") params.account_id = accountId;
+      if (search.trim()) params.search = search.trim();
       const r = await api.get("/inventory-sync/missing", { params });
       setMissing(r.data);
     } catch (e) { setErr(formatApiError(e)); }
     finally { setLoading(false); }
-  }, [accountId]);
+  }, [accountId, search]);
 
   const loadHistory = useCallback(async () => {
     try {
@@ -97,39 +98,65 @@ export default function LiveInventoryPage() {
   useEffect(() => { if (tab === "missing") loadMissing(); }, [tab, loadMissing]);
 
   const runSync = async () => {
-    if (!accountId || accountId === "all") {
-      setErr("Pick a specific account to sync."); return;
-    }
-    setErr(""); setRunningJob("queuing");
+    setErr(""); setInfo("");
     try {
-      const r = await api.post("/inventory-sync/run", { account_id: accountId });
-      setRunningJob(r.data.job_id);
+      const r = await api.post("/inventory-sync/run", {
+        account_id: accountId,
+        pages: Number(pages) || 20,
+      });
+      const ids = r.data.fanned_out
+        ? (r.data.jobs || []).map((j) => j.job_id).filter(Boolean)
+        : [r.data.job_id].filter(Boolean);
+      setRunningJobs(ids);
+      if (r.data.fanned_out) {
+        setInfo(`Queued ${ids.length} sync job(s) — one per account. Runs sequentially on EC2.`);
+      } else {
+        setInfo(r.data.already_queued
+          ? "A sync for this account is already queued or running."
+          : `Sync queued (${pages} pages).`);
+      }
       await loadHistory();
     } catch (e) {
       setErr(formatApiError(e));
-      setRunningJob(null);
+      setRunningJobs([]);
     }
   };
 
-  // Poll running job until done/failed
+  // Poll running jobs until every one is done/failed
   useEffect(() => {
-    if (!runningJob || runningJob === "queuing") return;
+    if (!runningJobs.length) return;
     const t = setInterval(async () => {
       try {
-        const r = await api.get("/inventory-sync/history", { params: { limit: 10 } });
+        const r = await api.get("/inventory-sync/history", { params: { limit: 50 } });
         setHistory(r.data.items || []);
-        const j = (r.data.items || []).find((x) => x.id === runningJob);
-        if (j && (j.status === "done" || j.status === "failed")) {
+        const outstanding = runningJobs.filter((id) => {
+          const j = (r.data.items || []).find((x) => x.id === id);
+          return !j || (j.status !== "done" && j.status !== "failed");
+        });
+        if (outstanding.length === 0) {
           clearInterval(t);
-          setRunningJob(null);
+          setRunningJobs([]);
           loadLastSync();
           if (tab === "live") loadLive();
           if (tab === "missing") loadMissing();
+        } else {
+          setRunningJobs(outstanding);
         }
       } catch (e) { /* silent */ }
     }, 3000);
     return () => clearInterval(t);
-  }, [runningJob, tab, loadLive, loadMissing, loadLastSync]);
+  }, [runningJobs, tab, loadLive, loadMissing, loadLastSync]);
+
+  const triggerDownload = (r, defaultName) => {
+    const cd = r.headers?.["content-disposition"] || "";
+    const m = /filename="?([^"]+)"?/i.exec(cd);
+    const name = (m && m[1]) || defaultName;
+    const url = URL.createObjectURL(new Blob([r.data]));
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
+  };
 
   const exportLive = async () => {
     const params = new URLSearchParams();
@@ -145,6 +172,7 @@ export default function LiveInventoryPage() {
   const exportMissing = async () => {
     const params = new URLSearchParams();
     if (accountId && accountId !== "all") params.set("account_id", accountId);
+    if (search.trim()) params.set("search", search.trim());
     const r = await api.get(`/inventory-sync/missing/export?${params.toString()}`, {
       responseType: "blob",
     });
@@ -156,8 +184,9 @@ export default function LiveInventoryPage() {
     [live.facets]
   );
 
-  const acc = accounts.find((a) => a.id === accountId);
   const lastForAcc = accountId !== "all" ? lastSync[accountId] : null;
+  const isSyncing = runningJobs.length > 0;
+  const missingCount = missing.total || 0;
 
   return (
     <div className="min-h-screen" data-testid="live-inventory-page">
@@ -167,22 +196,9 @@ export default function LiveInventoryPage() {
         right={
           <div className="flex items-center gap-2">
             <button
-              data-testid="cancel-stuck-btn"
-              onClick={async () => {
-                try {
-                  const r = await api.post("/jobs/cancel-stuck?job_type=inventory_sync&older_than_minutes=15");
-                  alert(`Cancelled ${r.data.cancelled} stuck inventory_sync jobs.`);
-                  loadHistory();
-                } catch (e) { setErr(formatApiError(e)); }
-              }}
+              onClick={() => { loadHistory(); loadLastSync(); if (tab === "live") loadLive(); if (tab === "missing") loadMissing(); }}
               className="btn-ghost text-xs"
-            >
-              Clear stuck jobs
-            </button>
-            <button
-              onClick={loadHistory}
-              className="btn-ghost text-xs"
-              data-testid="refresh-history-btn"
+              data-testid="refresh-btn"
             >
               <ArrowsClockwiseIcon size={12} weight="bold" />
               <span className="ml-1">Refresh</span>
@@ -193,6 +209,7 @@ export default function LiveInventoryPage() {
 
       <div className="px-8 py-6 space-y-6">
         <WorkerDriftBanner neededTypes={["inventory_sync"]} />
+
         {/* controls */}
         <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-4 flex flex-wrap items-end gap-3">
           <label className="block">
@@ -211,24 +228,36 @@ export default function LiveInventoryPage() {
               ))}
             </select>
           </label>
+          <label className="block">
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-[var(--text-muted)]">Pages to scrape</div>
+            <input
+              data-testid="pages-input"
+              type="number"
+              min={1}
+              max={200}
+              className="input-shell text-sm w-24"
+              value={pages}
+              onChange={(e) => setPages(e.target.value)}
+            />
+          </label>
           <label className="block flex-1 min-w-[240px]">
-            <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-[var(--text-muted)]">Search SKU / Style ID / Catalog</div>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-[var(--text-muted)]">Search Style ID</div>
             <div className="relative">
               <MagnifyingGlassIcon size={14} weight="bold"
                 className="absolute left-2 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
               <input
                 data-testid="search-input"
                 className="input-shell pl-7 text-sm w-full"
-                placeholder="MSS-NU-TAP-WHITE-03…"
+                placeholder="RM-LEOO-5-NAVY BLUE-123…"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && loadLive()}
+                onKeyDown={(e) => { if (e.key === "Enter") { if (tab === "live") loadLive(); else if (tab === "missing") loadMissing(); } }}
               />
             </div>
           </label>
           {tab === "live" && categoriesForAccount.length > 0 && (
             <label className="block">
-              <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-[var(--text-muted)]">Category</div>
+              <div className="mb-1 text-[10px] font-semibold uppercase tracking-widest text-[var(--text-muted)]">Main Category</div>
               <select
                 data-testid="category-select"
                 className="input-shell text-sm"
@@ -245,19 +274,27 @@ export default function LiveInventoryPage() {
           <button
             data-testid="run-sync-btn"
             onClick={runSync}
-            disabled={runningJob || !accountId || accountId === "all" || !acc?.enabled}
+            disabled={isSyncing}
             className="inline-flex items-center gap-2 rounded-md bg-emerald-500 px-4 py-2 text-xs font-semibold text-white shadow-lg shadow-emerald-500/20 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <StorefrontIcon size={14} weight="fill" />
-            {runningJob ? "Syncing…" : "Sync from Meesho"}
+            {isSyncing ? `Syncing… (${runningJobs.length})` : "Sync from Meesho"}
           </button>
           <button
-            data-testid={tab === "live" ? "export-live-btn" : "export-missing-btn"}
-            onClick={tab === "live" ? exportLive : exportMissing}
+            data-testid="export-live-btn"
+            onClick={exportLive}
             className="btn-ghost text-xs flex items-center gap-1"
           >
             <DownloadSimpleIcon size={12} weight="bold" />
-            Export {tab === "live" ? "live SKUs" : "missing"} (.xlsx)
+            Export live SKUs
+          </button>
+          <button
+            data-testid="export-missing-btn"
+            onClick={exportMissing}
+            className="btn-ghost text-xs flex items-center gap-1"
+          >
+            <DownloadSimpleIcon size={12} weight="bold" />
+            Export missing
           </button>
         </div>
 
@@ -271,6 +308,11 @@ export default function LiveInventoryPage() {
           </div>
         )}
 
+        {info && (
+          <div data-testid="info-banner" className="rounded border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200">
+            {info}
+          </div>
+        )}
         {err && (
           <div data-testid="error-banner" className="rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
             {err}
@@ -281,7 +323,7 @@ export default function LiveInventoryPage() {
         <div className="flex gap-1" data-testid="tabs">
           {[
             { k: "live", label: `Live SKUs ${live.total ? `(${live.total})` : ""}` },
-            { k: "missing", label: `Missing ${missing ? `(${missing.counts.only_on_meesho + missing.counts.only_in_pm})` : ""}` },
+            { k: "missing", label: `Missing ${missingCount ? `(${missingCount})` : ""}` },
             { k: "history", label: "Sync history" },
           ].map(({ k, label }) => (
             <button
@@ -301,10 +343,20 @@ export default function LiveInventoryPage() {
 
         <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden">
           {tab === "live" && (
-            <LiveTable rows={live.items} loading={loading} />
+            <RowTable
+              rows={live.items}
+              loading={loading}
+              emptyMsg={<>No live SKUs yet. Click <b>Sync from Meesho</b> to fetch.</>}
+              testid="live-table"
+            />
           )}
-          {tab === "missing" && missing && (
-            <MissingTable data={missing} />
+          {tab === "missing" && (
+            <RowTable
+              rows={missing.items}
+              loading={loading}
+              emptyMsg={<>Nothing missing — every scraped Style ID is in Master Inventory.</>}
+              testid="missing-table"
+            />
           )}
           {tab === "history" && (
             <HistoryList items={history} />
@@ -315,103 +367,41 @@ export default function LiveInventoryPage() {
   );
 }
 
-function LiveTable({ rows, loading }) {
+function RowTable({ rows, loading, emptyMsg, testid }) {
   if (loading) return <div className="p-6 text-sm text-[var(--text-muted)]">Loading…</div>;
   if (!rows || rows.length === 0) {
     return (
-      <div className="p-8 text-center text-sm text-[var(--text-muted)]" data-testid="live-empty">
-        No live SKUs yet. Click <b>Sync from Meesho</b> to fetch.
+      <div className="p-8 text-center text-sm text-[var(--text-muted)]" data-testid={`${testid}-empty`}>
+        {emptyMsg}
       </div>
     );
   }
   return (
-    <div className="overflow-auto" data-testid="live-table">
+    <div className="overflow-auto max-h-[65vh]" data-testid={testid}>
       <table className="dense w-full">
         <thead>
           <tr>
             <th>Account</th>
-            <th>Catalog</th>
-            <th>Category</th>
+            <th>Main Category</th>
             <th>Style ID</th>
-            <th>SKU</th>
-            <th>Size</th>
-            <th className="text-right">Price</th>
-            <th className="text-right">Stock</th>
+            <th>Last Synced</th>
           </tr>
         </thead>
         <tbody>
           {rows.map((r, i) => (
             <tr key={i}>
-              <td className="text-xs">{r.account_name}</td>
-              <td className="text-xs">{r.catalog_name} <span className="text-[var(--text-muted)]">#{r.catalog_id}</span></td>
-              <td className="text-xs">{r.category}</td>
+              <td className="text-xs">{r.account}</td>
+              <td className="text-xs">
+                {r.main_category === "Unmapped"
+                  ? <span className="rounded bg-amber-500/15 text-amber-300 px-1.5 py-0.5 text-[10px] uppercase tracking-widest">Unmapped</span>
+                  : r.main_category}
+              </td>
               <td className="font-mono text-[11px]">{r.style_id}</td>
-              <td className="font-mono text-[11px]">{r.sku}</td>
-              <td className="text-xs">{r.variation || "—"}</td>
-              <td className="text-right text-xs">{inr(r.price)}</td>
-              <td className="text-right text-xs">{r.current_stock ?? "—"}</td>
+              <td className="text-xs text-[var(--text-muted)]">{r.last_synced ? new Date(r.last_synced).toLocaleString() : "—"}</td>
             </tr>
           ))}
         </tbody>
       </table>
-    </div>
-  );
-}
-
-function MissingTable({ data }) {
-  const [sub, setSub] = useState("meesho");
-  const active = sub === "meesho" ? data.only_on_meesho : data.only_in_pm;
-  return (
-    <div>
-      <div className="flex flex-wrap gap-1 px-3 py-2 border-b border-[var(--border)]">
-        <button
-          data-testid="missing-tab-meesho"
-          onClick={() => setSub("meesho")}
-          className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-widest transition ${sub === "meesho" ? "border border-emerald-400/60 bg-emerald-500/15 text-emerald-200" : "text-[var(--text-muted)] hover:text-white"}`}
-        >
-          Live on Meesho, NOT in Product Master ({data.counts.only_on_meesho})
-        </button>
-        <button
-          data-testid="missing-tab-pm"
-          onClick={() => setSub("pm")}
-          className={`rounded-full px-2.5 py-1 text-[10px] uppercase tracking-widest transition ${sub === "pm" ? "border border-emerald-400/60 bg-emerald-500/15 text-emerald-200" : "text-[var(--text-muted)] hover:text-white"}`}
-        >
-          In Product Master, NOT live on Meesho ({data.counts.only_in_pm})
-        </button>
-      </div>
-      {(active.length === 0) ? (
-        <div className="p-8 text-center text-sm text-[var(--text-muted)]" data-testid="missing-empty">
-          Nothing missing — Product Master and Meesho are in sync.
-        </div>
-      ) : (
-        <div className="overflow-auto max-h-[60vh]" data-testid="missing-table">
-          <table className="dense w-full">
-            <thead>
-              <tr>
-                <th>Account</th>
-                <th>Style ID</th>
-                {sub === "meesho" && <th>Catalog</th>}
-                {sub === "meesho" && <th>Category</th>}
-              </tr>
-            </thead>
-            <tbody>
-              {active.slice(0, 500).map((r, i) => (
-                <tr key={i}>
-                  <td className="text-xs">{r.account_alias || r.account_name || "—"}</td>
-                  <td className="font-mono text-[11px]">{r.style_id}</td>
-                  {sub === "meesho" && <td className="text-xs">{r.catalog_name}</td>}
-                  {sub === "meesho" && <td className="text-xs">{r.category}</td>}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {active.length > 500 && (
-            <div className="text-[11px] text-[var(--text-muted)] px-3 py-2">
-              …showing first 500. Use Export for the full list.
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }
@@ -434,9 +424,12 @@ function HistoryList({ items }) {
               <div className="flex items-center gap-2">
                 <span className="text-sm">{j.account_name}</span>
                 <StatusPill status={j.status} />
+                <span className="text-[10px] text-[var(--text-muted)]">
+                  {j.pages_requested ? `${j.pages_requested} pages requested` : ""}
+                </span>
               </div>
               <div className="mt-1 text-[11px] text-[var(--text-muted)]">
-                {fmtRelative(j.created_at)} · captured <span className="text-emerald-300">{j.result.skus_captured}</span> SKUs across <span className="text-emerald-300">{j.result.catalogs_scanned}</span> catalogs
+                {fmtRelative(j.created_at)} · captured <span className="text-emerald-300">{j.result.skus_captured}</span> Style IDs across <span className="text-emerald-300">{j.result.catalogs_scanned}</span> catalogs ({j.result.pages_visited} pages visited)
               </div>
               {j.error && <div className="mt-1 text-[11px] text-rose-300 truncate" title={j.error}>{j.error}</div>}
               {j.result.note && (
@@ -455,15 +448,4 @@ function HistoryList({ items }) {
       })}
     </div>
   );
-}
-
-function triggerDownload(r, defaultName) {
-  const cd = r.headers?.["content-disposition"] || "";
-  const m = /filename="?([^"]+)"?/i.exec(cd);
-  const name = (m && m[1]) || defaultName;
-  const url = URL.createObjectURL(new Blob([r.data]));
-  const a = document.createElement("a");
-  a.href = url; a.download = name;
-  document.body.appendChild(a); a.click();
-  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
 }
