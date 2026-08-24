@@ -60,6 +60,53 @@ def _safe_text(node, timeout_ms: int = 1500) -> str:
         return ""
 
 
+def _dismiss_onboarding(page: Page) -> int:
+    """Meesho shows a coach-mark tooltip 'Find all your live catalogs here'
+    with a `GOT IT` button that intercepts clicks on Sort/Active/etc.
+    Also handles the generic 'Skip Tour' / 'Got It' popups. Returns the
+    number of popups dismissed."""
+    dismissed = 0
+    # Try multiple rounds in case there's a chain of tooltips.
+    for _round in range(6):
+        clicked_this_round = False
+        for sel in [
+            'button:has-text("GOT IT")',
+            'button:has-text("Got it")',
+            'button:has-text("Got It")',
+            'button:has-text("Skip Tour")',
+            'button:has-text("Skip")',
+            'button:has-text("Next")',   # tour step buttons
+            'xpath=//*[normalize-space(text())="GOT IT"]',
+            'xpath=//*[normalize-space(text())="Got it"]',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() > 0 and loc.is_visible(timeout=800):
+                    loc.click(timeout=1500, force=True)
+                    page.wait_for_timeout(500)
+                    dismissed += 1
+                    clicked_this_round = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        # Also try closing via the tooltip's own × button
+        try:
+            close = page.locator(
+                'xpath=//*[contains(normalize-space(.), "Find all your live catalogs")]'
+                '//ancestor::*[1]//button[@aria-label="close" or @aria-label="Close"]'
+            ).first
+            if close.count() > 0 and close.is_visible(timeout=600):
+                close.click(timeout=1500, force=True)
+                page.wait_for_timeout(400)
+                dismissed += 1
+                clicked_this_round = True
+        except Exception:  # noqa: BLE001
+            pass
+        if not clicked_this_round:
+            break
+    return dismissed
+
+
 def _ensure_active_all_stock(page: Page) -> None:
     """Meesho defaults land on Active > All Stock, but a session may
     remember the last-used sub-tab. Force it."""
@@ -76,32 +123,44 @@ def _ensure_active_all_stock(page: Page) -> None:
 
 
 def _select_newest_first(page: Page) -> bool:
-    """Open `Sort catalogs by` dropdown and pick `Newest First`."""
+    """Open `Sort catalogs by` dropdown and pick `Newest First`.
+
+    Uses force-click to bypass any residual coach-mark overlay.
+    """
+    _dismiss_onboarding(page)
     try:
-        # The dropdown label sits next to the value. Robust approach:
-        # click the visible current value ("Highest Estimated Orders"
-        # or whichever) which acts as the dropdown trigger.
-        trigger_candidates = [
-            'xpath=//*[contains(normalize-space(text()), "Sort catalogs by")]/following::*[self::div or self::button][1]',
-            'xpath=//*[text()="Highest Estimated Orders"]',
-            'xpath=//*[text()="Newest First"]',
-        ]
-        for sel in trigger_candidates:
-            loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible(timeout=1500):
-                try:
-                    loc.click(timeout=2500)
-                    break
-                except Exception:  # noqa: BLE001
+        # 1) The dropdown trigger IS the currently-shown value text
+        #    (e.g. "Highest Estimated Orders"). Click it force=True.
+        clicked_trigger = False
+        for sel in [
+            'text="Highest Estimated Orders"',
+            'text="Newest First"',  # already selected? no-op
+            'xpath=//*[contains(normalize-space(text()), "Sort catalogs by")]'
+            '/following::*[self::div or self::button or self::span][1]',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
                     continue
-        page.wait_for_timeout(600)
-        # Pick "Newest First" from the opened menu
+                loc.scroll_into_view_if_needed(timeout=1500)
+                loc.click(timeout=2500, force=True)
+                clicked_trigger = True
+                page.wait_for_timeout(700)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+        if not clicked_trigger:
+            return False
+
+        # 2) Pick "Newest First" from the opened menu
+        _dismiss_onboarding(page)  # in case a fresh tip pops on menu open
         newest = page.locator(
             'xpath=//*[normalize-space(text())="Newest First"]'
         ).first
         if newest.count() > 0:
-            newest.click(timeout=3000)
-            page.wait_for_timeout(1500)  # let list re-sort
+            newest.scroll_into_view_if_needed(timeout=1500)
+            newest.click(timeout=3000, force=True)
+            page.wait_for_timeout(2000)  # let list re-sort
             return True
     except Exception:  # noqa: BLE001
         return False
@@ -131,13 +190,20 @@ def _catalog_id_from_card(card) -> Optional[str]:
 
 
 def _click_catalog_card(page: Page, card) -> bool:
-    for _ in range(2):
+    for attempt in range(3):
         try:
             card.scroll_into_view_if_needed(timeout=2500)
-            card.click(timeout=3000)
+            # Use force=True on retry to bypass any residual coach-mark
+            # or floating element that may intercept the click.
+            card.click(timeout=3000, force=(attempt > 0))
             page.wait_for_timeout(1200)
             return True
         except Exception:  # noqa: BLE001
+            # Try dismissing any coach-mark that appeared mid-run
+            try:
+                _dismiss_onboarding(page)
+            except Exception:  # noqa: BLE001
+                pass
             page.wait_for_timeout(400)
     return False
 
@@ -239,6 +305,14 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
         page.wait_for_timeout(2500)
+
+        # Meesho shows a "Find all your live catalogs here — GOT IT"
+        # coach-mark on first landing; it intercepts every subsequent
+        # click. Dismiss ALL onboarding tips before touching the UI.
+        popups = _dismiss_onboarding(page)
+        diagnostics.append({"stage": "dismiss_onboarding",
+                            "popups_dismissed": popups})
+        _screenshot(page, debug_dir, "00_after_onboarding")
 
         _ensure_active_all_stock(page)
         page.wait_for_timeout(1200)
