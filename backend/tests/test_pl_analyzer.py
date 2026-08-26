@@ -15,7 +15,7 @@ import pytest
 import requests
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/") or \
-    "https://label-sorter-pro.preview.emergentagent.com"
+    "https://inventory-sync-hub-18.preview.emergentagent.com"
 
 ADMIN_EMAIL = "admin@meesho-dash.local"
 ADMIN_PASSWORD = "admin123"
