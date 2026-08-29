@@ -114,17 +114,16 @@ async def _iter_live_rows(db, account_id: Optional[str]):
 
 async def _build_view(db, account_id: Optional[str], search: Optional[str],
                      main_category: Optional[str]):
-    """Returns (matched_rows, unmatched_rows) already enriched + filtered."""
+    """Returns (matched_rows, unmatched_rows) already enriched + filtered.
+
+    Matching is STRICT per-account: a scraped (account_id, style_id) row
+    is matched ONLY against that same account_id's master inventory. If
+    no master row exists for that specific account, the row lands in
+    `unmatched` under the SCRAPED account — never rehomed to another
+    account whose master happens to contain the same style_id.
+    """
     pm = await _load_pm_lookup(db)
     accs = await _account_map(db)
-
-    # style_id → matched pm entry (first hit wins if same style_id lives
-    # under multiple accounts in master).
-    sku_index: Dict[str, Dict[str, Any]] = {}
-    for (aid, sku), info in pm.items():
-        # prefer entries whose account_id matches the row's account_id
-        # (handled at lookup time); keep any as fallback
-        sku_index.setdefault(sku, {"account_id": aid, **info})
 
     matched: List[Dict[str, Any]] = []
     unmatched: List[Dict[str, Any]] = []
@@ -135,28 +134,20 @@ async def _build_view(db, account_id: Optional[str], search: Optional[str],
         scraped_aname = r.get("account_name")
         scraped_at = _iso(r.get("scraped_at"))
 
-        # 1) exact (account, sku)
+        # STRICT per-account match. No cross-account fallback.
         hit = pm.get((scraped_aid, sid))
-        # 2) style_id alone
-        if not hit:
-            hit = sku_index.get(sid)
+        acc = accs.get(scraped_aid, {})
+        acc_display = (acc.get("alias") or acc.get("name")
+                       or scraped_aname or "—")
         if hit:
-            aid = hit.get("account_id") or scraped_aid
-            acc = accs.get(aid, {})
-            acc_display = (acc.get("alias") or acc.get("name")
-                           or scraped_aname or "—")
-            row = {
+            matched.append({
                 "account": acc_display,
-                "account_id": aid,
+                "account_id": scraped_aid,
                 "main_category": hit.get("main_category") or UNMAPPED,
                 "style_id": sid,
                 "last_synced": scraped_at,
-            }
-            matched.append(row)
+            })
         else:
-            acc = accs.get(scraped_aid, {})
-            acc_display = (acc.get("alias") or acc.get("name")
-                           or scraped_aname or "—")
             unmatched.append({
                 "account": acc_display,
                 "account_id": scraped_aid,

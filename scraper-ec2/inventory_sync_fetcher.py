@@ -247,20 +247,23 @@ def _list_cards(page: Page) -> List[Dict[str, Any]]:
 
 def _click_card(page: Page, card: Dict[str, Any]) -> bool:
     """Click a card by its tagged data-scraper-cid attribute. Scrolls into
-    view first and dispatches a real click. Falls back to JS .click()."""
+    view first and dispatches a real click. Falls back to JS .click().
+
+    NOTE: does NOT wait for the right panel to settle — callers who need
+    a fresh Style ID should use `_click_and_capture_style_id` instead.
+    """
     cid = card["catalog_id"]
     sel = f'[data-scraper-cid="{cid}"]'
     try:
         loc = page.locator(sel).first
         loc.scroll_into_view_if_needed(timeout=3_000)
         loc.click(timeout=4_000, force=True)
-        page.wait_for_timeout(900)
         return True
     except Exception:  # noqa: BLE001
         pass
     try:
         _dismiss_onboarding(page)
-        clicked = bool(page.evaluate(f"""
+        return bool(page.evaluate(f"""
             () => {{
                 const el = document.querySelector({sel!r});
                 if (!el) return false;
@@ -269,11 +272,63 @@ def _click_card(page: Page, card: Dict[str, Any]) -> bool:
                 return false;
             }}
         """))
-        if clicked:
-            page.wait_for_timeout(900)
-        return clicked
     except Exception:  # noqa: BLE001
         return False
+
+
+def _current_right_panel_style_id(page: Page) -> Optional[str]:
+    """Return whatever Style ID is CURRENTLY visible in the right panel
+    (regardless of catalog id) — used to detect a re-render across
+    clicks."""
+    txt = page.evaluate("""
+        () => {
+            const cands = document.querySelectorAll('div,section,main');
+            let best = null, bestArea = Infinity;
+            for (const el of cands) {
+                if (!el.offsetParent) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 300) continue;
+                const t = (el.innerText || '');
+                if (!t.includes('Style ID')) continue;
+                if (!t.includes('Catalog ID')) continue;
+                const occ = (t.match(/Catalog ID/gi) || []).length;
+                if (occ !== 1) continue;
+                const area = r.width * r.height;
+                if (area < bestArea) { bestArea = area; best = t; }
+            }
+            return best;
+        }
+    """) or ""
+    return _extract_style_id_from_text(txt)
+
+
+def _click_and_capture_style_id(page: Page, card: Dict[str, Any],
+                                pre_click_sid: Optional[str],
+                                timeout_ms: int = 8_000
+                                ) -> Optional[str]:
+    """Click a catalog card, then poll the right panel until BOTH
+      (a) it shows the target catalog id, and
+      (b) its Style ID differs from `pre_click_sid`.
+    Returns the fresh Style ID, or the last-seen one on timeout, or None
+    if the panel never resolved."""
+    cid = card["catalog_id"]
+    if not _click_card(page, card):
+        return None
+    import time as _t
+    deadline = _t.time() + timeout_ms / 1000
+    last_sid: Optional[str] = None
+    while _t.time() < deadline:
+        panel_txt = _find_right_panel_for(page, cid)
+        if panel_txt:
+            sid = _extract_style_id_from_text(panel_txt)
+            if sid:
+                last_sid = sid
+                if sid != pre_click_sid:
+                    return sid
+        page.wait_for_timeout(250)
+    # Timed out waiting for a change. Return whatever we last saw
+    # (could be None or the stale sid — caller decides what to do).
+    return last_sid
 
 
 def _scroll_left_panel(page: Page) -> bool:
@@ -473,13 +528,23 @@ def _click_next_arrow(page: Page) -> bool:
     """) or False)
 
 
-def _advance_page(page: Page, next_num: int) -> bool:
-    if _click_page_number(page, next_num):
-        page.wait_for_timeout(1500)
-        return True
-    if _click_next_arrow(page):
-        page.wait_for_timeout(1500)
-        return True
+def _advance_page(page: Page, next_num: int,
+                  processed_ids: Set[str],
+                  timeout_ms: int = 10_000) -> bool:
+    """Click the next-page control AND verify a new (unprocessed) card
+    appears in the left panel within `timeout_ms`. Returns False if the
+    page never actually changed."""
+    clicked = _click_page_number(page, next_num) or _click_next_arrow(page)
+    if not clicked:
+        return False
+    import time as _t
+    deadline = _t.time() + timeout_ms / 1000
+    while _t.time() < deadline:
+        cards = _list_cards(page)
+        for c in cards:
+            if c["catalog_id"] not in processed_ids:
+                return True
+        page.wait_for_timeout(400)
     return False
 
 
@@ -585,14 +650,15 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
                 no_new_streak = 0
                 for card in new_cards:
                     cid = card["catalog_id"]
-                    if not _click_card(page, card):
-                        diagnostics.append({"stage": "click_failed",
-                                            "page": current_page,
-                                            "catalog_id": cid})
-                        processed_ids.add(cid)
-                        continue
-                    sid = _first_style_id(page, catalog_id=cid,
-                                          prev_style_id=last_sid)
+                    # Capture what's currently shown in the right panel
+                    # (may belong to a previous catalog) so we can wait
+                    # for it to CHANGE after this click.
+                    pre_click_sid = _current_right_panel_style_id(page) or last_sid
+                    sid = _click_and_capture_style_id(
+                        page, card,
+                        pre_click_sid=pre_click_sid,
+                        timeout_ms=8_000,
+                    )
                     processed_ids.add(cid)
                     if sid:
                         last_sid = sid
@@ -621,7 +687,8 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
             if pages_visited >= pages_to_scrape:
                 break
             current_page += 1
-            if not _advance_page(page, current_page):
+            if not _advance_page(page, current_page, processed_ids,
+                                 timeout_ms=10_000):
                 diagnostics.append({"stage": "pagination_exhausted",
                                     "reached_page": current_page - 1})
                 break
