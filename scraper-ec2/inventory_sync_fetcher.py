@@ -308,15 +308,43 @@ def _scroll_left_panel(page: Page) -> bool:
 
 
 # ---------- style id extraction ----------
-def _wait_right_panel_for_catalog(page: Page, catalog_id: str,
-                                  timeout_ms: int = 6_000) -> bool:
-    """Wait until the right panel header shows the expected catalog_id
-    (i.e. Meesho finished loading the selected catalog's details).
-
-    The right panel shows `Catalog ID: <id>  Category: <name>` right below
-    the catalog title. We poll for a large-ish container whose innerText
-    contains BOTH 'Catalog ID' and the specific numeric id.
+def _find_right_panel_for(page: Page, catalog_id: str) -> Optional[str]:
+    """Return the innerText of the SMALLEST DOM container that represents
+    the right-panel view of the given catalog_id. We identify it as:
+      - contains 'Catalog ID' EXACTLY ONCE  (rules out list wrappers)
+      - contains the target catalog_id
+      - contains 'Style ID'                 (right-panel-only marker)
+      - width >= 300px                      (rules out narrow LEFT cards)
+    Returns None if no such container exists yet.
     """
+    return page.evaluate(f"""
+        () => {{
+            const cid = {catalog_id!r};
+            const cands = document.querySelectorAll('div,section,main');
+            let best = null, bestArea = Infinity;
+            for (const el of cands) {{
+                if (!el.offsetParent) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 300) continue;
+                const t = (el.innerText || '');
+                if (!t.includes('Catalog ID')) continue;
+                if (!t.includes(cid)) continue;
+                if (!t.includes('Style ID')) continue;
+                const occ = (t.match(/Catalog ID/gi) || []).length;
+                if (occ !== 1) continue;
+                const area = r.width * r.height;
+                if (area < bestArea) {{ bestArea = area; best = t; }}
+            }}
+            return best;
+        }}
+    """)
+
+
+def _wait_right_panel_for_catalog(page: Page, catalog_id: str,
+                                  timeout_ms: int = 8_000) -> bool:
+    """Wait until Meesho commits the right-panel re-render for the given
+    catalog. Requires the container to have EXACTLY one 'Catalog ID'
+    text (rules out wrapper divs that span both panels)."""
     js = f"""
         () => {{
             const cid = {catalog_id!r};
@@ -324,10 +352,13 @@ def _wait_right_panel_for_catalog(page: Page, catalog_id: str,
             for (const el of cands) {{
                 if (!el.offsetParent) continue;
                 const r = el.getBoundingClientRect();
-                if (r.width < 300) continue;   // skip narrow left-panel cards
+                if (r.width < 300) continue;
                 const t = (el.innerText || '');
-                if (t.includes('Catalog ID') && t.includes(cid)
-                    && t.includes('Style ID')) return true;
+                if (!t.includes('Catalog ID')) continue;
+                if (!t.includes(cid)) continue;
+                if (!t.includes('Style ID')) continue;
+                const occ = (t.match(/Catalog ID/gi) || []).length;
+                if (occ === 1) return true;
             }}
             return false;
         }}
@@ -339,40 +370,56 @@ def _wait_right_panel_for_catalog(page: Page, catalog_id: str,
         return False
 
 
-def _first_style_id(page: Page, catalog_id: Optional[str] = None) -> Optional[str]:
-    """Return the first 'Style ID: X' visible in the right panel.
+def _extract_style_id_from_text(txt: str) -> Optional[str]:
+    """Best-effort regex extraction of the first 'Style ID: X' value from
+    the given innerText blob."""
+    import re
+    m = re.search(r"Style ID[:\s]*([^\r\n|,]+)", txt or "", re.IGNORECASE)
+    if not m:
+        return None
+    val = m.group(1)
+    # cut at second whitespace-run (defensive: Style ID SKU ... on same line)
+    val = val.split("  ")[0]
+    return val.strip() or None
 
-    If `catalog_id` is provided, first wait for the right panel to
-    display that catalog id — avoids the race where we read the previous
-    catalog's Style ID before Meesho re-renders."""
-    if catalog_id:
-        _wait_right_panel_for_catalog(page, catalog_id, timeout_ms=6_000)
-    try:
-        page.wait_for_function(
-            "() => /Style ID/i.test(document.body.innerText || '')",
-            timeout=4_000,
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    return page.evaluate("""
-        () => {
-            // Find the leaf-most element whose text starts with
-            // "Style ID:". Prefer nodes that also contain an SKU line
-            // (they're in the right panel product row).
-            const all = Array.from(document.querySelectorAll(
-                'div,span,p,td'));
-            for (const el of all) {
-                if (el.children.length > 5) continue;
-                const t = (el.innerText || el.textContent || '').trim();
-                const m = /^Style ID[:\\s]*([^\\n\\r]+)/i.exec(t);
-                if (m) {
-                    // Strip trailing "SKU:..." if it flowed together
-                    return m[1].split(/\\s{2,}|\\n/)[0].trim();
-                }
-            }
-            return null;
-        }
-    """)
+
+def _first_style_id(page: Page, catalog_id: Optional[str] = None,
+                    prev_style_id: Optional[str] = None) -> Optional[str]:
+    """Return the Style ID for `catalog_id` from the right panel.
+
+    Reads ONLY from within the container that has EXACTLY ONE
+    'Catalog ID' occurrence AND matches the target catalog_id — this
+    guarantees we ignore the LEFT panel and stale wrappers.
+
+    If `prev_style_id` is provided and the fresh read equals it, we
+    retry once after a short wait (defends against Meesho updating the
+    header before it updates the SKU rows).
+    """
+    if not catalog_id:
+        # Legacy fallback: scan globally (still filters by <=5 children)
+        try:
+            page.wait_for_function(
+                "() => /Style ID/i.test(document.body.innerText || '')",
+                timeout=4_000,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        txt = page.evaluate(
+            "() => document.body ? document.body.innerText : ''") or ""
+        return _extract_style_id_from_text(txt)
+
+    _wait_right_panel_for_catalog(page, catalog_id, timeout_ms=8_000)
+    panel_txt = _find_right_panel_for(page, catalog_id) or ""
+    sid = _extract_style_id_from_text(panel_txt)
+
+    if sid and prev_style_id and sid == prev_style_id:
+        # Stale: right-panel header updated but SKU rows not yet.
+        page.wait_for_timeout(1200)
+        panel_txt = _find_right_panel_for(page, catalog_id) or ""
+        sid2 = _extract_style_id_from_text(panel_txt)
+        if sid2:
+            sid = sid2
+    return sid
 
 
 # ---------- pagination ----------
@@ -456,6 +503,7 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
     pages_visited = 0
     diagnostics: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()
+    last_sid: Optional[str] = None
 
     p, _browser, _ctx, page, page_reused = cdp_reuse_supplier_page(port)
     diagnostics.append({"stage": "cdp_attach", "page_reused": page_reused})
@@ -543,8 +591,11 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
                                             "catalog_id": cid})
                         processed_ids.add(cid)
                         continue
-                    sid = _first_style_id(page, catalog_id=cid)
+                    sid = _first_style_id(page, catalog_id=cid,
+                                          prev_style_id=last_sid)
                     processed_ids.add(cid)
+                    if sid:
+                        last_sid = sid
                     if sid:
                         all_rows.append({
                             "account_id": account_id,
