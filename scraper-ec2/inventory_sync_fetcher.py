@@ -246,8 +246,12 @@ def _list_cards(page: Page) -> List[Dict[str, Any]]:
 
 
 def _click_card(page: Page, card: Dict[str, Any]) -> bool:
-    """Click a card by its tagged data-scraper-cid attribute. Scrolls into
-    view first and dispatches a real click. Falls back to JS .click().
+    """Click a catalog card using a REAL mouse click at the coordinate
+    of the inner <img>. `element.click()` and `locator.click(force=True)`
+    on the outer container don't reliably trigger Meesho's React click
+    handler (which is bound to a specific inner element). Firing a real
+    mouse click at the image's centre matches manual-click behaviour and
+    causes the SKU-fetch XHR (`fetchAllStockV2Products`) to fire.
 
     NOTE: does NOT wait for the right panel to settle — callers who need
     a fresh Style ID should use `_click_and_capture_style_id` instead.
@@ -255,23 +259,34 @@ def _click_card(page: Page, card: Dict[str, Any]) -> bool:
     cid = card["catalog_id"]
     sel = f'[data-scraper-cid="{cid}"]'
     try:
-        loc = page.locator(sel).first
-        loc.scroll_into_view_if_needed(timeout=3_000)
-        loc.click(timeout=4_000, force=True)
-        return True
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        _dismiss_onboarding(page)
-        return bool(page.evaluate(f"""
+        pt = page.evaluate(f"""
             () => {{
                 const el = document.querySelector({sel!r});
-                if (!el) return false;
-                el.scrollIntoView({{block:'center'}});
-                try {{ el.click(); return true; }} catch(e){{}}
-                return false;
+                if (!el) return null;
+                el.scrollIntoView({{block: 'center'}});
+                // Prefer the inner <img>: it always has the click handler
+                // bound to it (or bubbles to card's onClick). Falls back
+                // to the card itself.
+                const target = el.querySelector('img') || el;
+                const r = target.getBoundingClientRect();
+                return {{
+                    x: r.left + r.width / 2,
+                    y: r.top + r.height / 2,
+                    visible: r.width > 5 && r.height > 5
+                             && r.top < (window.innerHeight - 10)
+                             && r.top > 10,
+                }};
             }}
-        """))
+        """)
+        if not pt or not pt.get("visible"):
+            return False
+        # Real hover → click. `delay` gives Meesho a chance to observe
+        # pointerdown/mouseup separately (some React handlers only fire
+        # on the full down→up sequence).
+        page.mouse.move(float(pt["x"]), float(pt["y"]))
+        page.wait_for_timeout(80)
+        page.mouse.click(float(pt["x"]), float(pt["y"]), delay=40)
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -309,26 +324,26 @@ def _click_and_capture_style_id(page: Page, card: Dict[str, Any],
     """Click a catalog card, then poll the right panel until BOTH
       (a) it shows the target catalog id, and
       (b) its Style ID differs from `pre_click_sid`.
-    Returns the fresh Style ID, or the last-seen one on timeout, or None
-    if the panel never resolved."""
+    Returns the fresh Style ID on success, or None if the SKU section
+    never actually refreshed within the timeout — a stale Style ID is
+    NEVER returned, so a failed/no-op click can't be recorded as this
+    catalog's data.
+    """
     cid = card["catalog_id"]
     if not _click_card(page, card):
         return None
     import time as _t
     deadline = _t.time() + timeout_ms / 1000
-    last_sid: Optional[str] = None
     while _t.time() < deadline:
         panel_txt = _find_right_panel_for(page, cid)
         if panel_txt:
             sid = _extract_style_id_from_text(panel_txt)
-            if sid:
-                last_sid = sid
-                if sid != pre_click_sid:
-                    return sid
+            if sid and sid != pre_click_sid:
+                return sid
         page.wait_for_timeout(250)
-    # Timed out waiting for a change. Return whatever we last saw
-    # (could be None or the stale sid — caller decides what to do).
-    return last_sid
+    # Timed out — SKU section did not refresh. Do NOT record the stale
+    # value; caller sees `no_style_id` diagnostic instead.
+    return None
 
 
 def _scroll_left_panel(page: Page) -> bool:
