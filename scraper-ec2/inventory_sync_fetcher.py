@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
-from _meesho_ui import cdp_context_page
+from _meesho_ui import cdp_context_page, cdp_reuse_supplier_page
 from playwright.sync_api import Page, TimeoutError as PWTimeout  # noqa: F401
 from pymongo import MongoClient
 
@@ -168,73 +168,112 @@ def _select_newest_first(page: Page) -> Dict[str, Any]:
 
 
 # ---------- catalog cards ----------
+def _wait_for_cards_loaded(page: Page, timeout_ms: int = 20_000) -> bool:
+    """Wait until the left panel actually renders catalog cards (not the
+    loading skeleton). We detect a card as: an <img> ancestor whose
+    innerText contains 'Catalog ID: <digit>'. Returns True on success."""
+    try:
+        page.wait_for_function(
+            """() => {
+                const imgs = document.querySelectorAll('img');
+                for (const img of imgs) {
+                    let el = img.parentElement;
+                    for (let i = 0; i < 10 && el; i++) {
+                        const t = (el.innerText || '');
+                        if (/Catalog ID[:\\s]*\\d/i.test(t)) return true;
+                        el = el.parentElement;
+                    }
+                }
+                return false;
+            }""",
+            timeout=timeout_ms,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _list_cards(page: Page) -> List[Dict[str, Any]]:
-    """Return a list of {catalog_id, x, y, top} for every visible catalog
-    card currently rendered in the left panel. Uses JS TreeWalker so it
-    works regardless of how Meesho splits the DOM text."""
+    """Return list of {catalog_id, top, bottom} for every visible catalog
+    card in the left panel. Also tags each card DOM element with
+    `data-scraper-cid="<id>"` so `_click_card` can click deterministically
+    via a CSS selector (no mouse coordinates → survives scroll jitter).
+
+    Strategy: anchor on <img> elements and walk UP to find the nearest
+    ancestor whose *innerText* contains 'Catalog ID: <id>' exactly once.
+    This survives Meesho splitting the label across multiple spans
+    (which is what breaks a `.textContent`-only walker).
+    """
     return page.evaluate("""
         () => {
-            const results = [];
+            const out = [];
             const seen = new Set();
-            const walker = document.createTreeWalker(
-                document.body, NodeFilter.SHOW_TEXT, null, false);
-            let node;
-            const cards = [];
-            while (node = walker.nextNode()) {
-                const parent = node.parentElement;
-                if (!parent) continue;
-                const parentText = (parent.textContent || '').trim();
-                const m = /Catalog ID[:\\s]*(\\d[\\d\\w-]*)/i.exec(parentText);
-                if (!m) continue;
-                const cid = m[1].replace(/[,\\s]+$/, '');
-                if (seen.has(cid)) continue;
-                // Walk up to the card container: nearest ancestor that
-                // (a) contains an <img>, (b) does NOT contain more than
-                // one "Catalog ID" occurrence.
-                let el = parent;
+            const imgs = Array.from(document.querySelectorAll('img'));
+            for (const img of imgs) {
+                let el = img.parentElement;
                 let card = null;
                 for (let i = 0; i < 10 && el; i++) {
-                    const hasImg = !!el.querySelector('img');
-                    if (hasImg) {
-                        const txt = (el.textContent || '');
-                        const occ = (txt.match(/Catalog ID/gi) || []).length;
+                    const t = (el.innerText || '');
+                    if (/Catalog ID[:\\s]*\\d/i.test(t)) {
+                        const occ = (t.match(/Catalog ID/gi) || []).length;
                         if (occ === 1) { card = el; break; }
                     }
                     el = el.parentElement;
                 }
                 if (!card) continue;
+                const t = card.innerText || '';
+                const m = /Catalog ID[:\\s]*(\\d[\\d\\w-]*)/i.exec(t);
+                if (!m) continue;
+                const cid = m[1].replace(/[^\\d\\w-].*$/, '');
+                if (seen.has(cid)) continue;
                 const r = card.getBoundingClientRect();
                 if (r.width < 40 || r.height < 30) continue;
+                // Skip cards not currently visible in the viewport-agnostic
+                // sense — allow off-screen (they may need scrolling in).
                 seen.add(cid);
-                cards.push({
+                try { card.setAttribute('data-scraper-cid', cid); } catch(e){}
+                out.push({
                     catalog_id: cid,
-                    x: r.left + Math.min(80, r.width/2),
-                    y: r.top + r.height/2,
                     top: r.top,
                     bottom: r.bottom,
                     height: r.height,
                 });
             }
-            // sort by vertical position (top-down)
-            cards.sort((a,b) => a.top - b.top);
-            return cards;
+            out.sort((a,b) => a.top - b.top);
+            return out;
         }
     """) or []
 
 
 def _click_card(page: Page, card: Dict[str, Any]) -> bool:
+    """Click a card by its tagged data-scraper-cid attribute. Scrolls into
+    view first and dispatches a real click. Falls back to JS .click()."""
+    cid = card["catalog_id"]
+    sel = f'[data-scraper-cid="{cid}"]'
     try:
-        page.mouse.click(card["x"], card["y"])
-        page.wait_for_timeout(1200)
+        loc = page.locator(sel).first
+        loc.scroll_into_view_if_needed(timeout=3_000)
+        loc.click(timeout=4_000, force=True)
+        page.wait_for_timeout(900)
         return True
     except Exception:  # noqa: BLE001
-        try:
-            _dismiss_onboarding(page)
-            page.mouse.click(card["x"], card["y"])
-            page.wait_for_timeout(1200)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        pass
+    try:
+        _dismiss_onboarding(page)
+        clicked = bool(page.evaluate(f"""
+            () => {{
+                const el = document.querySelector({sel!r});
+                if (!el) return false;
+                el.scrollIntoView({{block:'center'}});
+                try {{ el.click(); return true; }} catch(e){{}}
+                return false;
+            }}
+        """))
+        if clicked:
+            page.wait_for_timeout(900)
+        return clicked
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _scroll_left_panel(page: Page) -> bool:
@@ -269,12 +308,49 @@ def _scroll_left_panel(page: Page) -> bool:
 
 
 # ---------- style id extraction ----------
-def _first_style_id(page: Page) -> Optional[str]:
-    """Return the first 'Style ID: X' visible in the right panel."""
+def _wait_right_panel_for_catalog(page: Page, catalog_id: str,
+                                  timeout_ms: int = 6_000) -> bool:
+    """Wait until the right panel header shows the expected catalog_id
+    (i.e. Meesho finished loading the selected catalog's details).
+
+    The right panel shows `Catalog ID: <id>  Category: <name>` right below
+    the catalog title. We poll for a large-ish container whose innerText
+    contains BOTH 'Catalog ID' and the specific numeric id.
+    """
+    js = f"""
+        () => {{
+            const cid = {catalog_id!r};
+            const cands = document.querySelectorAll('div,section,main');
+            for (const el of cands) {{
+                if (!el.offsetParent) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 300) continue;   // skip narrow left-panel cards
+                const t = (el.innerText || '');
+                if (t.includes('Catalog ID') && t.includes(cid)
+                    && t.includes('Style ID')) return true;
+            }}
+            return false;
+        }}
+    """
+    try:
+        page.wait_for_function(js, timeout=timeout_ms)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _first_style_id(page: Page, catalog_id: Optional[str] = None) -> Optional[str]:
+    """Return the first 'Style ID: X' visible in the right panel.
+
+    If `catalog_id` is provided, first wait for the right panel to
+    display that catalog id — avoids the race where we read the previous
+    catalog's Style ID before Meesho re-renders."""
+    if catalog_id:
+        _wait_right_panel_for_catalog(page, catalog_id, timeout_ms=6_000)
     try:
         page.wait_for_function(
             "() => /Style ID/i.test(document.body.innerText || '')",
-            timeout=6_000,
+            timeout=4_000,
         )
     except Exception:  # noqa: BLE001
         pass
@@ -381,9 +457,12 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
     diagnostics: List[Dict[str, Any]] = []
     processed_ids: Set[str] = set()
 
-    p, _browser, _ctx, page = cdp_context_page(port)
+    p, _browser, _ctx, page, page_reused = cdp_reuse_supplier_page(port)
+    diagnostics.append({"stage": "cdp_attach", "page_reused": page_reused})
     try:
-        # Try to maximise / enlarge the viewport so nothing is hidden
+        # Try to maximise / enlarge the viewport so nothing is hidden.
+        # (Playwright viewport override is a no-op on CDP-attached pages —
+        # this is fine, Chrome's native window size is what applies.)
         try:
             page.set_viewport_size({"width": 1600, "height": 1000})
         except Exception:  # noqa: BLE001
@@ -406,8 +485,15 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
         page.wait_for_timeout(1200)
         _dismiss_onboarding(page)
 
+        # Wait for real catalog cards to render (skeleton → real cards).
+        cards_loaded = _wait_for_cards_loaded(page, timeout_ms=20_000)
+        diagnostics.append({"stage": "wait_cards_loaded",
+                            "loaded": cards_loaded})
+
         sort_res = _select_newest_first(page)
         diagnostics.append({"stage": "sort_newest_first", **sort_res})
+        # Sort mutates the list; wait again for the fresh render.
+        _wait_for_cards_loaded(page, timeout_ms=15_000)
         _screenshot(page, debug_dir, "01_after_sort")
 
         # early sanity: are there any cards?
@@ -457,7 +543,7 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
                                             "catalog_id": cid})
                         processed_ids.add(cid)
                         continue
-                    sid = _first_style_id(page)
+                    sid = _first_style_id(page, catalog_id=cid)
                     processed_ids.add(cid)
                     if sid:
                         all_rows.append({
@@ -495,10 +581,13 @@ def run_inventory_sync_for_account(acc: dict, payload: dict) -> Dict[str, Any]:
                             "error": f"{type(e).__name__}: {e}"})
         _screenshot(page, debug_dir, "fatal")
     finally:
-        try:
-            page.close()
-        except Exception:  # noqa: BLE001
-            pass
+        # Never close a page we reused — keep the user's existing tab
+        # alive so subsequent runs (and manual browsing) stay logged in.
+        if not page_reused:
+            try:
+                page.close()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             p.stop()
         except Exception:  # noqa: BLE001

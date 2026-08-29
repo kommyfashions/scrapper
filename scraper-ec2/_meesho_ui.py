@@ -79,6 +79,47 @@ def cdp_context_page(port: int):
     return p, browser, context, page
 
 
+def cdp_reuse_supplier_page(port: int):
+    """Like cdp_context_page but REUSES an already-open supplier.meesho.com
+    tab if one exists. Falls back to opening a new page when none is found.
+
+    This avoids the /root/login "Access Denied" flow that some Meesho
+    accounts (e.g. UOBFS) trigger when a brand-new tab is opened via CDP.
+
+    Returns (playwright, browser, context, page, was_reused: bool).
+    The caller MUST call playwright.stop() when done. If the page was
+    reused, DO NOT close it — just leave it as-is so the user's Chrome
+    profile keeps the tab alive for the next run.
+    """
+    p = sync_playwright().start()
+    try:
+        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+    except Exception:
+        p.stop()
+        raise
+    if not browser.contexts:
+        p.stop()
+        raise RuntimeError(f"no browser context on port {port}; is Chrome started?")
+    context = browser.contexts[0]
+    reused_page = None
+    for pg in context.pages:
+        try:
+            url = pg.url or ""
+        except Exception:  # noqa: BLE001
+            url = ""
+        if "supplier.meesho.com" in url:
+            reused_page = pg
+            break
+    if reused_page is not None:
+        try:
+            reused_page.bring_to_front()
+        except Exception:  # noqa: BLE001
+            pass
+        return p, browser, context, reused_page, True
+    page = context.new_page()
+    return p, browser, context, page, False
+
+
 def screenshot_on_fail(page: Page, debug_dir: Path, prefix: str) -> Optional[Path]:
     try:
         debug_dir.mkdir(parents=True, exist_ok=True)
